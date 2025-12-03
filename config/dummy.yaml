@@ -1,0 +1,17 @@
+train:
+  epochs: 30
+  batch_size: 16
+  lr: 0.0003
+  seed: 42
+
+model:
+  name: "my-transformer"
+  hidden_size: 768
+  num_layers: 12
+  dropout: 0.1
+
+data:
+  train_path: "data/train.jsonl"
+  val_path: "data/val.jsonl"
+  num_workers: 4
+

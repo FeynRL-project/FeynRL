@@ -1,9 +1,7 @@
-import random
 import numpy as np
-from math import floor
-from collections import Counter
+from torch.utils.data import Sampler
 
-class MixedRatioSampler:
+class MixedRatioSampler(Sampler):
     def __init__(self, seed: int,
                        dnames: list[str], # ['d1', 'd2', 'd3']
                        ratios: dict[str, float], # {'d1':0.3, 'd2':0.1, 'd3':0.6}
@@ -65,10 +63,11 @@ class MixedRatioSampler:
         if self.redo_ratio_every_step == False:
             self.sample_per_dataset = self._fixed_sample_count()
 
-    def _fixed_sample_count(self)
+    def _fixed_sample_count(self):
         '''
             Stable rounding to make sure the sum of the ratios is equal to the batch size. This 
             method also returns same ratio hence it is fixed ratio and needs to be called just once. 
+            This is largest remainder method appraoch.
         '''
         raw_samples = self.probs * self.local_batch_size
         base_samples = np.floor(raw_samples).astype(int)
@@ -78,7 +77,8 @@ class MixedRatioSampler:
         if remaining_samples > 0:
             frac = raw_samples - base_samples
             # largest fractional parts first
-            order = np.argsort(-frac)
+            # we want largest fractional parts so we look at the end of the sorted array
+            order = np.argsort(frac)[::-1] # descending order
             base_samples[order[:remaining_samples]] += 1
         out_counts = {name: int(count) for name, count in zip(self.dnames, base_samples)}
         
@@ -101,15 +101,16 @@ class MixedRatioSampler:
             # this is important for distributed training
             batch = []
             # recalculate sample count if need
-            sample_per_dataset = self._calculate_sample_counts() if self.redo_ratio_every_step else self.sample_per_dataset
+            sample_per_dataset = self._probabilistic_sample_counts() if self.redo_ratio_every_step else self.sample_per_dataset
             
             for current_dataset_name, count in sample_per_dataset.items():
                 if count == 0:
                     continue
                 
                 # sample from the dataset
+                # self.rng.integers implies sampling with replacement.
                 local_indices = self.rng.integers(low=0, high=self.len_datasets[current_dataset_name], size=count)
-                global_indices = [self.offset[current_dataset_name] + i  for i in local_indices]
+                global_indices = [self.offsets[current_dataset_name] + i  for i in local_indices]
                 batch.extend(global_indices) 
                 
             if self.shuffle_within_batch:

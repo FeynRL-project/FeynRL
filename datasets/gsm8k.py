@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import datasets
+# adopted based on https://github.com/volcengine/verl/blob/main/examples/data_preprocess/gsm8k.py
 
 def create_prompt(question, use_system_prompt):
     '''

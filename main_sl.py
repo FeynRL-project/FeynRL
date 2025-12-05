@@ -7,42 +7,63 @@ from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM, AutoCon
 from torch.utils.data import DataLoader, DistributedSampler
 
 # local imports
-import config.load as cfg
-import datasets as dh
+import config.load as cfg # all config arguments
+import datasets    as ds  # our custom pytorch dataset
 
-def set_random_seeds(config):
+def set_random_seeds(seed):
     '''
         Set random seeds, etc., for reproducibility.
     '''
-    random.seed(config.train.seed)
-    np.random.seed(config.train.seed)
-    torch.manual_seed(config.train.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-def load_models_and_tokenizer(config: cfg.Config):
+def load_models_and_tokenizer(model_name,
+                              model_dtype,
+                              ref_model_name=None,
+                              trust_remote_code=False,
+                              model_class='llm'):
     '''
         Load models and tokenizer from huggingface.
         It also loads the ref model if provided.
-        This fucntion would be resposible to make sure with use correct precision.
+        This fucntion would be resposible to make sure with use correct precision
+        and decides how to laod the model if it is a text-only model or multi-modal model.
     '''
-    assert config.model.dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-    model = AutoModelForCausalLM.from_pretrained(config.model.name,
-                                                torch_dtype=config.model.dtype)
+    assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
+
+    ########
+    # 1. model and its config initialization
+    ########
+    model_config = AutoConfig.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name,
+                                                torch_dtype=model_dtype,
+                                                trust_remote_code=trust_remote_code,
+                                                config=model_config)
+
     # if ref model is provided to use it in kl for example.
-    if config.model.ref_model is not None:
-        ref_model = AutoModelForCausalLM.from_pretrained(config.model.ref_model,
-                                                         torch_dtype=config.model.dtype)
+    if ref_model_name is not None:
+        ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
+                                                         torch_dtype=model_dtype,
+                                                         trust_remote_code=trust_remote_code,
+                                                         config=model_config)
     else:
         ref_model = None
-    tokenizer = AutoTokenizer.from_pretrained(config.model.name)
 
+    ########
+    # 2. Tokenizer initialization
+    ########
+    tokenizer = AutoTokenizer.from_pretrained(model_name,
+                                              trust_remote_code=trust_remote_code)
+
+    # if pad token is not present, we use eos token as pad token
+    # log warning if pad token is not present.
     if tokenizer.pad_token_id is None:
-        # if pad token is not present, we use eos token as pad token
         print("Warning: Pad token is not present, using eos token as pad token")
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return model, ref_model, tokenizer  
 
-def training_engine_setup(config, model, ref_model=None):
+def training_engine_setup(deepspeed_config, model, ref_model=None):
     '''
         This function is responsible for setting up distributed training engine.
         For now, it only supports deepspeed.
@@ -58,29 +79,59 @@ def training_engine_setup(config, model, ref_model=None):
     model_engine, optimizer, _, _ = deepspeed.initialize(
                                                         model=model,
                                                         model_parameters=model.parameters(),
-                                                        config=config.deepspeed
+                                                        config=deepspeed_config
                                                         )
     ref_model_engine = None
     if ref_model is not None:
         ref_model_engine, *_ = deepspeed.initialize(
-                                             model=ref_model,
-                                             config=config.deepspeed
-                                            )
+                                                    model=ref_model,
+                                                    config=deepspeed_config
+                                                    )
 
     return model_engine, ref_model_engine, optimizer
 
-def inference_engine_setup(config, model):
-    pass
+def inference_engine_setup(deepspeed_config, model):
+    '''
+        This function is responsible for setting up distributed inference engine.
+        For now, it only supports deepspeed.
+    ''' 
+    return None
 
-def data_loader_setup(config, tokenizer):
+def data_loader_setup(data_config, batch_size, tokenizer, split='train', world_size=1, rank=0):
     '''
        This function is responsible for setting up data loader.
+       batch_size is an input to handle global or micro batch size.
     '''
-    dataset = dh.DummyDataset(tokenizer)
-    sampler = DistributedSampler(dataset)
-    dataloader = DataLoader(dataset,
-                            batch_size=2,
-                            sampler=sampler)
+    ########
+    # 1. Initialize our custom datasets
+    ########
+    dataset = ds.PairedDataset(prompt_key=data_config.prompt_key,
+                                    answer_key=data_config.answer_key,
+                                    max_seq_len=data_config.max_seq_len,
+                                    tokenizer=tokenizer,
+                                    data_path=data_config.data_path)
+    shuffle = True if split == 'train' else False
+
+    ########
+    # 2. Initialize distributed sampler
+    ########
+    sampler = DistributedSampler(dataset,
+                                shuffle=shuffle,
+                                num_replicas=world_size,
+                                rank=rank,
+                                drop_last=True)
+
+    ########
+    # 3. Initialize data loader
+    ########
+    dataloader = DataLoader(
+                            dataset=dataset,
+                            batch_size=batch_size,
+                            sampler=sampler,
+                            num_workers=data_config.num_workers,
+                            pin_memory=True,
+                            drop_last=True,
+                            )
 
     return dataloader
 
@@ -106,6 +157,7 @@ if __name__ == "__main__":
     ########
     # 3. Logging and saving (e.g., W&B, results dir, etc.)
     ########
+    #TBA
 
     ########
     # 4. load model or previous checkpoints

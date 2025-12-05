@@ -107,7 +107,7 @@ class SFT:
                 ########
                 loss = self.compute_loss(logits=logits, y=y, mask=mask)
 
-                val_loss += loss.item()
+                val_loss += loss.item()/num_of_micro_batches
 
         return val_loss
 

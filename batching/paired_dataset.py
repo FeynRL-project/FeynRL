@@ -3,13 +3,12 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import os
 
-class SFTDataset(Dataset):
+class PairedDataset(Dataset):
     '''
-        This is a general dataloader that works for any source data that has the following formant:
+        This is a general dataset that works for any source data that has the following formant:
         {
             "prompt": [{"role": "system", "content": "this is a system prompt"}, {"role": "user", "content": "this is a user prompt"}],
             "answer": "this is an answer",
-            ...
         }
         The data should be in a parquet format.
     '''

@@ -35,6 +35,11 @@ def load_models_and_tokenizer(config: cfg.Config):
         ref_model = None
     tokenizer = AutoTokenizer.from_pretrained(config.model.name)
 
+    if tokenizer.pad_token_id is None:
+        # if pad token is not present, we use eos token as pad token
+        print("Warning: Pad token is not present, using eos token as pad token")
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     return model, ref_model, tokenizer  
 
 def training_engine_setup(config, model, ref_model=None):

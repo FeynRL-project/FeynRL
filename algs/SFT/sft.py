@@ -115,9 +115,9 @@ class SFT:
         loss = self.compute_loss(logits=logits, y=y, mask=mask)
 
         # 3. backward step
+        self.model_engine.zero_grad()
         # DeepSpeed backward handles gradient accumulation logic automatically.
         # It aggregates gradients and only updates weights when accumulation_steps is reached.
-        # we don't need self.optimizer.zero_grad() as we rely on DeepSpeed.
         self.model_engine.backward(loss)
 
         # 4. optimizer step

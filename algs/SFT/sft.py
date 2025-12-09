@@ -5,25 +5,14 @@ class SFT:
     def __init__(self,
                 model_engine,
                 optimizer,
-                micro_batch_size_per_gpu,
-                clip_grad_norm=None,
-                use_cache=False, 
                 device='cpu'):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
-        self.micro_batch_size_per_gpu = micro_batch_size_per_gpu
-        self.use_cache = use_cache
         self.device = device
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
-
-        # clip gradient if required
-        if clip_grad_norm is not None:
-            self.clip_grad = torch.nn.utils.clip_grad_norm_
-        else:
-            self.clip_grad = None
 
     def compute_loss(self, logits, y, mask):
         '''
@@ -86,61 +75,49 @@ class SFT:
 
         return logits, y, mask
 
-    def eval_step(self, data):
+    def eval_step(self, micro_batch):
         '''
            This function implements a single validation step per rank/gpu.
         '''
         # we need to split data into micro batches
-        micro_batches = data.split(self.micro_batch_size_per_gpu)
-        num_of_micro_batches = len(micro_batches)
         val_loss = 0
         self.model_engine.eval()
         with torch.no_grad():
-            for batch in micro_batches:
-                ######## 
-                # forward pass per gpu/rank
-                ########
-                logits, y, mask = self.forward(batch)
+            # forward pass per gpu/rank
+            logits, y, mask = self.forward(micro_batch)
 
-                ######## 
-                # compute loss pass
-                ########
-                loss = self.compute_loss(logits=logits, y=y, mask=mask)
-
-                val_loss += loss.item()/num_of_micro_batches
+            # compute loss pass
+            loss = self.compute_loss(logits=logits, y=y, mask=mask)
+            val_loss += loss.item()
 
         return val_loss
 
-    def train_step(self, data):
+    def train_step(self, micro_batch):
         '''
            This function implements a single training step per rank/gpu.
            The batch size for each gpu/rank should be micro_batch_size_per_gpu. 
-           So we need to split data into micro batches.  
+           The DataLoader already yields micro-batches. 
         '''
-        # we need to split data into micro batches
-        micro_batches = data.split(self.micro_batch_size_per_gpu)
-        num_of_micro_batches = len(micro_batches)
         step_loss = 0
         # make sure model is in training mode
         self.model_engine.train()
-        for batch in micro_batches:
-            ######## 
-            # forward pass per gpu/rank
-            ########
-            logits, y, mask = self.forward(batch)
 
-            ######## 
-            # compute loss pass
-            ########
-            loss = self.compute_loss(logits=logits, y=y, mask=mask)
+        # 1. forward pass per gpu/rank
+        logits, y, mask = self.forward(micro_batch)
 
-            ########    
-            # backward step
-            ########
-            self.optimizer.zero_grad()
-            loss = loss / num_of_micro_batches            
-            loss.backward()
-            step_loss += loss.item()
+        # 2. compute loss pass
+        loss = self.compute_loss(logits=logits, y=y, mask=mask)
 
+        # 3. backward step
+        # DeepSpeed backward handles gradient accumulation logic automatically.
+        # It aggregates gradients and only updates weights when accumulation_steps is reached.
+        # we don't need self.optimizer.zero_grad() as we rely on DeepSpeed.
+        self.model_engine.backward(loss)
+
+        # 4. optimizer step
+        # DeepSpeed step handles optimizer updates and gradient clearing.
         self.model_engine.step()
-        return step_loss
+
+        # return loss
+        step_loss = loss.item()
+        return {"loss": step_loss}

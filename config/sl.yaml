@@ -56,7 +56,7 @@ data:
   answer_key: "answer"
  
 deepspeed:
-  config: "./ds_config.json"
+  config_path: "./ds_config.json"
 
 inference_engine:
   name: "vllm"

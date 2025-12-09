@@ -66,7 +66,7 @@ def load_models_and_tokenizer(model_name,
                                                 attn_implementation=None if attn_impl == '' else attn_impl)
 
     # if ref model is provided to use it in kl for example.
-    if ref_model_name is not None:
+    if ref_model_name:
         ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
                                                          torch_dtype=model_dtype,
                                                          trust_remote_code=trust_remote_code,
@@ -147,10 +147,10 @@ def data_loader_setup(dnames,
     sampler = DistributedSampler(dataset,
                                 shuffle=shuffle,
                                 num_replicas=world_size,
-                                rank=rank,
-                                drop_last=drop_last)
+                                rank=rank)
 
     # 3. Initialize data loader
+    worker_init = lambda worker_id: np.random.seed(seed + (rank * num_workers) + worker_id)
     dataloader = DataLoader(
                             dataset=dataset,
                             batch_size=batch_size,
@@ -158,6 +158,7 @@ def data_loader_setup(dnames,
                             num_workers=num_workers,
                             pin_memory=True,
                             drop_last=drop_last,
+                            worker_init_fn=worker_init # for reproducibility
                             )
 
     return dataloader, sampler
@@ -310,13 +311,14 @@ if __name__ == "__main__":
             num_val_batches += 1
 
         # Average loss across batches and across GPUs
-        avg_val_loss = torch.tensor(val_loss / max(1, num_val_batches)).to(model_engine.device)
+        avg_val_loss_tensor = torch.tensor(val_loss / max(1, num_val_batches)).to(model_engine.device)
 
         # Sync validation loss across GPUs
-        torch.distributed.all_reduce(avg_val_loss, op=torch.distributed.ReduceOp.AVG)
+        torch.distributed.all_reduce(avg_val_loss_tensor, op=torch.distributed.ReduceOp.SUM)
+        avg_val_loss_tensor /= world_size
 
         if rank == 0:
-            print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss.item()}")
+            print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss_tensor.item()}")
 
         ########
         # 8.3 Save checkpoint

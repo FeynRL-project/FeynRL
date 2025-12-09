@@ -5,11 +5,13 @@ class SFT:
     def __init__(self,
                 model_engine,
                 optimizer,
-                device='cpu'):
+                device='cpu',
+                use_cache=False):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
         self.device = device
+        self.use_cache = use_cache
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
@@ -50,9 +52,13 @@ class SFT:
         '''
         # batch is a dictionary, so we want to extract things we need from it
         # input_ids/att_mask/pos_ids are [B, T]
-        input_ids = batch['input_ids'].to(self.device)
-        att_mask  = batch['attention_mask'].to(self.device)
-        pos_ids   = batch['position_ids'].to(self.device)
+        input_ids = batch['seq_ids'].to(self.device)
+        att_mask  = batch['seq_attn_mask'].to(self.device)
+
+        # if pos_ids is not provided, HF will add that automatically.
+        pos_ids   = batch.get('position_ids', None)
+        if pos_ids is not None:
+            pos_ids = pos_ids.to(self.device)
 
         # feed data to model
         output = self.model_engine(input_ids=input_ids,
@@ -90,7 +96,7 @@ class SFT:
             loss = self.compute_loss(logits=logits, y=y, mask=mask)
             val_loss += loss.item()
 
-        return val_loss
+        return {"loss": val_loss}
 
     def train_step(self, micro_batch):
         '''

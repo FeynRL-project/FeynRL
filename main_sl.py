@@ -253,7 +253,8 @@ if __name__ == "__main__":
             alg = calg.SFT(
                            model_engine=model_engine,
                            optimizer=optimizer,
-                           device=model_engine.device)
+                           device=model_engine.device,
+                           use_cache=config.train.use_cache)
 
     else:
         raise ValueError(f"Unknown algorithm: {config.train.alg_name}")

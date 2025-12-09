@@ -136,4 +136,4 @@ def load_and_verify(input_yaml: str):
 
 if __name__ == "__main__":
     # load config
-    config = load_and_verify("./config/dummy.yaml")
+    config = load_and_verify("./configs/sl_args.yaml")

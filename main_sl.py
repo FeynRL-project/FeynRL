@@ -12,47 +12,39 @@ from tqdm import tqdm
 # imports local methods, classes, etc.
 import config.load as cfg # all config arguments
 from custom_datasets.paired_dataset import PairedDataset # our custom pytorch dataset
-from misc.utils import save_checkpoint
 
 def set_random_seeds(seed):
     '''
-        Set random seeds, etc., for reproducibility.
+        Set random seeds, etc., to make it easier to reproduce results eventhough it is not 100% guaranteed.
+        In particualr, since we do distributed training, floating-point arithmetic, non-deterministic operations (e.g., torch.Tensor.index_add_),
+        setting the seed is not enough, just make things a bit "predictable".
     '''
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def rank_world_size_setup(world_size):
+def rank_world_size_setup():
     '''
-        Set rank and world size for distributed training.
+        Detect rank and world size from environment variables.
     '''
-    rank = int(os.environ.get('RANK', 0))
+    # total number of gpus (e.g, 2 nodes x 4 gpus = 8 gpus in total). world size need to be at least 1
     world_size = int(os.environ.get('WORLD_SIZE', 1))
-    return rank, world_size
 
-def batch_size_setup(train_batch_size_per_gpu, gradient_accumulation, val_batch_size_per_gpu, world_size):
-    '''
-        Set batch size for each gpu/rank.
-        This function helps to avoid having to do this in multiple places especially
-        with distributed training engine sometime causes confusion.
-        (global) train_batch_size = micro_batch_size x gradient_accumulation x number_of_gpus
-    '''
-    bsz = {}
-    global_train_batch_size = train_batch_size_per_gpu * gradient_accumulation * world_size
-    bsz['train_global'] = global_train_batch_size
-    bsz['train_local']  = train_batch_size_per_gpu
-    global_val_batch_size = val_batch_size_per_gpu * world_size
-    bsz['val_global']   = global_val_batch_size
-    bsz['val_local']    = val_batch_size_per_gpu
+    # Unique id of gpu in the ENTIRE WORLD. It ranges from 0 to world_size - 1
+    rank = int(os.environ.get('RANK', 0))
 
-    # update related arguments in deepspeed config
-    return bsz
+    # Unique id of gpu in the LOCAL node. It ranges from 0 to local_node_size - 1
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+
+    return rank, world_size, local_rank
 
 def load_models_and_tokenizer(model_name,
                               model_dtype,
                               ref_model_name=None,
                               trust_remote_code=False,
+                              attn_impl='',
                               model_class='llm'):
     '''
         Load models and tokenizer from huggingface.
@@ -61,35 +53,35 @@ def load_models_and_tokenizer(model_name,
         and decides how to laod the model if it is a text-only model or multi-modal model.
     '''
     assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
+    assert attn_impl=='' or attn_impl in ['eager', 'flash_attention_2'], "attn_impl must be one of 'eager', 'flash_attention_2' or empty string"
 
-    ########
     # 1. model and its config initialization
-    ########
     model_config = AutoConfig.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name,
                                                 torch_dtype=model_dtype,
                                                 trust_remote_code=trust_remote_code,
-                                                config=model_config)
+                                                config=model_config,
+                                                attn_implementation=None if attn_impl == '' else attn_impl)
 
     # if ref model is provided to use it in kl for example.
     if ref_model_name is not None:
         ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
                                                          torch_dtype=model_dtype,
                                                          trust_remote_code=trust_remote_code,
-                                                         config=model_config)
+                                                         config=model_config,
+                                                         attn_implementation=None if attn_impl == '' else attn_impl)
     else:
         ref_model = None
 
-    ########
     # 2. Tokenizer initialization
-    ########
     tokenizer = AutoTokenizer.from_pretrained(model_name,
                                               trust_remote_code=trust_remote_code)
 
     # if pad token is not present, we use eos token as pad token
     # log warning if pad token is not present.
     if tokenizer.pad_token_id is None:
-        print("Warning: Pad token is not present, using eos token as pad token")
+        if rank == 0:
+            print("Warning: Pad token is not present, using eos token as pad token")
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return model, ref_model, tokenizer  
@@ -99,24 +91,23 @@ def training_engine_setup(deepspeed_config, model, ref_model=None):
         This function is responsible for setting up distributed training engine.
         For now, it only supports deepspeed.
     '''
-    ########
+    # Convert pydantic model to python Dict for DeepSpeed
+    ds_config_dict = deepspeed_config.model_dump()
+
     # 1. Initialize distributed training engine
-    ########
     deepspeed.init_distributed()
 
-    ########
     # 2. Initialize model engine
-    ########
     model_engine, optimizer, _, _ = deepspeed.initialize(
                                                         model=model,
                                                         model_parameters=model.parameters(),
-                                                        config=deepspeed_config
+                                                        config=ds_config_dict
                                                         )
     ref_model_engine = None
     if ref_model is not None:
-        ref_model_engine, *_ = deepspeed.initialize(
+        ref_model_engine, _, _, _ = deepspeed.initialize(
                                                     model=ref_model,
-                                                    config=deepspeed_config
+                                                    config=ds_config_dict
                                                     )
 
     return model_engine, ref_model_engine, optimizer
@@ -138,9 +129,7 @@ def data_loader_setup(dnames,
        This function is responsible for setting up data loader.
        batch_size is an input to handle global or micro batch size.
     '''
-    ########
     # 1. Initialize our custom datasets
-    ########
     dataset = PairedDataset(prompt_key=prompt_key,
                             answer_key=answer_key,
                             max_seq_len=max_seq_len,
@@ -148,23 +137,19 @@ def data_loader_setup(dnames,
                             data_path=files_path)
     shuffle = True if split == 'train' else False
 
-    ########
     # 2. Initialize distributed sampler
-    ########
     sampler = DistributedSampler(dataset,
                                 shuffle=shuffle,
                                 num_replicas=world_size,
                                 rank=rank,
                                 drop_last=True)
 
-    ########
     # 3. Initialize data loader
-    ########
     dataloader = DataLoader(
                             dataset=dataset,
                             batch_size=batch_size,
                             sampler=sampler,
-                            num_workers=data_config.num_workers,
+                            num_workers=num_workers,
                             pin_memory=True,
                             drop_last=True,
                             )
@@ -183,27 +168,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-file", type=str, default="./config/dummy.yaml", help="config file")
     parser.add_argument("--experiment_id", type=str, default="run_1", help="experiment id")
-    parser.add_argument("--world_size", type=int, default=1, help="world size")
-
     args = parser.parse_args()
- 
+
     ########
-    # 1. Load config
+    # 1. Setup Environment
+    ########
+    rank, world_size, local_rank = rank_world_size_setup()
+
+    ########
+    # 2. Load config
     ########
     config = cfg.load_and_verify(input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
-                                 world_size=args.world_size)
-
-    ########
-    # 2. Generic setup (e.g., random seed, device, world size, etc.)
-    ########
+                                 world_size=world_size,
+                                 )
     set_random_seeds(seed=config.run.seed)
-    rank, world_size = rank_world_size_setup(world_size=config.run.world_size)
-    batch_sizes = batch_size_setup(train_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
-                                   gradient_accumulation=config.train.gradient_accumulation_steps,
-                                   val_batch_size_per_gpu=config.train.val_batch_size_per_gpu,
-                                   world_size=world_size)
-
     ########
     # 3. Logging and saving (e.g., W&B, results dir, etc.)
     ########
@@ -216,7 +195,8 @@ if __name__ == "__main__":
                                                             model_dtype=config.model.dtype,
                                                             ref_model_name=config.model.ref_model,
                                                             trust_remote_code=config.model.trust_remote_code,
-                                                            model_class=config.model.model_class)
+                                                            model_class=config.model.model_class,
+                                                            attn_impl=config.model.attn_implementation)
 
     ########
     # 5. Setup trainiing and inference engines
@@ -236,7 +216,7 @@ if __name__ == "__main__":
                                                         max_seq_len=config.data.max_seq_len,
                                                         prompt_key=config.data.prompt_key,
                                                         answer_key=config.data.answer_key,
-                                                        batch_size=batch_sizes['train_local'],
+                                                        batch_size=config.train.train_batch_size_per_gpu,
                                                         tokenizer=tokenizer,
                                                         seed=config.run.seed,
                                                         split='train',
@@ -250,7 +230,7 @@ if __name__ == "__main__":
                                           max_seq_len=config.data.max_seq_len,
                                           prompt_key=config.data.prompt_key,
                                           answer_key=config.data.answer_key,
-                                          batch_size=batch_sizes['val_local'],
+                                          batch_size=config.train.val_batch_size_per_gpu,
                                           tokenizer=tokenizer,
                                           seed=config.run.seed,
                                           split='val',
@@ -266,10 +246,10 @@ if __name__ == "__main__":
             alg = calg.SFT(
                            model_engine=model_engine,
                            optimizer=optimizer,
-                           micro_batch_size_per_gpu=config.train.micro_batch_size_per_gpu,
+                           micro_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
                            clip_grad_norm=config.train.clip_grad_norm,
-                           use_cache=config.train.use_cache,
-                           device='cpu')
+                           use_cache=config.model.use_cache,
+                           device=model_engine.device)
 
     else:
         raise ValueError(f"Unknown algorithm: {config.train.alg_name}")
@@ -277,42 +257,54 @@ if __name__ == "__main__":
     ########
     # 8. Training and evaluation loop
     ########
-    for epoch in range(config.train.num_epochs):
+    if rank == 0:
+        print("Starting training...")
+
+    global_step = 0
+    for epoch in range(config.train.total_number_of_epochs):
         train_sampler.set_epoch(epoch)
         ########
         # 8.1 Training loop
         ########
-        total_train_step = 0
-        for data in tqdm(train_dataloader,
-                        total=config.train.steps_per_epoch,
-                        desc=f"Epoch {epoch + 1}/{config.train.num_epochs}"):
-            total_train_step += 1
-            metric = alg.train_step(data)
-            if total_train_step % config.train.log_interval == 0:
-                print(f"Global step: {total_train_step}, Loss: {metric['loss']}")
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.train.total_number_of_epochs}", disable=(rank != 0))
+
+        for step, batch in enumerate(progress_bar):
+            # Move batch to gpu (deepspeed engine device)
+            batch = {k: v.to(model_engine.device) for k, v in batch.items()}
+
+            # Run one train step for micro-batch.
+            metric = alg.train_step(batch)
+            global_step += 1
+
+            # logging
+            if rank == 0 and step % config.deepspeed.steps_per_print == 0:
+                progress_bar.set_postfix(loss=metric['loss'])
 
         ########
         # 8.2 Validation loop
         ########
-        total_eval_step = 0
-        for data in tqdm(val_dataloader,
-                        total=config.val.steps_per_epoch,
-                        desc=f"Epoch {epoch + 1}/{config.train.num_epochs}"):
-            total_eval_step += 1
-            metric = alg.eval_step(data)
-            if total_eval_step % config.val.log_interval == 0:
-                print(f"Global step: {global_step}, Loss: {metric['loss']}")
+        val_loss = 0.0
+        num_val_batches = 0
+        for data in val_dataloader:
+            val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
+            val_metric = alg.eval_step(val_batch)
+            val_loss += val_metric['loss']
+            num_val_batches += 1
+
+        # Average loss across batches and across GPUs
+        avg_val_loss = torch.tensor(val_loss / num_val_batches).to(model_engine.device)
+        # Sync validation loss across GPUs
+        torch.distributed.all_reduce(avg_val_loss, op=torch.distributed.ReduceOp.AVG)
+
+        if rank == 0:
+            print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss.item()}")
 
         ########
         # 8.3 Save checkpoint
         ########
-        if epoch % config.train.save_interval == 0:
-            save_checkpoint(config, model, optimizer, epoch)
+        # DeepSpeed saves directory structures, not just a single file.
+        tag = f"epoch_{epoch+1}"
+        model_engine.save_checkpoint(config.deepspeed.monitor_config.get("tensorboard", {}).get("output_path", "./checkpoints"), tag=tag)
 
-    ########
-    # 9. Save final checkpoint
-    ########
-    save_checkpoint(config, model, optimizer, config.train.num_epochs)
-
-    
-
+    if rank == 0:
+        print("Training complete.")

@@ -13,6 +13,7 @@ import gc
 # imports local methods, classes, etc.
 import config.load as cfg # all config arguments
 from custom_datasets.paired_dataset import PairedDataset # our custom pytorch dataset
+from misc.utils import safe_string_to_torch_dtype
 
 def set_random_seeds(seed):
     '''
@@ -28,6 +29,9 @@ def set_random_seeds(seed):
 def rank_world_size_setup():
     '''
         Detect rank and world size from environment variables.
+        we way to run is to use torchrun (torchrun --nnodes=2 --nproc_per_node=4 main_sl.py) where we can specify
+        nnodes=2 -> world_size
+        nproc_per_node=4 -> local_world_size/num_local_gpus
     '''
     # total number of gpus (e.g, 2 nodes x 4 gpus = 8 gpus in total). world size need to be at least 1
     world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -35,9 +39,19 @@ def rank_world_size_setup():
     # Unique id of gpu in the ENTIRE WORLD. It ranges from 0 to world_size - 1
     rank = int(os.environ.get('RANK', 0))
 
-    # Unique id of gpu in the LOCAL node. It ranges from 0 to local_node_size - 1
+    # Unique id of gpu in the LOCAL node (or simply one node). It ranges from 0 to local_node_size - 1
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    torch.cuda.set_device(local_rank)
+
+    # add some checks to make sure number of gpus and local rank are correct.
+    if not torch.cuda.is_available():
+        if rank == 0:
+            print("Warning: CUDA is not available, running on CPU. Sorry!")
+    else:
+        num_local_gpus = torch.cuda.device_count()
+        if local_rank >= num_local_gpus:
+            raise RuntimeError(f"LOCAL_RANK {local_rank} >= available GPUs {num_local_gpus}")
+
+        torch.cuda.set_device(local_rank)
 
     return rank, world_size, local_rank
 
@@ -56,6 +70,9 @@ def load_models_and_tokenizer(model_name,
     '''
     assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
     assert attn_impl=='' or attn_impl in ['eager', 'flash_attention_2'], "attn_impl must be one of 'eager', 'flash_attention_2' or empty string"
+
+    # convert string to torch dtype if it is not already
+    model_dtype = safe_string_to_torch_dtype(model_dtype)
 
     # 1. model and its config initialization
     model_config = AutoConfig.from_pretrained(model_name)
@@ -84,7 +101,14 @@ def load_models_and_tokenizer(model_name,
     if tokenizer.pad_token_id is None:
         if rank == 0:
             print("Warning: Pad token is not present, using eos token as pad token")
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        if getattr(tokenizer, 'eos_token', None) is not None:
+            # prefer explicit token if available
+            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+
+        else:
+            # fallback to eos token id
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return model, ref_model, tokenizer  
 
@@ -107,7 +131,16 @@ def training_engine_setup(deepspeed_config, model, ref_model=None):
                                                         )
     ref_model_engine = None
     if ref_model is not None:
-        ref_model_engine, _, _, _ = deepspeed.initialize(
+        # ref_model is supported here in case if we want to add
+        # additional metrics, divergence, etc. Note, ref_model will not be optimized.
+        try:
+            ref_model.to(model_engine.device)
+            ref_model.eval()
+            ref_model_engine = ref_model
+
+        except:
+            # fallback: initialize with DeepSpeed
+            ref_model_engine, _, _, _ = deepspeed.initialize(
                                                     model=ref_model,
                                                     config=ds_config_dict
                                                     )
@@ -128,8 +161,10 @@ def data_loader_setup(dnames,
                       world_size=1,
                       rank=0):
     '''
-       This function is responsible for setting up data loader.
-       batch_size is an input to handle global or micro batch size.
+       Setup DataLoader for distributed training.
+       Notes:
+           - batch_size is the per-gpu-micro-batch size. Global batch size = batch_size * world_size * gradient_accumulation_steps.
+           - Sampler is DistributedSampler; caller must call sampler.set_epoch(epoch) each epoch.
     '''
     # 1. Initialize our custom datasets
     dataset = PairedDataset(prompt_key=prompt_key,
@@ -137,10 +172,8 @@ def data_loader_setup(dnames,
                             max_seq_len=max_seq_len,
                             tokenizer=tokenizer,
                             data_path=files_path)
-    shuffle = True if split == 'train' else False
 
-    # For validation, it's usually better to be False to see all data, but if using DistributedSampler
-    # with drop_last=False, it might pad with duplicates.
+    shuffle = True if split == 'train' else False
     drop_last = True if split == 'train' else False
 
     # 2. Initialize distributed sampler
@@ -150,7 +183,13 @@ def data_loader_setup(dnames,
                                 rank=rank)
 
     # 3. Initialize data loader
-    worker_init = lambda worker_id: np.random.seed(seed + (rank * num_workers) + worker_id)
+    def worker_init_fn(worker_id):
+        # each worker gets a different seed but deterministic across runs when seed fixed
+        worker_seed = seed + worker_id + (rank * 100000)
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
     dataloader = DataLoader(
                             dataset=dataset,
                             batch_size=batch_size,
@@ -158,7 +197,7 @@ def data_loader_setup(dnames,
                             num_workers=num_workers,
                             pin_memory=True,
                             drop_last=drop_last,
-                            worker_init_fn=worker_init # for reproducibility
+                            worker_init_fn=worker_init_fn # for reproducibility
                             )
 
     return dataloader, sampler
@@ -302,23 +341,24 @@ if __name__ == "__main__":
         ########
         # 8.2 Validation loop
         ########
-        val_loss = 0.0
-        num_val_batches = 0
+        # to be safe and caculate loss average across batches and across GPUs correctly, we use
+        # the following instead computes per-rank average and then all-reduces averages
+        local_sum = torch.tensor(0.0, device=model_engine.device)
+        local_count = torch.tensor(0.0, device=model_engine.device)
+
         for data in val_dataloader:
             val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
             val_metric = alg.eval_step(val_batch)
-            val_loss += val_metric['loss']
-            num_val_batches += 1
+            local_sum += float(val_metric['loss'])
+            local_count += 1
 
-        # Average loss across batches and across GPUs
-        avg_val_loss_tensor = torch.tensor(val_loss / max(1, num_val_batches)).to(model_engine.device)
+        # Aggregate across all ranks
+        torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
 
-        # Sync validation loss across GPUs
-        torch.distributed.all_reduce(avg_val_loss_tensor, op=torch.distributed.ReduceOp.SUM)
-        avg_val_loss_tensor /= world_size
-
+        global_avg_loss = (local_sum / torch.clamp(local_count, min=1.0)).item()
         if rank == 0:
-            print(f"Epoch {epoch+1}, Validation Loss: {avg_val_loss_tensor.item()}")
+            print(f"Epoch {epoch+1}, Validation Loss: {global_avg_loss}")
 
         ########
         # 8.3 Save checkpoint

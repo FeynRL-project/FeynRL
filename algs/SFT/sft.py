@@ -6,12 +6,15 @@ class SFT:
                 model_engine,
                 optimizer,
                 device='cpu',
-                use_cache=False):
+                use_cache=False,
+                normalize_loss=False):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
         self.device = device
         self.use_cache = use_cache
+        self.normalize_loss = normalize_loss
+
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
@@ -42,6 +45,15 @@ class SFT:
         # To avoid gradient accumulation error caused by loss.mean(),
         # we use sum of loss instead but play with learning rate to account for this.
         loss = masked_per_token_loss.sum()
+
+        # Loss_accumulated \neq Loss_full_batch when sequence lengths vary.
+        # to address that, we normalize by total sequence length (constant)
+        # which is fixed across gpus, not valid tokens (variable) which is loss_mask.sum().
+        # This solves the gradient accumulation bug.
+        if self.normalize_loss:
+            total_possible_tokens = logits.shape[0]
+            loss = loss / total_possible_tokens
+
         return loss
 
     def forward(self, batch):

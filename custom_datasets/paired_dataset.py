@@ -7,7 +7,8 @@ class PairedDataset(Dataset):
     '''
         This is a general dataset that works for any source data that has the following formant:
         {
-            "prompt": [{"role": "system", "content": "this is a system prompt"}, {"role": "user", "content": "this is a user prompt"}],
+            "prompt": [{"role": "system", "content": "this is a system prompt"},
+                       {"role": "user", "content": "this is a user prompt"}],
             "answer": "this is an answer",
         }
         The data should be in a parquet format.
@@ -25,8 +26,11 @@ class PairedDataset(Dataset):
         assert tokenizer is not None, "tokenizer cannot be None"
         assert isinstance(data_path, str), "data_path must be a string"
         assert os.path.exists(os.path.expanduser(data_path)), f"{data_path} does not exist"
-        # add this assert yo mask sure that tokenizer has a pad token (or if not, we already added during loading)
+
+        # add this assert to make sure that tokenizer has a pad token (or if not,
+        # we already added during loading)
         assert tokenizer.pad_token_id is not None, "tokenizer must have a pad token"
+        assert tokenizer.eos_token_id is not None, "tokenizer must have an eos token"
 
         self.prompt_key = prompt_key
         self.answer_key = answer_key
@@ -56,9 +60,10 @@ class PairedDataset(Dataset):
 
     def __getitem__(self, idx):
         '''
-           data is pandas series with the following format:
+           data is a dict with the following format:
            {
-               "messages": [{"role": "system", "content": "this is a system prompt"}, {"role": "user", "content": "this is a user prompt"}],
+               "messages": [{"role": "system", "content": "this is a system prompt"},
+                            {"role": "user", "content": "this is a user prompt"}],
                "answer": "this is an answer",
                ...
            }
@@ -89,7 +94,7 @@ class PairedDataset(Dataset):
         prompt_len = len(prompt_ids)
 
         # 2. Validate prompt length
-        if prompt_len > self.max_seq_len or prompt_len == 0:
+        if prompt_len >= self.max_seq_len or prompt_len == 0:
             raise ValueError(f"Prompt in sample {idx}:{current_sample}: too long or empty: "
                              f"prompt must be at most {self.max_seq_len} tokens (got {prompt_len})")
 

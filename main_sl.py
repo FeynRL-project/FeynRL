@@ -120,8 +120,10 @@ def training_engine_setup(deepspeed_config, model, ref_model=None):
     # Convert pydantic model to python Dict for DeepSpeed
     ds_config_dict = deepspeed_config.model_dump()
 
-    # 1. Initialize distributed training engine
-    deepspeed.init_distributed()
+    # check to avoid re-initializing distributed backend
+    if not torch.distributed.is_initialized():
+        # 1. Initialize distributed training engine
+        deepspeed.init_distributed()
 
     # 2. Initialize model engine
     model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -294,7 +296,8 @@ if __name__ == "__main__":
                            model_engine=model_engine,
                            optimizer=optimizer,
                            device=model_engine.device,
-                           use_cache=config.train.use_cache)
+                           use_cache=config.model.use_cache,
+                           normalize_loss=config.train.normalize_loss)
 
     else:
         raise ValueError(f"Unknown algorithm: {config.train.alg_name}")

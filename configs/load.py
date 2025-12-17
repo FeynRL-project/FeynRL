@@ -53,6 +53,8 @@ class Train(BaseModel):
     gradient_accumulation_steps: int
     val_batch_size_per_gpu: int
 
+    normalize_loss: bool
+
 class Data(BaseModel):
     '''
         Everything related to data goes here.

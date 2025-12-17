@@ -5,16 +5,13 @@ class SFT:
     def __init__(self,
                 model_engine,
                 optimizer,
-                device='cpu',
                 use_cache=False,
                 normalize_loss=False):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
-        self.device = device
         self.use_cache = use_cache
         self.normalize_loss = normalize_loss
-
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
@@ -78,7 +75,7 @@ class SFT:
         # if pos_ids is not provided, HF will add that automatically.
         pos_ids   = batch.get('position_ids', None)
         if pos_ids is not None:
-            pos_ids = pos_ids.to(self.device)
+            pos_ids = pos_ids.to(self.att_mask.device)
 
         # feed data to model
         output = self.model_engine(input_ids=input_ids,

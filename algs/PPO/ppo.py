@@ -10,8 +10,10 @@ class PPO:
                 kl_coeff: [float]=0.0,
                 clip_low: [float]=0.0,
                 clip_high: [float]=1.0,
+                vf_clip: [float]=None,
                 tau: [float]=0.95,
                 gamma: [float]=0.99,
+                entropy_coeff: [float]=0.0,
                 alg_type: [str]="ppo",
                 ):
 
@@ -25,6 +27,8 @@ class PPO:
         self.tau = tau
         self.gamma = gamma
         self.alg_type = alg_type.lower()
+        self.vf_clip = vf_clip
+        self.ent_coeff = entropy_coeff
 
     @staticmethod
     def compute_advantages(rewards: torch.Tensor,
@@ -113,3 +117,106 @@ class PPO:
         rets = advs + values
 
         return rets, advs
+
+    def compute_policy_loss(self,
+                            logprobs: torch.Tensor,
+                            old_logprobs: torch.Tensor,
+                            advantages: torch.Tensor,
+                            mask: torch.Tensor,
+                            ):
+        '''
+            logprobs, old_logprobs, advantages, mask: [B, T]
+            Compute policy loss:
+                1. ratio = exp(logprobs - old_logprobs)
+                2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
+        '''
+        # 1. make sure advantages are detached and convert to float32 for stability under bf16/fp16
+        adv = advantages.detach().to(torch.float32)
+
+        # 2. calculate ratio = exp(logprobs - old_logprobs)
+        logratio = (logprobs - old_logprobs).to(torch.float32)
+        ratio   = torch.exp(logratio)
+
+        # 3. compute loss: -(min(ratio * adv, clip_adv)) * mask
+        unclipped = ratio * adv
+        clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
+        loss_pi   = -(torch.minimum(unclipped, clip_adv) * mask).sum() / mask.sum()
+
+        # 4. useful metrics
+        with torch.no_grad():
+            clipped_mask = (ratio > (1.0 + self.clip_high)) | (ratio < (1.0 - self.clip_low))
+            clipfrac = (clipped_mask.to(torch.float32) * mask).sum() / mask.sum()
+
+            # approx KL: either E[old_logprobs - logprobs] or E[(ratio - 1) - logratio]
+            approx_kl_t = (ratio - 1.0) - logratio
+            approx_kl = (approx_kl_t.to(torch.float32) * mask).sum() / mask.sum()
+
+            # save the metrics for debugging
+            metrics = {
+                'clipfrac': clipfrac,
+                'approx_kl': approx_kl,
+            }
+
+        return loss_pi, metrics
+
+    def compute_value_loss(self,
+                           values: torch.Tensor,
+                           v_old: torch.Tensor,
+                           returns: torch.Tensor,
+                           mask: torch.Tensor,
+                           ):
+        '''
+            Compute value loss:
+                1. if v_old:  loss = 0.5 * (max(values, v_clipped) - rets)^2
+                2. otherwise: loss = 0.5 * (values - rets)^2
+        '''
+        # 1. compute unlipped value loss
+        rets = returns.detach()
+        v_loss = (values - rets).pow(2)
+
+        # 2. compute clipped value loss
+        if  self.vf_clip is not None and v_old is not None:
+            v_old = v_old.detach()
+
+            # 3. compute clipped value loss
+            v_clipped = v_old + torch.clamp(values - v_old, -self.vf_clip, self.vf_clip)
+            v_loss_clipped = (v_clipped - rets).pow(2)
+            vmax =  torch.maximum(v_loss, v_loss_clipped)
+            loss = 0.5 * (vmax * mask).sum() / mask.sum()
+
+            # 4. log how much things are changed
+            with torch.no_grad():
+                vf_clipfrac = (values - v_old).abs() > self.vf_clip
+                vf_clipfrac = (vf_clipfrac * mask).sum() / mask.sum()
+
+        else:
+            loss = 0.5 * (v_loss * mask).sum() / mask.sum()
+            vf_clipfrac = 0.0
+
+        # save the metrics for debugging
+        metrics = {
+            'vf_clipfrac': vf_clipfrac,
+        }
+
+        return loss, metrics
+
+    def compute_entropy_loss(self,
+                            entropies: torch.Tensor,
+                            mask: torch.Tensor,
+                            ):
+        '''
+            Compute entropy loss
+        '''
+        if entropies is None or self.ent_coeff == 0.0:
+            return 0.0, {}
+
+        else:
+            loss = - (entropies * mask).sum() / mask.sum()
+            return loss, {'ent_loss': loss}
+
+    def compute_loss(self,
+                     replay_buffer: ReplayBuffer):
+        '''
+            Compute total ppo loss
+        '''
+        pass

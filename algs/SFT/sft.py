@@ -59,18 +59,17 @@ class SFT:
 
     def forward(self, batch):
         '''
-            This function implements a single forward pass for current batch.
-            It returns logits, y, and mask.
-            The size of batch['seq_ids']/batch['seq_attn_mask'] is [B, T]
-            The size of batch['loss_mask'] is [B, T-1]
-            The size of return variables logits, y, and mask would be [B, T-1]
+            This function implements a single forward pass for current batch:
+            batch['seq_ids/seq_attn_mask'] are [B, T]
+            batch['position_ids'] is [B, T] or None
+            Returns:
+                logits is [B, T-1, vocab_size]
+                y is [B, T-1]
+                loss_mask is [B, T-1]
         '''
-        # batch is a dictionary, so we want to extract things we need from it
         # input_ids and att_mask are [B, T]
         input_ids = batch['seq_ids']
         att_mask  = batch['seq_attn_mask']
-        # loss_mask is [B, T -1]
-        loss_mask = batch['loss_mask'].contiguous()
 
         # if pos_ids is not provided, HF will add that automatically.
         pos_ids   = batch.get('position_ids', None)
@@ -91,6 +90,9 @@ class SFT:
         y = input_ids[:, 1:].contiguous()
         # it is next token prediction, so we remove last token from logits
         logits = every_token_logits[:, :-1, :].contiguous()
+
+        # loss_mask is [B, T -1]
+        loss_mask = batch['loss_mask'].contiguous()
 
         return logits, y, loss_mask
 

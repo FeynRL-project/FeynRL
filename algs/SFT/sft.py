@@ -60,7 +60,7 @@ class SFT:
     def forward(self, batch):
         '''
             This function implements a single forward pass for current batch:
-            batch['seq_ids/seq_attn_mask'] are [B, T]
+            batch['input_ids/attn_mask'] are [B, T]
             batch['position_ids'] is [B, T] or None
             Returns:
                 logits is [B, T-1, vocab_size]
@@ -68,8 +68,8 @@ class SFT:
                 loss_mask is [B, T-1]
         '''
         # input_ids and att_mask are [B, T]
-        input_ids = batch['seq_ids']
-        att_mask  = batch['seq_attn_mask']
+        input_ids = batch['input_ids']
+        att_mask  = batch['attn_mask']
 
         # if pos_ids is not provided, HF will add that automatically.
         pos_ids   = batch.get('position_ids', None)

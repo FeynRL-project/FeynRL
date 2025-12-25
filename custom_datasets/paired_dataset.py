@@ -177,8 +177,8 @@ class PairedDataset(Dataset):
                          f"Total length: {total_seq_len}.")
 
         return {
-            "seq_ids": seq_ids, # T
-            "seq_attn_mask": seq_attn_mask, # T
+            "input_ids": seq_ids, # T
+            "attn_mask": seq_attn_mask, # T
             "loss_mask": loss_mask, # T-1
         }
 

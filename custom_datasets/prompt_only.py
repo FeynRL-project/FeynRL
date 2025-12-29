@@ -62,7 +62,17 @@ class PromptOnlyDataset(Dataset):
         if not message or (isinstance(message, list) and len(message) == 0):
             raise ValueError(f"Sample {idx}:{sample}: Prompt cannot be empty")
 
-        # 1. Tokenize the prompt and return python list[int] directly
+        # 1. Get the prompt text, this is what vllm sees.
+        prompt_text = self.tokenizer.apply_chat_template(
+                                                        conversation=message,
+                                                        add_generation_prompt=True,
+                                                        tokenize=False,
+                                                        return_tensors=None,
+                                                        )
+
+        # 2. Tokenize the prompt and return python list[int] directly
+        #    it is used just for length validation, but I added here
+        #    for future use and debugging purposes.
         prompt_ids = self.tokenizer.apply_chat_template(
                                                         conversation=message,
                                                         add_generation_prompt=True,
@@ -73,12 +83,12 @@ class PromptOnlyDataset(Dataset):
             raise ValueError(f"Sample {idx}:{sample}: tokenization produced empty prompt_ids")
 
 
-        # 2. Validate prompt length
+        # 3. Validate prompt length
         if len(prompt_ids) >= self.max_seq_len:
             raise ValueError(f"Prompt in sample {idx}:{sample}: too long: "
                              f"prompt must be at most {self.max_seq_len} tokens (got {len(prompt_ids)})")
 
-        return prompt_ids  # list[int]
+        return prompt_text
 
     def __len__(self):
         return self.len_data
@@ -107,7 +117,7 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
 
     random_prompts = [
-        {'prompt': [{"role": "user", "content": "Hello, how are you?"}]},
+        {'prompt': [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello, how are you?"}]},
         {'prompt': [{"role": "user", "content": "What is the meaning of life?"}]},
         {'prompt': [{"role": "user", "content": "What is the meaning of the universe?"}]},
         {'prompt': [{"role": "user", "content": "This is is a just rather long prompt that is going to be tokenized. This is a test to make sure the dataset works."}]},
@@ -127,3 +137,4 @@ if __name__ == "__main__":
                             collate_fn=dataset.collate_fn)
     for d in dataloader:
         print(d)
+        print("\n")

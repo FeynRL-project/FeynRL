@@ -145,7 +145,7 @@ class VLLMRolloutEngine:
 
             # setup to returns required info
             logprobs=1, # it returns logprobs for each token
-            prompt_logprobs=self.prompt_logprobs, # it returns logprobs for each token in the prompt which is memory intensive
+            prompt_logprobs=self.prompt_logprobs if self.prompt_logprobs is not None else 0, # it returns logprobs for each token in the prompt which is memory intensive
         )
 
     def extract_logprobs(self, response_ids: List[int], logprobs_by_pos: Any) -> torch.Tensor:
@@ -172,6 +172,9 @@ class VLLMRolloutEngine:
             v = lgp_dict[key]
             if hasattr(v, 'logprob'):
                 token_logprobs.append(float(v.logprob))
+
+            elif isinstance(v, (int, float)):
+                token_logprobs.append(float(v))
 
             elif isinstance(v, dict) and 'logprob' in v:
                 token_logprobs.append(float(v['logprob']))
@@ -234,12 +237,13 @@ class VLLMRolloutEngine:
                             response_logprobs = self.extract_logprobs(response_ids, response.logprobs)
                             old_logps[prompt_len:] = response_logprobs
                             rewards   = self.score_response(prompt_ids, response_ids, finish_reason)
+                            rewards[prompt_len:] = rewards
 
                             # Terminal handling:
-                            #  1. stop: ended due to EOS or a stop condition
-                            #  2. length: truncated which should not be done and we need to bootstrap
+                            #  1. stop: ended due to EOS or a stop condition so done should be 1.
+                            #  2. length: truncated which should not be done=1 and we need to bootstrap
                             if finish_reason == "stop":
-                                done[seq_len -1] = 1
+                                done[seq_len - 1] = 1
 
                             eos_in_tokens = response_ids[-1] == self.eos_id
                             ended_on_eos = (finish_reason == "stop" and stop_reason is None and eos_in_tokens)
@@ -273,6 +277,16 @@ class VLLMRolloutEngine:
     def score_response(self, prompt_ids, response_ids, finish_reason) -> List[float]:
         '''
             Calculate the reward for each response token.
-            it returns a float tensor of [T] where assign zero to prompt tokens.
+            it returns a float tensor of len(response_ids).
         '''
-        return self.reward_func(prompt_ids, response_ids, finish_reason)
+        rewards = self.reward_func(prompt_ids, response_ids, finish_reason)
+        if isinstance(rewards, torch.Tensor):
+            rewards = rewards.to(dtype=torch.float32, device='cpu')
+
+        else:
+            rewards = torch.tensor(rewards, dtype=torch.float32, device='cpu')
+
+        if rewards.numel() != len(response_ids):
+            raise ValueError(f"score_response must return len={len(response_ids)} rewards, got {rewards.numel()}")
+
+        return rewards

@@ -245,6 +245,8 @@ class VLLMRolloutEngine:
                             if finish_reason == "stop":
                                 done[seq_len - 1] = 1
 
+                            # if stop_reason is None, it means it ended on eos
+                            # see here https://docs.vllm.ai/en/stable/api/vllm/outputs/#vllm.outputs.CompletionOutput
                             eos_in_tokens = response_ids[-1] == self.eos_id
                             ended_on_eos = (finish_reason == "stop" and stop_reason is None and eos_in_tokens)
 

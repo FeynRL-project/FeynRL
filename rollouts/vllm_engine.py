@@ -159,11 +159,14 @@ class VLLMRolloutEngine:
            Extract logprobs for each token in response_ids from logprobs.
            logprobs_by_pos: list of dict {token_id -> logprob_info}
         '''
-        if logprobs_by_pos is None or len(response_ids) != len(logprobs_by_pos):
-            raise ValueError("logprobs_by_pos must be a list of dict with the same len as response_ids.")
+        if logprobs_by_pos is None:
+            raise ValueError("logprobs_by_pos must not be None.")
 
         if not isinstance(logprobs_by_pos, list):
             raise TypeError(f"logprobs_by_pos must be a list, got {type(logprobs_by_pos)}")
+
+        if len(response_ids) != len(logprobs_by_pos):
+            raise ValueError(f"logprobs_by_pos must have the same len as response_ids. Got {len(logprobs_by_pos)} vs {len(response_ids)}.")
 
         token_logprobs = []
         for t_id, lgp_dict in zip(response_ids, logprobs_by_pos):

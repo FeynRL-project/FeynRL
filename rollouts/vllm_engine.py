@@ -2,7 +2,6 @@ import torch
 import gc
 import ray
 from vllm import LLM, SamplingParams
-import numpy as np
 from typing import Optional, List, Callable, Any, Dict
 
 @ray.remote(resources={"vllm": 1})
@@ -62,10 +61,11 @@ class VLLMRolloutEngine:
            model_path == self.model_path:
             return False
 
-        self.model_path     = model_path
-        self.loaded_version = version
+        self.model_path = model_path
         self.load_model()
+        self.loaded_version = version
         return True
+
 
     def load_model(self) -> None:
         '''
@@ -114,7 +114,11 @@ class VLLMRolloutEngine:
         if self.n_samples < 1:
             raise ValueError("Strict on-policy requires n_samples >= 1.")
 
-        if self.stop is not None or self.stop_token_ids is not None or self.ignore_eos == True:
+        # vllm can return empty responses for max_tokens <= 0 which will break the rest of the code.
+        if self.max_tokens <= 0:
+            raise ValueError("max_tokens must be > 0.")
+
+        if self.stop is not None or self.stop_token_ids is not None or self.ignore_eos:
             raise ValueError(
                 "Strict on-policy requires stop=None, stop_token_ids=None, ignore_eos=False "
                 "(these change the trajectory distribution)."
@@ -158,6 +162,9 @@ class VLLMRolloutEngine:
         if logprobs_by_pos is None or len(response_ids) != len(logprobs_by_pos):
             raise ValueError("logprobs_by_pos must be a list of dict with the same len as response_ids.")
 
+        if not isinstance(logprobs_by_pos, list):
+            raise TypeError(f"logprobs_by_pos must be a list, got {type(logprobs_by_pos)}")
+
         token_logprobs = []
         for t_id, lgp_dict in zip(response_ids, logprobs_by_pos):
             if lgp_dict is None:
@@ -197,10 +204,19 @@ class VLLMRolloutEngine:
                     token-aligned and prediction-aligned logprobs/mask/done are returned.
                     Prediction-aligned here means: logit position t predicts token at t+1 (SFT-style shift).
                 '''
+                if not isinstance(prompts, list) or len(prompts) == 0:
+                    raise TypeError(f"prompts must be a non-empty list, got {type(prompts)}")
+
+                if self.force_strict_on_policy and int(policy_version) != int(self.loaded_version):
+                    raise ValueError(
+                                     f"Off-policy rollout: policy_version={int(policy_version)} "
+                                     f"but loaded_version={int(self.loaded_version)}. ")
+
                 assert self.vllm_engine is not None, f"{self.model_path} not loaded."
                 generated_outputs = self.vllm_engine.generate(prompts,
                                                              sampling_params=self.sampling_params,
                                                              use_tqdm=False)
+
                 # generated_outputs has prompt_ids and other outputs
                 # this works even if n_samples >= 1
                 rollout_samples = []
@@ -232,6 +248,11 @@ class VLLMRolloutEngine:
 
                         rewards   = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
+                        # it is important to score the response regardless of its length.
+                        # if it is empty, then reward-function should handle that case.
+                        rewards_resp = self.score_response(prompt_ids, response_ids, finish_reason)
+                        rewards[prompt_len:] = rewards_resp
+
                         if response_len > 0:
                             if response.logprobs is None:
                                 raise ValueError("response.logprobs is None. Check if SamplingParams(logprobs=1) is set.")
@@ -254,9 +275,6 @@ class VLLMRolloutEngine:
                             pred_mask[pred_start:pred_end] = 1
                             pred_old_logprobs[pred_start:pred_end] = response_logprobs
 
-                            rewards_resp = self.score_response(prompt_ids, response_ids, finish_reason)
-                            rewards[prompt_len:] = rewards_resp
-
                             # Terminal handling:
                             #  1. stop: ended due to EOS or a stop condition so done should be 1.
                             #  2. length: truncated which should not be done=1 and we need to bootstrap
@@ -264,6 +282,7 @@ class VLLMRolloutEngine:
                                 token_done[seq_len - 1] = 1
 
                                 # pred-aligned terminal is at the logit index that predicts last token
+                                # seq_len >= 2 is guaranteed since prompt_len >= 1 and response_len >= 1
                                 pred_done[seq_len - 2] = 1
 
                             # if stop_reason is None, it means it ended on eos
@@ -303,7 +322,7 @@ class VLLMRolloutEngine:
 
                 return rollout_samples
 
-    def score_response(self, prompt_ids, response_ids, finish_reason) -> List[float]:
+    def score_response(self, prompt_ids, response_ids, finish_reason) -> torch.Tensor:
         '''
             Calculate the reward for each response token.
             it returns a float tensor of len(response_ids).

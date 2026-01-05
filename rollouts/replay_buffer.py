@@ -2,6 +2,9 @@ import torch
 from typing import Dict, Optional, Any, List
 from torch.utils.data import Dataset
 
+# local imports
+from misc.utils import ensure_1d, pad_1d_to_length
+
 class ReplayBuffer(Dataset):
     '''
        Replay buffer for RL.
@@ -15,39 +18,9 @@ class ReplayBuffer(Dataset):
         self.items: List[Dict[str, Optional[torch.Tensor]]] = []
         self.pad_token_id = int(pad_token_id)
         self.max_seq_len  = int(max_seq_len)
-        # shows the total number of action tokens which are not masked which
+        # this shows the total number of action tokens which are not masked which
         # can be used for token-weighted scaling later.
         self.total_action_tokens = 0
-
-    @staticmethod
-    def ensure_1d(x: torch.Tensor, name: str):
-        '''
-            Sanity check to make sure the input is a 1D tensor.
-        '''
-        if x.dim() != 1:
-            raise ValueError(f"Expected {name} to be 1D, got {x.dim()}D")
-
-        return x
-
-    @staticmethod
-    def pad_to_len(x: torch.Tensor, pad_value: float, target_len: int) -> torch.Tensor:
-        '''
-            Pad/truncate 1D sequence x[T] to target_len.
-            Always returns length == target_len.
-        '''
-        seq_len = x.numel()
-
-        if seq_len > target_len:
-            return x[:target_len]
-
-        if seq_len < target_len:
-            pad = torch.full((target_len - seq_len,),
-                             pad_value,
-                             dtype=x.dtype,
-                             device=x.device)
-            return torch.cat([x, pad], dim=0)
-
-        return x
 
     def add(self,
             generated_token_ids: torch.Tensor,
@@ -60,12 +33,12 @@ class ReplayBuffer(Dataset):
         '''
             dones: 1=eos, 0=not eos
         '''
-        input_ids =  self.ensure_1d(input_ids, "input_ids")
-        attn_mask = self.ensure_1d(attn_mask, "attn_mask")
-        old_logps = self.ensure_1d(old_logps, "old_logps")
-        token_masks = self.ensure_1d(token_masks, "token_masks")
-        rewards = self.ensure_1d(rewards, "rewards")
-        dones = self.ensure_1d(dones, "dones")
+        input_ids =  ensure_1d(input_ids, "input_ids")
+        attn_mask = ensure_1d(attn_mask, "attn_mask")
+        old_logps = ensure_1d(old_logps, "old_logps")
+        token_masks = ensure_1d(token_masks, "token_masks")
+        rewards = ensure_1d(rewards, "rewards")
+        dones = ensure_1d(dones, "dones")
 
         if v_old is not None:
             v_old = self.ensure_1d(v_old, "v_old")

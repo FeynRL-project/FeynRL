@@ -27,3 +27,32 @@ def safe_string_to_torch_dtype(dtype_in):
             return torch.float64
 
     raise ValueError(f"Unsupported model_dtype: {dtype_in}")
+
+
+def ensure_1d(x: torch.Tensor, name: str) -> torch.Tensor:
+    '''
+        Sanity check to make sure the input is a 1D tensor.
+    '''
+    if x.dim() != 1:
+        raise ValueError(f"Expected {name} to be 1D, got {x.dim()}D")
+
+    return x
+
+def pad_1d_to_length(x: torch.Tensor, pad_value: float, target_len: int) -> torch.Tensor:
+    '''
+        Pad/truncate 1D sequence x[T] to target_len.
+        Always returns length == target_len.
+    '''
+    seq_len = x.numel()
+
+    if seq_len > target_len:
+        return x[:target_len]
+
+    if seq_len < target_len:
+        pad = torch.full((target_len - seq_len,),
+                            pad_value,
+                            dtype=x.dtype,
+                            device=x.device)
+        return torch.cat([x, pad], dim=0)
+
+    return x

@@ -4,7 +4,7 @@ from tqdm import tqdm
 import ray
 
 @ray.remote(resources={"training": 1})
-class GRPO:
+class PG:
     def __init__(self,
                 policy_engine,
                 kl_coeff: float,
@@ -14,6 +14,7 @@ class GRPO:
                 use_cache: bool,
                 micro_batch_size_per_gpu: int,
                 ref_model=None,
+                update_after_full_replay: bool,
                 ):
 
         # model related parameters
@@ -31,6 +32,9 @@ class GRPO:
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
 
+        # if true, it means the update is done after seeing all samples in the reply buffer
+        # treating the entire buffer as a single batch.
+        self.update_only_after_full_replay = update_after_full_replay
 
     def policy_forward(self, input_ids, att_mask, pos_ids):
         '''
@@ -58,8 +62,8 @@ class GRPO:
         target_ids = input_ids[:, 1:].contiguous()
 
         # cross_entropy return -logprobs but we need logprobs
-        # logits is [B, T-1, vocab_size]
-        # target_ids is [B, T-1]
+        # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
+        # target_ids is [B, T-1] --> [B * (T-1)]
         neg_logprobs = self.cross_entropy(logits.view(-1, vocab_size), target_ids.view(-1))
         logprobs = -neg_logprobs.view(B, T_minus_1)
         # we can also do this, but it is less efficient I guess
@@ -80,7 +84,9 @@ class GRPO:
                             entropies: torch.Tensor,
                             ):
         '''
-            logprobs, old_logprobs, advantages, mask: [B, T]
+            logprobs: [B, T-1]
+            old_logprobs, advantages, mask: [B, T - 1]
+            entropies: [B, T-1]
             Compute policy loss:
                 1. ratio = exp(logprobs - old_logprobs)
                 2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
@@ -95,7 +101,7 @@ class GRPO:
         mask = (mask.to(device=device) > 0.5).to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
-        # 2. calculate ratio = exp(logprobs - old_logprobs)
+        # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
         logratio = (logprobs - old_logprobs).to(torch.float32)
         ratio   = torch.exp(logratio)
 
@@ -160,7 +166,14 @@ class GRPO:
             ########
             # 1. Data from buffer
             ########
-            rewards   = micro_batch['rewards'].to(device, non_blocking=True)
+            # all are [B, T]
+            # zscore is normalized rewards using the number of samples for each proompt
+            # For a given prompt with N sampled completions:
+            #   mu  = (1/N) * \sum_{j=1}^N r_j
+            #   adv_i or zscore_i = (r_i - mu) / (std + eps)
+            # this is a simple baseline for policy gradients as it reflects relative quality
+            # among that prompt’s samples.
+            advs = micro_batch['zscore'].to(device, non_blocking=True)
             done      = micro_batch['done'].to(device, non_blocking=True)
             mask      = micro_batch['mask'].to(device, non_blocking=True)
             old_logprobs = micro_batch['old_logprobs'].to(device, non_blocking=True)
@@ -170,23 +183,24 @@ class GRPO:
             pos_ids   = micro_batch.get('position_ids', None)
 
             ########
-            # 2. Compute advantages
+            # 2. Compute loss
             ########
             # Forward pass through the current policy.
-            pi_logprobs, pi_entropies = self.policy_forward(
-                                                                input_ids=input_ids,
-                                                                att_mask=att_mask,
-                                                                pos_ids=pos_ids)
+            pi_logprobs, pi_entropies = self.policy_forward(input_ids=input_ids,
+                                                            att_mask=att_mask,
+                                                            pos_ids=pos_ids)
 
             # Compute policy loss using the current policy.
-            pi_loss, pi_metrics = self.compute_policy_loss(
-                                                        logprobs=pi_logprobs,
-                                                        old_logprobs=old_logprobs,
-                                                        advantages=advantages,
-                                                        mask=mask,
-                                                        entropies=pi_entropies)
+            pi_loss, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
+                                                           old_logprobs=old_logprobs,
+                                                           advantages=advs,
+                                                           mask=mask,
+                                                           entropies=pi_entropies)
 
-            self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
+            if self.update_only_after_full_replay:
+                # is_boundary is true, deepspeed will only update the parameters
+                # after seeing all samples in the replay buffer.
+                self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
             # backward pass
             self.policy_engine.backward(pi_loss)

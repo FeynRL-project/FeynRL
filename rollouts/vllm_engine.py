@@ -3,6 +3,7 @@ import gc
 import ray
 from vllm import LLM, SamplingParams
 from typing import Optional, List, Callable, Any, Dict
+import numpy as np
 
 @ray.remote(resources={"vllm": 1})
 class VLLMRolloutEngine:
@@ -231,7 +232,7 @@ class VLLMRolloutEngine:
                 rollout_samples = []
                 for data in generated_outputs:
                     group_samples = []
-                    group_stats   = {}
+                    group_stats   = {'reward': [], 'length': []}
                     prompt_ids = list(data.prompt_token_ids or [])
                     prompt_len = len(prompt_ids)
                     if prompt_len == 0:
@@ -248,13 +249,13 @@ class VLLMRolloutEngine:
                         seq_len = prompt_len + response_len
                         input_ids = torch.tensor(prompt_ids + response_ids, dtype=torch.int64, device='cpu')
 
-                        token_mask      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        token_done      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                        token_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                        token_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
                         token_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
                         # prediction-level
-                        pred_mask      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        pred_done      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                        pred_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                        pred_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
                         pred_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
                         rewards   = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
@@ -262,11 +263,6 @@ class VLLMRolloutEngine:
                         # it is important to score the response regardless of its length if it is empty
                         rewards_resp = self.score_response(prompt_ids, response_ids, finish_reason)
                         rewards[prompt_len:] = rewards_resp
-
-                        # keep the sum of rewards
-                        if len(group_stats) == 0:
-                            group_stats['reward'] =[]
-                            group_stats['length'] =[]
 
                         # is_per_token is False, then rewards_resp will only have value for the last element
                         group_stats['reward'].append(rewards_resp.sum().item())
@@ -279,7 +275,7 @@ class VLLMRolloutEngine:
                             #####
                             # token-aligned
                             #####
-                            token_mask[prompt_len:] = 1 # 1 if valid token which we want to update.
+                            token_masks[prompt_len:] = 1 # 1 if valid token which we want to update.
                             response_logprobs = self.extract_logprobs(response_ids, response.logprobs)
                             token_old_logprobs[prompt_len:] = response_logprobs
 
@@ -289,20 +285,22 @@ class VLLMRolloutEngine:
                             # To recall how autoregressive models work:
                             # - response token j is at token index prompt_len + j in input_ids
                             # - and this is predicted by logits index prompt_len + j - 1
+                            # pred_aligned which would be one we will use in policy update
+                            # and to avoid any weired indexing later in the training loop.
                             pred_start = prompt_len - 1
                             pred_end   = seq_len - 1
-                            pred_mask[pred_start:pred_end] = 1
+                            pred_masks[pred_start:pred_end] = 1
                             pred_old_logprobs[pred_start:pred_end] = response_logprobs
 
                             # Terminal handling:
                             #  1. stop: ended due to EOS or a stop condition so done should be 1.
                             #  2. length: truncated which should not be done=1 and we need to bootstrap
                             if finish_reason == "stop":
-                                token_done[seq_len - 1] = 1
+                                token_dones[seq_len - 1] = 1
 
                                 # pred-aligned terminal is at the logit index that predicts last token
                                 # seq_len >= 2 is guaranteed since prompt_len >= 1 and response_len >= 1
-                                pred_done[seq_len - 2] = 1
+                                pred_dones[seq_len - 2] = 1
 
                             # if stop_reason is None, it means it ended on eos
                             # see here https://docs.vllm.ai/en/stable/api/vllm/outputs/#vllm.outputs.CompletionOutput
@@ -313,6 +311,8 @@ class VLLMRolloutEngine:
                             ended_on_eos = False
 
                         # rollout sample in group if n_samples >= 1
+                        # I didn't drop response_len == 0 here as it can be useful for logging, or even reward normalization as
+                        # reward function should be designed in such way that it assigns negative rewards for example to empty responses.
                         group_samples.append({
                                                 "iter": int(current_iter),
                                                 "policy_version": int(policy_version),
@@ -321,13 +321,14 @@ class VLLMRolloutEngine:
                                                 # token-aligned
                                                 "input_ids": input_ids, #[T]
                                                 "rewards": rewards, #[T]
-                                                "token_mask": token_mask, #[T] 1 on response/valid tokens
-                                                "token_done": token_done, #[T] 1 on last token if terminal
+                                                "zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
+                                                "token_masks": token_masks, #[T] 1 on response/valid tokens
+                                                "token_dones": token_dones, #[T] 1 on last token if terminal
                                                 "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
 
                                                 # pred-aligned
-                                                "pred_mask": pred_mask, #[T]
-                                                "pred_done": pred_done, #[T]
+                                                "pred_masks": pred_masks, #[T]
+                                                "pred_dones": pred_dones, #[T]
                                                 "pred_old_logprobs": pred_old_logprobs, #[T]
 
                                                 "finish_reason": finish_reason,
@@ -337,8 +338,10 @@ class VLLMRolloutEngine:
                                                 "response_ids": response_ids, # list[int]
                                                 "prompt_ids": prompt_ids, # list[int]
                                                 "response_text": getattr(response, "text", ""),
+                                                "response_len": response_len,
                                                 })
-                    if len(group_samples) > 0:
+                    if len(group_samples) > 1:
+                        # add zscore to the above samples
                         self.normalize_rewards(
                                                 samples=group_samples,
                                                 stats=group_stats,
@@ -392,6 +395,6 @@ class VLLMRolloutEngine:
             # sample['reward'][-1]: means the last token reward
             zscore = torch.zeros_like(sample['reward'], dtype=torch.float)
             zscore[-1] = (sample['reward'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
-            sample["zscore"] = zscore
+            sample["zscores"] = zscore
             if self.reward_broadcast:
-                sample["zscore"][prompt_len:] = zscore[-1]
+                sample["zscores"][prompt_len:] = zscore[-1]

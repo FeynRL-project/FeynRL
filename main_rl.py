@@ -6,16 +6,16 @@ import deepspeed
 import torch
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader, DistributedSampler
-import torch.distributed as torch_dist
 from tqdm import tqdm
-import gc
 import ray
 
 # imports local methods, classes, etc.
 import config.load as cfg # all config arguments
 from custom_datasets.prompt_only_dataset import PromptOnlyDataset # our custom pytorch dataset
 from misc.utils import safe_string_to_torch_dtype
-from rollout_engine import VLLMRolloutEngine
+from rollouts.vllm_rollout_engine import VLLMRolloutEngine
+from rollouts.replay_buffer import ReplayBuffer
+import rewards as reward_fns
 
 def set_random_seeds(seed):
     '''
@@ -28,14 +28,10 @@ def set_random_seeds(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def rank_setup(world_size):
+def rank_setup():
     '''
         Detect rank from environment variables.
     '''
-    # world_size is the total number of gpus (e.g, 2 nodes x 4 gpus = 8 gpus in total). 
-    # world size need to be at least 1
-    assert world_size >= 1, 'world_size need to be at least 1'
-
     # Unique id of gpu in the ENTIRE WORLD. It ranges from 0 to world_size - 1
     rank = int(os.environ.get('RANK', 0))
 
@@ -53,7 +49,7 @@ def rank_setup(world_size):
 
         torch.cuda.set_device(local_rank)
 
-    return rank, world_size, local_rank
+    return rank, local_rank
 
 def setup_ray(ray_address):
     '''
@@ -75,21 +71,22 @@ def setup_ray(ray_address):
     return ray, master_addr
 
 def training_runner_setup(model_path,
-                           ref_model_path,
-                           model_dtype,
-                           trust_remote_code,
-                           attn_impl,
-                           world_size,
-                           master_addr,
-                           master_port,
-                           alg,
-                           kl_coeff,
-                           clip_low,
-                           clip_high,
-                           entropy_coeff,
-                           use_cache,
-                           micro_batch_size_per_gpu,
-                           update_after_full_replay):
+                          ref_model_path,
+                          model_dtype,
+                          trust_remote_code,
+                          attn_impl,
+                          world_size,
+                          master_addr,
+                          master_port,
+                          alg,
+                          kl_coeff,
+                          clip_low,
+                          clip_high,
+                          entropy_coeff,
+                          use_cache,
+                          micro_batch_size_per_gpu,
+                          update_after_full_replay,
+                          deepspeed_config):
     '''
         This function is responsible for running the training engine.
     '''
@@ -108,7 +105,7 @@ def training_runner_setup(model_path,
                             ).remote(
                                      model_path=model_path,
                                      ref_model_path=ref_model_path,
-                                     model_dtype=model_dtype,
+                                     model_dtype=safe_string_to_torch_dtype(model_dtype),
                                      trust_remote_code=trust_remote_code,
                                      attn_impl=attn_impl,
                                      kl_coeff=kl_coeff,
@@ -118,6 +115,7 @@ def training_runner_setup(model_path,
                                      use_cache=use_cache,
                                      micro_batch_size_per_gpu=micro_batch_size_per_gpu,
                                      update_after_full_replay=update_after_full_replay,
+                                     deepspeed_config=deepspeed_config,
                                      )
         ray_runners.append(runner)
 
@@ -141,13 +139,11 @@ def inference_engine_setup(model_path,
                            eos_id,
                            reward_broadcast,
                            eps_reward_norm,
-                           gen_gpus,
+                           rollout_gpus,
                            ):
     '''
         This function is responsible for setting up distributed inference engine.
     '''
-    tp = int(tensor_parallel_size)
-    num_rollout_engines = max(1, int(gen_gpus) // tp)
 
     kwargs = { "model_path": model_path,
                "trust_remote_code": trust_remote_code,
@@ -168,12 +164,15 @@ def inference_engine_setup(model_path,
                "reward_broadcast": reward_broadcast,
                "eps_reward_norm": eps_reward_norm,
             }
-    rollout_engines = [
-                       VLLMRolloutEngine.options(num_gpus=tp).remote(**kwargs)
-                                                                        for _ in range(num_rollout_engines)
-                      ]
 
-    return rollout_engines
+    tp = int(tensor_parallel_size)
+    num_rollout_engines = max(1, int(rollout_gpus) // tp)
+
+    rollout_engines = []
+    for _ in range(num_rollout_engines):
+        rollout_engines.append(VLLMRolloutEngine.options(num_gpus=tp).remote(**kwargs))
+
+    return num_rollout_engines, rollout_engines
 
 def load_tokenizer(model_name,
                    trust_remote_code=False,
@@ -201,35 +200,29 @@ def load_tokenizer(model_name,
 
     return tokenizer
 
-def data_loader_setup(dnames,
-                      dataset_ratios,
-                      files_path,
-                      num_workers,
-                      max_seq_len,
-                      prompt_key,
-                      answer_key,
-                      batch_size,
-                      tokenizer,
-                      seed,
-                      split='train',
-                      world_size=1,
-                      rank=0):
+def rollout_dataloader_setup(files_path,
+                             num_workers,
+                             max_seq_len,
+                             prompt_key,
+                             rollout_batch_size,
+                             tokenizer,
+                             num_rollout_engines,
+                             split='train',
+                             ):
     '''
-       Setup DataLoader for distributed training.
-       Notes:
-           - batch_size is the per-gpu-micro-batch size. Global batch size = batch_size * world_size * gradient_accumulation_steps.
-           - Sampler is DistributedSampler; caller must call sampler.set_epoch(epoch) each epoch.
+       This dataloader is used for rollout generation.
     '''
     # 1. Initialize our custom datasets
     prompt_ds = PromptOnlyDataset(prompt_key=prompt_key,
-                            max_seq_len=max_seq_len,
-                            tokenizer=tokenizer,
-                            data_path=files_path,
-                            return_text=False)
+                                  max_seq_len=max_seq_len,
+                                  tokenizer=tokenizer,
+                                  data_path=files_path,
+                                  return_text=False)
 
-    dataloader = DataLoader(
-                            dataset=prompt_ds,
-                            batch_size=rollout_batch_size,
+    # since we split the data across the rollout engines
+    bsz = num_rollout_engines * rollout_batch_size
+    dataloader = DataLoader(dataset=prompt_ds,
+                            batch_size=bsz,
                             num_workers=num_workers,
                             shuffle=True,
                             pin_memory=True,
@@ -250,11 +243,15 @@ if __name__ == "__main__":
     # 1. Miscellaneous setups
     ########
     rank, local_rank = rank_setup()
-    world_size = config.run.world_size
     config = cfg.load_and_verify(input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
                                  )
     set_random_seeds(seed=config.run.seed)
+
+    # number of gpus for training which is used by deepspeed
+    training_gpus = config.run.training_gpus
+    # number of gpus for rollout generation which is used by vllm
+    rollout_gpus  = config.run.rollout_gpus
 
     ########
     # 2. initialize ray
@@ -280,12 +277,12 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown algorithm: {config.train.alg_name}")
 
-    training_engine_runner = training_runner_setup(model_path=config.model.name,
+    training_engine_runners = training_runner_setup(model_path=config.model.name,
                                                   ref_model_path=config.model.ref_model,
                                                   model_dtype=config.model.dtype,
                                                   trust_remote_code=config.model.trust_remote_code,
                                                   attn_impl=config.model.attn_implementation,
-                                                  world_size=world_size,
+                                                  world_size=training_gpus,
                                                   master_addr=master_addr,
                                                   master_port=config.run.ray_master_port,
                                                   alg=alg,
@@ -294,156 +291,155 @@ if __name__ == "__main__":
                                                   clip_high=config.train.clip_high,
                                                   entropy_coeff=config.train.entropy_coeff,
                                                   use_cache=config.model.use_cache,
-                                                  train_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
-                                                  update_after_full_replay=config.train.update_after_full_replay)
+                                                  micro_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
+                                                  update_after_full_replay=config.train.update_after_full_replay,
+                                                  deepspeed_config=config.deepspeed)
     ########
     # 5. load tokenizer
     ########
-    tokenizer = load_tokenizer()
+    tokenizer = load_tokenizer(model_name=config.model.name,
+                               trust_remote_code=config.model.trust_remote_code,
+                               rank=rank)
 
     ########
     # 6. initialize inference engine
     ########
-    rollout_engines = inference_engine_setup(model_path=config.model.name,
-                                             trust_remote_code=config.model.trust_remote_code,
-                                             temperature=config.inference_engine.temperature,
-                                             max_tokens=config.inference_engine.max_tokens,
-                                             n_samples=config.inference_engine.n_samples,
-                                             top_p=config.inference_engine.top_p,
-                                             top_k=config.inference_engine.top_k,
-                                             seed=config.run.seed,
-                                             ignore_eos=config.inference_engine.ignore_eos,
-                                             stop=config.inference_engine.stop,
-                                             stop_token_ids=config.inference_engine.stop_token_ids,
-                                             prompt_logprobs=config.inference_engine.prompt_logprobs,
-                                             force_strict_on_policy=config.inference_engine.force_strict_on_policy,
-                                             reward_func=config.inference_engine.reward_func,
-                                             tensor_parallel_size=config.inference_engine.tensor_parallel_size,
-                                             eos_id=tokenizer.eos_token_id,
-                                             reward_broadcast=config.inference_engine.reward_broadcast,
-                                             eps_reward_norm=config.inference_engine.eps_reward_norm,
-                                             gen_gpus=config.run.gen_gpus,)
-
-    ########
-    # 6. Build env or data loader
-    ########
-    train_dataloader, train_sampler = data_loader_setup(dnames=config.data.train_dnames,
-                                                        dataset_ratios=config.data.train_ratios,
-                                                        files_path=config.data.train_files_path,
-                                                        num_workers=config.data.num_workers,
-                                                        max_seq_len=config.data.max_seq_len,
-                                                        prompt_key=config.data.prompt_key,
-                                                        answer_key=config.data.answer_key,
-                                                        batch_size=config.train.train_batch_size_per_gpu,
-                                                        tokenizer=tokenizer,
-                                                        seed=config.run.seed,
-                                                        split='train',
-                                                        world_size=world_size,
-                                                        rank=rank)
-
-    val_dataloader, _ = data_loader_setup(dnames=config.data.train_dnames,
-                                          dataset_ratios=config.data.train_ratios,
-                                          files_path=config.data.val_files_path,
-                                          num_workers=config.data.num_workers,
-                                          max_seq_len=config.data.max_seq_len,
-                                          prompt_key=config.data.prompt_key,
-                                          answer_key=config.data.answer_key,
-                                          batch_size=config.train.val_batch_size_per_gpu,
-                                          tokenizer=tokenizer,
-                                          seed=config.run.seed,
-                                          split='val',
-                                          world_size=world_size,
-                                          rank=rank)
-
-    ########
-    # 7. Intitate the learning algorithm (e.g., ppo)
-    ########
-    if str.lower(config.train.alg_name) in {'pg'}:
-        if str.lower(config.train.alg_name) == 'pg':
-            import algs.PG.pg as calg
-            alg = calg.PG(
-                           model_engine=model_engine,
-                           optimizer=optimizer,
-                           device=model_engine.device,
-                           use_cache=config.model.use_cache,
-                           normalize_loss=config.train.normalize_loss)
+    if config.reward.reward_func:
+        reward_fnc = getattr(reward_fns, config.reward.reward_func)
 
     else:
-        raise ValueError(f"Unknown algorithm: {config.train.alg_name}")
+        raise ValueError("Reward function not specified")
+
+    num_rollout_engines, rollout_engines = inference_engine_setup(model_path=config.model.name,
+                                                                  trust_remote_code=config.model.trust_remote_code,
+                                                                  temperature=config.inference_engine.temperature,
+                                                                  max_tokens=config.inference_engine.max_tokens,
+                                                                  n_samples=config.inference_engine.n_samples,
+                                                                  top_p=config.inference_engine.top_p,
+                                                                  top_k=config.inference_engine.top_k,
+                                                                  seed=config.run.seed,
+                                                                  ignore_eos=config.inference_engine.ignore_eos,
+                                                                  stop=config.inference_engine.stop,
+                                                                  stop_token_ids=config.inference_engine.stop_token_ids,
+                                                                  prompt_logprobs=config.inference_engine.prompt_logprobs,
+                                                                  force_strict_on_policy=config.inference_engine.force_strict_on_policy,
+                                                                  reward_func=reward_fnc,
+                                                                  tensor_parallel_size=config.inference_engine.tensor_parallel_size,
+                                                                  eos_id=tokenizer.eos_token_id,
+                                                                  reward_broadcast=config.reward.reward_broadcast,
+                                                                  eps_reward_norm=config.reward.eps_reward_norm,
+                                                                  rollout_gpus=config.run.rollout_gpus,)
 
     ########
-    # 8. Training and evaluation loop
+    # 6. Load the rollout dataloader
     ########
-    if rank == 0:
-        print("Starting training...")
+    rollout_dataloader = rollout_dataloader_setup(files_path=config.data.train_files_path,
+                                                  num_workers=config.data.num_workers,
+                                                  max_seq_len=config.data.max_seq_len,
+                                                  prompt_key=config.data.prompt_key,
+                                                  rollout_batch_size=config.train.train_batch_size_per_gpu,
+                                                  tokenizer=tokenizer,
+                                                  num_rollout_engines=num_rollout_engines,
+                                                  split='train',
+                                                  )
 
-    global_step = 0
+    replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
+                                 max_seq_len=config.data.max_seq_len,
+                                 )
+    ########
+    # 7. Training and evaluation loop
+    ########
+    policy_version = 0
+    number_of_epochs  = config.train.total_number_of_epochs
+    total_training_steps_per_epoch = config.train.train_steps_per_epoch
 
-    # Sync before starting
-    # Ensure all nodes have loaded the model and data before anyone starts iterating
-    torch.distributed.barrier()
+    for epoch in range(number_of_epochs):
+        ################
+        # Sample generation step
+        ################
+        # 1) Generate rollouts
+        for rollout_batch in rollout_dataloader:
+            # 1.1 split data across rollout engines
+            # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
+            rollout_shards = torch.split(rollout_batch, num_rollout_engines, dim=0)
 
-    for epoch in range(config.train.total_number_of_epochs):
-        train_sampler.set_epoch(epoch)
+            # 1.2 generate rollouts
+            rollout_samples = []
+            for eng, shard in zip(rollout_engines, rollout_shards):
+                rollout_samples.append(eng.generate.remote(prompts=shard,
+                                                           current_iter=epoch,
+                                                           policy_version=policy_version))
 
-        ########
-        # 8.1 Training loop
-        ########
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.train.total_number_of_epochs}", disable=(rank != 0))
+            # 1.3 gather rollouts
+            rollout_lists = ray.get(rollout_samples)
 
-        for step, micro_batch in enumerate(progress_bar):
-            # Move batch to gpu (deepspeed engine device)
-            micro_batch = {k: v.to(model_engine.device) for k, v in micro_batch.items()}
+            # 1.4 merge rollouts
+            rollout_merged = []
+            for rl in rollout_lists:
+                rollout_merged.extend(rl)
 
-            # Run one train step for micro-batch.
-            metric = alg.train_step(micro_batch)
-            global_step += 1
+            # 1.5 add to replay buffer
+            replay_buffer.add_batch_seqs(rollout_merged)
 
-            # logging
-            if rank == 0 and step % config.deepspeed.steps_per_print == 0:
-                progress_bar.set_postfix(loss=metric['loss'])
+        if len(replay_buffer) <= 1:
+            raise ValueError("Replay buffer is empty")
 
-        # Sync before validation to ensure consistent state
-        torch.distributed.barrier()
+        ################
+        # Training step
+        ################
+        # 2. create dataloader from replay buffer
+        train_dataloader = DataLoader(dataset=replay_buffer,
+                                      batch_size=config.train.train_batch_size_per_gpu,
+                                      shuffle=True,
+                                      num_workers=0,
+                                      pin_memory=True,
+                                      collate_fn=replay_buffer.collate_fn,
+                                      )
 
-        # Clear graph and to reclaim fragmented memory from training ONCE per epoch
-        torch.cuda.empty_cache()
-        gc.collect()
+        # 3. update the policy based on the current replay buffer
+        for tidx in range(total_training_steps_per_epoch):
+            # 3.1 send training task to all training engines
+            train_futures = []
+            for engine in training_engine_runners:
+                train_futures.append(engine.train_step.remote(train_dataloader))
 
-        ########
-        # 8.2 Validation loop
-        ########
-        # to be safe and caculate loss average across batches and across GPUs correctly, we use
-        # the following instead computes per-rank average and then all-reduces averages
-        local_sum = torch.tensor(0.0, device=model_engine.device)
-        local_count = torch.tensor(0.0, device=model_engine.device)
+            # 3.2 gather training metrics from all engines
+            train_metrics = ray.get(train_futures)
 
-        for data in val_dataloader:
-            val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
-            val_metric = alg.eval_step(val_batch)
-            local_sum += float(val_metric['loss'])
-            local_count += 1
+            # 3.3 log training progress
+            if rank == 0 and tidx % 10 == 0:
+                # aggregate metrics across all training engines
+                avg_loss = np.mean([m.get('loss_total', 0.0) for m in train_metrics])
+                avg_kl = np.mean([m.get('approx_kl', 0.0) for m in train_metrics])
+                print(f"Epoch {epoch+1}/{number_of_epochs}, "
+                      f"Step {tidx+1}/{total_training_steps_per_epoch}, "
+                      f"Loss: {avg_loss:.4f}, KL: {avg_kl:.4f}")
 
-        # Aggregate across all ranks
-        torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
+        # 4. update policy version and clear replay buffer
+        policy_version += 1
+        if config.train.update_after_full_replay:
+            replay_buffer.__reset__()
 
-        global_avg_loss = (local_sum / torch.clamp(local_count, min=1.0)).item()
-        if rank == 0:
-            print(f"Epoch {epoch+1}, Validation Loss: {global_avg_loss}")
+        ################
+        # Save current policy
+        ################
+        tag = f"iter{epoch:06d}_v{policy_version:06d}"
+        # save must run on *all ranks* for zero-3 correctness.
+        save_paths = []
+        for engine in training_engine_runners:
+            save_paths.append(engine.save_hf_model.remote(output_path="./checkpoints", tag=tag))
 
-        ########
-        # 8.3 Save checkpoint
-        ########
-        # Sync before saving to ensure no one is still writing
-        torch.distributed.barrier()
+        save_paths = ray.get(save_paths)
+        ################
+        # Refresh rollout policy
+        ################
+        refs = []
+        for eng in rollout_engines:
+            refs.append(eng.refresh_policy.remote(policy_version))
+        ray.get(refs)
 
-        tag = f"epoch_{epoch+1}"
-        # DeepSpeed handles the collective saving internally so we don't need to worry about different ranks.
-        model_engine.save_checkpoint(config.deepspeed.monitor_config.get("tensorboard", {}).get("output_path", "./checkpoints"), tag=tag)
+    print("Training completed")
+    ray.shutdown()
 
-        # Wait for saving to complete on all ranks
-        torch.distributed.barrier()
 
-    if rank == 0:
-        print("Training complete.")
+

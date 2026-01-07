@@ -226,7 +226,8 @@ if __name__ == "__main__":
     ########
     # 2. Load config
     ########
-    config = cfg.load_and_verify(input_yaml=args.config_file,
+    config = cfg.load_and_verify(model_type="sl",
+                                 input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
                                  world_size=world_size,
                                  )

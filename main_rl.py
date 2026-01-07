@@ -243,7 +243,8 @@ if __name__ == "__main__":
     # 1. Miscellaneous setups
     ########
     rank, local_rank = rank_setup()
-    config = cfg.load_and_verify(input_yaml=args.config_file,
+    config = cfg.load_and_verify(model_type="rl",
+                                 input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
                                  )
     set_random_seeds(seed=config.run.seed)

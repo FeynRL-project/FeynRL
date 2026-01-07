@@ -5,7 +5,7 @@ import ray
 import deepspeed
 from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
-@ray.remote(resources={"training": 1})
+@ray.remote
 class PG:
     def __init__(self,
                  model_path: str,
@@ -255,10 +255,10 @@ class PG:
             #   adv_i or zscore_i = (r_i - mu) / (std + eps)
             # this is a simple baseline for policy gradients as it reflects relative quality
             # among that prompt’s samples.
-            advs = micro_batch['zscore'].to(device, non_blocking=True)
-            done      = micro_batch['done'].to(device, non_blocking=True)
-            mask      = micro_batch['mask'].to(device, non_blocking=True)
-            old_logprobs = micro_batch['old_logprobs'].to(device, non_blocking=True)
+            advs = micro_batch['zscore'][:, :-1].to(device, non_blocking=True)
+            done      = micro_batch['done'][:, :-1].to(device, non_blocking=True)
+            mask      = micro_batch['mask'][:, :-1].to(device, non_blocking=True)
+            old_logprobs = micro_batch['old_logprobs'][:, :-1].to(device, non_blocking=True)
 
             input_ids = micro_batch['input_ids'].to(device, non_blocking=True)
             att_mask  = micro_batch['attn_mask'].to(device, non_blocking=True)
@@ -298,3 +298,20 @@ class PG:
                 aggregated_metrics[key] = np.mean([m[key] for m in all_metrics])
 
         return aggregated_metrics
+
+    def save_checkpoint(self, output_path: str, tag: str):
+        '''
+            Minimal wrapper to access internal DeepSpeed engine for checkpoint saving.
+            This method must remain in PG class to access self.policy_engine.
+
+            Args:
+                output_path: Base directory for checkpoints
+                tag: Checkpoint tag/name
+
+            Returns:
+                save_dir: Path where the checkpoint was saved
+        '''
+        import os
+        save_dir = os.path.join(output_path, tag)
+        self.policy_engine.save_checkpoint(output_path, tag=tag)
+        return save_dir

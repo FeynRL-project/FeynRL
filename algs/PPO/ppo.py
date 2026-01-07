@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import ray
+from typing import Dict
 
 @ray.remote(resources={"training": 1})
 class PPO:
@@ -153,6 +154,8 @@ class PPO:
         target_ids = input_ids[:, 1:].contiguous()
 
         # cross_entropy return -logprobs but we need logprobs
+        # logits is [B, T-1, vocab_size]
+        # target_ids is [B, T-1]
         neg_logprobs = self.cross_entropy(logits.view(-1, vocab_size), target_ids.view(-1))
         logprobs = -neg_logprobs.view(B, T_minus_1)
         # we can also do this, but it is less efficient I guess
@@ -247,8 +250,10 @@ class PPO:
 
         # [B, T, 1] -> [B, T]
         every_token_values = output.logits.squeeze(-1)
+        # [B, T] -> [B, T-1]
         values = every_token_values[:, :-1].contiguous()
         # Value for terminal state (e.g., t=T-1) for bootstrapping if not EOS
+        #[B, T] -> [B]
         last_value = every_token_values[:, -1].contiguous()
 
         return values, last_value
@@ -295,6 +300,84 @@ class PPO:
 
         return loss, metrics
 
+    def policy_step_update(self,
+                           input_ids: torch.Tensor,
+                           att_mask: torch.Tensor,
+                           pos_ids,
+                           old_logprobs: torch.Tensor,
+                           advantages: torch.Tensor,
+                           mask: torch.Tensor,
+                           is_boundary: bool,
+                           ) -> Dict[str, float]:
+        '''
+            Update policy using the current policy.
+            input_ids/att_mask/pos_ids: [B, T]
+            old_logprobs/advantages/mask: [B, T]
+            is_boundary: bool
+            Returns:
+                policy_metrics: Dictionary containing policy metrics.
+        '''
+        # Forward pass through the current policy.
+        pi_logprobs, pi_entropies = self.policy_forward(
+                                                        input_ids=input_ids,
+                                                        att_mask=att_mask,
+                                                        pos_ids=pos_ids)
+
+        # Compute policy loss using the current policy.
+        pi_loss, pi_metrics = self.compute_policy_loss(
+                                                logprobs=pi_logprobs,
+                                                old_logprobs=old_logprobs,
+                                                advantages=advantages,
+                                                mask=mask,
+                                                entropies=pi_entropies)
+
+        self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
+
+        # backward pass
+        self.policy_engine.backward(pi_loss)
+        self.policy_engine.step()
+
+        return pi_metrics
+
+    def value_step_update(self,
+                          input_ids: torch.Tensor,
+                          att_mask: torch.Tensor,
+                          pos_ids: torch.Tensor | None,
+                          v_old: torch.Tensor,
+                          returns: torch.Tensor,
+                          mask: torch.Tensor,
+                          is_boundary: bool,
+                          device: torch.device,
+                          ) -> Dict[str, float]:
+        '''
+            Update value using the current value.
+            input_ids/att_mask/pos_ids: [B, T]
+            values/v_old/returns/mask: [B, T]
+            is_boundary: bool
+            Returns:
+                value_metrics: Dictionary containing value metrics.
+        '''
+        if v_old is not None:
+            v_old = v_old.to(device, non_blocking=True)
+
+        values, last_value = self.value_forward(
+                                            input_ids=input_ids,
+                                            att_mask=att_mask,
+                                            pos_ids=pos_ids)
+
+        vl_loss, vl_metrics = self.compute_value_loss(
+                                            values=values,
+                                            v_old=v_old,
+                                            returns=returns,
+                                            mask=mask)
+
+        self.value_engine.set_gradient_accumulation_boundary(is_boundary)
+
+        # backward pass
+        self.value_engine.backward(vl_loss)
+        self.value_engine.step()
+
+        return vl_metrics
 
     def train_step(self, replay_buffer):
         '''
@@ -312,8 +395,7 @@ class PPO:
         self.value_engine.zero_grad()
 
         # 3. create progress bar
-        len_replay_buffer = len(replay_buffer)
-        num_micro = len_replay_buffer // self.micro_batch_size_per_gpu
+        num_micro = len(replay_buffer) # replay_buffer is already a dataloader of micro-batches
         progress_bar = tqdm(replay_buffer, total=num_micro)
 
         ga_pi_attr = getattr(self.policy_engine, 'gradient_accumulation_steps', 1)
@@ -327,11 +409,17 @@ class PPO:
             # 1. Data from buffer
             ########
             rewards   = micro_batch['rewards'].to(device, non_blocking=True)
-            values    = micro_batch['values'].to(device, non_blocking=True)
             done      = micro_batch['done'].to(device, non_blocking=True)
             mask      = micro_batch['mask'].to(device, non_blocking=True)
-            last_val  = micro_batch['last_val'].to(device, non_blocking=True)
             old_logprobs = micro_batch['old_logprobs'].to(device, non_blocking=True)
+
+            # PPO-specific: values and last_val from vLLM rollout
+            values    = micro_batch.get('v_olds', None)
+            if values is not None:
+                values = values.to(device, non_blocking=True)
+            last_val  = micro_batch.get('last_val', None)
+            if last_val is not None:
+                last_val = last_val.to(device, non_blocking=True)
 
             input_ids = micro_batch['input_ids'].to(device, non_blocking=True)
             att_mask  = micro_batch['attn_mask'].to(device, non_blocking=True)
@@ -341,57 +429,33 @@ class PPO:
             # 2. Compute advantages
             ########
             returns, advantages = self.compute_advantages(
-                                                rewards=rewards,
-                                                values=values,
-                                                done=done,
-                                                mask=mask,
-                                                last_val=last_val)
+                                                    rewards=rewards,
+                                                    values=values,
+                                                    done=done,
+                                                    mask=mask,
+                                                    last_val=last_val)
 
             ########
-            # 3. Forward pass based on the current policy.
+            # 3. Update policy
             ########
-            pi_logprobs, pi_entropies = self.policy_forward(
-                                                input_ids=input_ids,
-                                                att_mask=att_mask,
-                                                pos_ids=pos_ids)
-
-            ########
-            # 4. Compute policy loss
-            ########
-            pl_loss, pl_metrics = self.compute_policy_loss(
-                                                logprobs=pi_logprobs,
-                                                old_logprobs=old_logprobs,
-                                                advantages=advantages,
-                                                mask=mask,
-                                                entropies=pi_entropies)
+            pi_metrics = self.policy_step_update(
+                                    input_ids=input_ids,
+                                    att_mask=att_mask,
+                                    pos_ids=pos_ids,
+                                    old_logprobs=old_logprobs,
+                                    advantages=advantages,
+                                    mask=mask,
+                                    is_boundary=is_boundary)
 
             ########
-            # 3. forward pass for value and compute value loss
+            # 4. Update value
             ########
-            values       = micro_batch["values"].to(device, non_blocking=True)
-            v_old        = micro_batch.get("v_old", None)
-            if v_old is not None:
-                v_old = v_old.to(device, non_blocking=True)
-
-            values, last_value = self.value_forward(
-                                                input_ids=input_ids,
-                                                att_mask=att_mask,
-                                                pos_ids=pos_ids)
-            vl_loss, vl_metrics = self.compute_value_loss(
-                                                values=values,
-                                                v_old=v_old,
-                                                returns=returns,
-                                                mask=mask)
-
-            # Mark accumulation boundary (ONLY last micro-batch updates)
-            self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
-            self.value_engine.set_gradient_accumulation_boundary(is_boundary)
-
-            # backward pass
-            self.policy_engine.backward(pl_loss)
-            self.value_engine.backward(vl_loss)
-
-            # DeepSpeed expects step() each micro-batch
-            # update happens only if boundary=True
-            self.policy_engine.step()
-            self.value_engine.step()
+            vl_metrics = self.value_step_update(
+                                    input_ids=input_ids,
+                                    att_mask=att_mask,
+                                    pos_ids=pos_ids,
+                                    v_old=values,  # values from rollout (old value estimates)
+                                    returns=returns,
+                                    mask=mask,
+                                    is_boundary=is_boundary,
+                                    device=device)

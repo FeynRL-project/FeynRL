@@ -13,7 +13,7 @@ import ray
 import config.load as cfg # all config arguments
 from custom_datasets.prompt_only_dataset import PromptOnlyDataset # our custom pytorch dataset
 from misc.utils import safe_string_to_torch_dtype
-from rollouts.vllm_rollout_engine import VLLMRolloutEngine
+from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
 import rewards as reward_fns
 
@@ -243,7 +243,7 @@ if __name__ == "__main__":
     # 1. Miscellaneous setups
     ########
     rank, local_rank = rank_setup()
-    config = cfg.load_and_verify(model_type="rl",
+    config = cfg.load_and_verify(method="rl",
                                  input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
                                  )
@@ -313,21 +313,21 @@ if __name__ == "__main__":
 
     num_rollout_engines, rollout_engines = inference_engine_setup(model_path=config.model.name,
                                                                   trust_remote_code=config.model.trust_remote_code,
-                                                                  temperature=config.inference_engine.temperature,
-                                                                  max_tokens=config.inference_engine.max_tokens,
-                                                                  n_samples=config.inference_engine.n_samples,
-                                                                  top_p=config.inference_engine.top_p,
-                                                                  top_k=config.inference_engine.top_k,
+                                                                  temperature=config.rollout.temperature,
+                                                                  max_tokens=config.rollout.max_tokens,
+                                                                  n_samples=config.rollout.n_samples,
+                                                                  top_p=config.rollout.top_p,
+                                                                  top_k=config.rollout.top_k,
                                                                   seed=config.run.seed,
-                                                                  ignore_eos=config.inference_engine.ignore_eos,
-                                                                  stop=config.inference_engine.stop,
-                                                                  stop_token_ids=config.inference_engine.stop_token_ids,
-                                                                  prompt_logprobs=config.inference_engine.prompt_logprobs,
-                                                                  force_strict_on_policy=config.inference_engine.force_strict_on_policy,
+                                                                  ignore_eos=config.rollout.ignore_eos,
+                                                                  stop=config.rollout.stop,
+                                                                  stop_token_ids=config.rollout.stop_token_ids,
+                                                                  prompt_logprobs=config.rollout.prompt_logprobs,
+                                                                  force_strict_on_policy=config.rollout.force_strict_on_policy,
                                                                   reward_func=reward_fnc,
-                                                                  tensor_parallel_size=config.inference_engine.tensor_parallel_size,
+                                                                  tensor_parallel_size=config.rollout.tensor_parallel_size,
                                                                   eos_id=tokenizer.eos_token_id,
-                                                                  reward_broadcast=config.reward.reward_broadcast,
+                                                                  reward_broadcast=config.reward.broadcast,
                                                                   eps_reward_norm=config.reward.eps_reward_norm,
                                                                   rollout_gpus=config.run.rollout_gpus,)
 
@@ -338,7 +338,7 @@ if __name__ == "__main__":
                                                   num_workers=config.data.num_workers,
                                                   max_seq_len=config.data.max_seq_len,
                                                   prompt_key=config.data.prompt_key,
-                                                  rollout_batch_size=config.train.train_batch_size_per_gpu,
+                                                  rollout_batch_size=config.rollout.rollout_batch_size_per_gpu,
                                                   tokenizer=tokenizer,
                                                   num_rollout_engines=num_rollout_engines,
                                                   split='train',
@@ -431,13 +431,18 @@ if __name__ == "__main__":
             save_paths.append(engine.save_hf_model.remote(output_path="./checkpoints", tag=tag))
 
         save_paths = ray.get(save_paths)
+
+        # Use the first saved path (all should be the same)
+        model_path = save_paths[0] if save_paths else None
+
         ################
         # Refresh rollout policy
         ################
-        refs = []
-        for eng in rollout_engines:
-            refs.append(eng.refresh_policy.remote(policy_version))
-        ray.get(refs)
+        if model_path:
+            refs = []
+            for eng in rollout_engines:
+                refs.append(eng.refresh_model.remote(model_path, policy_version))
+            ray.get(refs)
 
     print("Training completed")
     ray.shutdown()

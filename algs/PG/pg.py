@@ -72,8 +72,12 @@ class PG:
             # 1. Initialize distributed training engine
             deepspeed.init_distributed()
 
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(f"[PG][Rank {rank}] Initializing training engine...")
+
         # 2. Load model
         model, ref_model = self.load_model()
+        print(f"[PG][Rank {rank}] Model loaded: {self.model_path}")
 
         # 2. Initialize model engine
         self.policy_engine, self.optimizer, _, _ = deepspeed.initialize(
@@ -81,6 +85,8 @@ class PG:
                                                             model_parameters=model.parameters(),
                                                             config=ds_config_dict
                                                             )
+        print(f"[PG][Rank {rank}] DeepSpeed engine initialized on device: {self.policy_engine.device}")
+
         self.ref_model_engine = None
         if ref_model is not None:
             # ref_model is supported here in case if we want to add
@@ -89,6 +95,7 @@ class PG:
                 ref_model.to(self.policy_engine.device)
                 ref_model.eval()
                 self.ref_model_engine = ref_model
+                print(f"[PG][Rank {rank}] Reference model loaded")
 
             except:
                 # fallback: initialize with DeepSpeed
@@ -96,6 +103,7 @@ class PG:
                                                         model=ref_model,
                                                         config=ds_config_dict
                                                         )
+                print(f"[PG][Rank {rank}] Reference model initialized with DeepSpeed fallback")
 
     def load_model(self):
         '''
@@ -311,7 +319,7 @@ class PG:
 
         return aggregated_metrics
 
-    def save_checkpoint(self, output_path: str, tag: str):
+    def save_checkpoint(self, output_dir: str, tag: str):
         '''
             Saves the model in hf compatible format for vllm, etc.
             We rely on save_16bit_model which handles gathering partitioned weights in zero-3.
@@ -319,11 +327,12 @@ class PG:
             Note we must call this on ALL ranks for zero-3 correctness.
         '''
         rank = torch.distributed.get_rank()
+        print(f"[PG][Rank {rank}] Saving checkpoint to {output_dir} with tag {tag}...")
 
         try:
             # 1. Save model weights (gathered fp16/bf16)
             # save_16bit_model internally handles zero-3 gathering from all ranks
-            self.policy_engine.save_16bit_model(output_path)
+            self.policy_engine.save_16bit_model(output_dir)
 
             # Barrier to ensure all ranks finished writing before rank 0 saves config
             # Without this, rank 0 might save config before other ranks write their shards
@@ -333,23 +342,27 @@ class PG:
             # 2. Save config (required for vllm) on rank 0 ONLY
             if rank == 0:
                 if hasattr(self.policy_engine.module, 'config'):
-                    self.policy_engine.module.config.save_pretrained(output_path)
+                    self.policy_engine.module.config.save_pretrained(output_dir)
+                    print(f"[PG][Rank {rank}] Config saved")
 
                 else:
                     # fallback by trying to get config from the model itself
                     if hasattr(self.policy_engine.module, 'module'):
                         # wrapped model e.g., deepspeed wrapper
                         if hasattr(self.policy_engine.module.module, 'config'):
-                            self.policy_engine.module.module.config.save_pretrained(output_path)
+                            self.policy_engine.module.module.config.save_pretrained(output_dir)
+                            print(f"[PG][Rank {rank}] Config saved (fallback)")
 
             # make sure rank 0 finished writing config
             # this ensures vLLM refresh can safely read all files
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
 
+            print(f"[PG][Rank {rank}] Checkpoint save completed!")
+
         except Exception as e:
             # log error but don't crash allows other ranks to continue
-            print(f"[Rank {rank}] Error saving checkpoint to {output_path}: {e}")
+            print(f"[PG][Rank {rank}] Error saving checkpoint to {output_dir}: {e}")
             if torch.distributed.is_initialized():
                 # still need barrier even on error to prevent deadlock
                 torch.distributed.barrier()

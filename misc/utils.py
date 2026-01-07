@@ -29,7 +29,6 @@ def safe_string_to_torch_dtype(dtype_in):
 
     raise ValueError(f"Unsupported model_dtype: {dtype_in}")
 
-
 def ensure_1d(x: torch.Tensor, name: str) -> torch.Tensor:
     '''
         Sanity check to make sure the input is a 1D tensor.
@@ -58,9 +57,9 @@ def pad_1d_to_length(x: torch.Tensor, pad_value: float, target_len: int) -> torc
 
     return x
 
-def get_experiment_dir_name(output_dir: str, tag: str, experiment_name: str):
+def get_experiment_dir_name(output_dir: str, tag: str, experiment_id: str):
     '''
-       It creates output_dir/experiment_name/tag
+       It creates output_dir/experiment_id/tag
     '''
-    experiment_dir = os.path.join(output_dir, experiment_name, tag)
+    experiment_dir = os.path.join(output_dir, experiment_id, tag)
     return experiment_dir

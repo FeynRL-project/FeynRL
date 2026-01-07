@@ -11,6 +11,9 @@ class Run(BaseModel):
     experiment_id: str
     distributed_training_strategy: str
     seed: int
+    project_name: str
+    tracking_uri: str
+
     # RL-specific fields
     training_gpus: int | None = None
     rollout_gpus: int | None = None

@@ -16,6 +16,7 @@ class Run(BaseModel):
     rollout_gpus: int | None = None
     ray_address: str | None = None
     ray_master_port: int | None = None
+    checkpoint_dir: str | None = None
 
 class Train(BaseModel):
     '''

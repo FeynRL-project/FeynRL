@@ -1,9 +1,10 @@
 import torch
+import os
 
 def safe_string_to_torch_dtype(dtype_in):
     '''
-    dtype_in might be a string in config (e.g., "fp16", "float16"). transformers expects torch.float16 or torch.bfloat16 etc., when passed as torch_dtype. 
-    We must convert strings safely.
+        dtype_in might be a string in config (e.g., "fp16", "float16"). transformers expects torch.float16 or torch.bfloat16 etc.,
+        when passed as torch_dtype. We must convert strings safely.
     '''
 
     if isinstance(dtype_in, torch.dtype):
@@ -56,3 +57,10 @@ def pad_1d_to_length(x: torch.Tensor, pad_value: float, target_len: int) -> torc
         return torch.cat([x, pad], dim=0)
 
     return x
+
+def get_experiment_dir_name(output_dir: str, tag: str, experiment_name: str):
+    '''
+       It creates output_dir/experiment_name/tag
+    '''
+    experiment_dir = os.path.join(output_dir, experiment_name, tag)
+    return experiment_dir

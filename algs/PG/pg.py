@@ -318,13 +318,12 @@ class PG:
 
             Note we must call this on ALL ranks for zero-3 correctness.
         '''
-        save_dir = os.path.join(output_path, tag)
         rank = torch.distributed.get_rank()
 
         try:
             # 1. Save model weights (gathered fp16/bf16)
             # save_16bit_model internally handles zero-3 gathering from all ranks
-            self.policy_engine.save_16bit_model(save_dir)
+            self.policy_engine.save_16bit_model(output_path)
 
             # Barrier to ensure all ranks finished writing before rank 0 saves config
             # Without this, rank 0 might save config before other ranks write their shards
@@ -334,14 +333,14 @@ class PG:
             # 2. Save config (required for vllm) on rank 0 ONLY
             if rank == 0:
                 if hasattr(self.policy_engine.module, 'config'):
-                    self.policy_engine.module.config.save_pretrained(save_dir)
+                    self.policy_engine.module.config.save_pretrained(output_path)
 
                 else:
                     # fallback by trying to get config from the model itself
                     if hasattr(self.policy_engine.module, 'module'):
                         # wrapped model e.g., deepspeed wrapper
                         if hasattr(self.policy_engine.module.module, 'config'):
-                            self.policy_engine.module.module.config.save_pretrained(save_dir)
+                            self.policy_engine.module.module.config.save_pretrained(output_path)
 
             # make sure rank 0 finished writing config
             # this ensures vLLM refresh can safely read all files
@@ -350,10 +349,9 @@ class PG:
 
         except Exception as e:
             # log error but don't crash allows other ranks to continue
-            print(f"[Rank {rank}] Error saving checkpoint to {save_dir}: {e}")
+            print(f"[Rank {rank}] Error saving checkpoint to {output_path}: {e}")
             if torch.distributed.is_initialized():
                 # still need barrier even on error to prevent deadlock
                 torch.distributed.barrier()
             raise
 
-        return save_dir

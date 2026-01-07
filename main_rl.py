@@ -13,7 +13,7 @@ import time
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
 from custom_datasets.prompt_only import PromptOnlyDataset # our custom pytorch dataset
-from misc.utils import safe_string_to_torch_dtype
+from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
 import rewards as reward_fns
@@ -467,23 +467,20 @@ if __name__ == "__main__":
         # Save current policy
         ################
         tag = f"iter{epoch:06d}_v{policy_version:06d}"
-        save_dir = os.path.join("./checkpoints", tag)
+        model_path = get_experiment_dir_name(output_dir=config.run.checkpoint_dir, tag=tag, experiment_id=config.run.experiment_id)
 
         # save tokenizer so it's ready when vllm loads the model
         if rank == 0:
-            os.makedirs(save_dir, exist_ok=True)
-            tokenizer.save_pretrained(save_dir)
+            os.makedirs(model_path, exist_ok=True)
+            tokenizer.save_pretrained(model_path)
 
         # save must run on *all ranks* for zero-3 correctness.
         save_futures = []
         for engine in training_engine_runners:
-            save_futures.append(engine.save_checkpoint.remote(output_path="./checkpoints", tag=tag))
+            save_futures.append(engine.save_checkpoint.remote(output_dir=model_path, tag=tag))
 
         # Wait for all saves to complete
-        save_paths = ray.get(save_futures)
-
-        # Use the first saved path (all should be the same)
-        model_path = save_paths[0] if save_paths else None
+        ray.get(save_futures)
 
         # barrier to ensure all files are written before vllm refresh
         time.sleep(1)  # small delay to ensure filesystem consistency
@@ -491,11 +488,10 @@ if __name__ == "__main__":
         ################
         # Refresh rollout policy
         ################
-        if model_path:
-            refresh_futures = []
-            for eng in rollout_engines:
-                refresh_futures.append(eng.refresh_model.remote(model_path, policy_version))
-            ray.get(refresh_futures)
+        refresh_futures = []
+        for eng in rollout_engines:
+            refresh_futures.append(eng.refresh_model.remote(model_path, policy_version))
+        ray.get(refresh_futures)
 
     print("Training completed")
     ray.shutdown()

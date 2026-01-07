@@ -149,6 +149,8 @@ class Rollout(BaseModel):
         Everything related to rollout generation (RL-specific).
     '''
     model_config = ConfigDict(extra='forbid')
+    temperature: float | None = None
+    max_tokens: int | None = None
     n_samples: int | None = None
     top_p: float | None = None
     top_k: int | None = None

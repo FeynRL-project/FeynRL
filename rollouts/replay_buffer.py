@@ -151,8 +151,8 @@ class ReplayBuffer(Dataset):
             zscores.append(pad_1d_to_length(x=x["zscores"], pad_value=0.0, target_len=target_len))
 
             # if it is None, v_old_list will append None too
-            if x["v_old"] is not None:
-                v_old_list.append(pad_1d_to_length(x["v_old"], pad_value=0.0, target_len=target_len))
+            if x["v_olds"] is not None:
+                v_old_list.append(pad_1d_to_length(x["v_olds"], pad_value=0.0, target_len=target_len))
 
             else:
                 empty_v_count += 1

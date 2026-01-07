@@ -5,7 +5,7 @@ from vllm import LLM, SamplingParams
 from typing import Optional, List, Callable, Any, Dict
 import numpy as np
 
-@ray.remote(resources={"vllm": 1})
+@ray.remote
 class VLLMRolloutEngine:
     def __init__(self,
                  model_path: str,

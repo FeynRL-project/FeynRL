@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 import ray
+import time
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -295,6 +296,19 @@ if __name__ == "__main__":
                                                   micro_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
                                                   update_after_full_replay=config.train.update_after_full_replay,
                                                   deepspeed_config=config.deepspeed)
+
+    assert len(training_engine_runners) == training_gpus, "Number of training engines does not match number of training gpus"
+
+    # Synchronization barrier to prevent deepspeed rendezvous hang
+    # wait for all training actors to finish initialization before proceeding
+    if rank == 0:
+        print("Waiting for all training engines to initialize...")
+
+    ready_checks = [engine.is_ready.remote() for engine in training_engine_runners]
+    ready = ray.get(ready_checks)
+    if rank == 0:
+        print("All training engines ready!")
+
     ########
     # 5. load tokenizer
     ########
@@ -390,8 +404,8 @@ if __name__ == "__main__":
         ################
         # Training step
         ################
-        # 2. create dataloader from replay buffer and convert to list (serializable for Ray)
-        # as pytorch dataloader cannot be serialized and sent to ray workers.
+        # 2. create dataloader from replay buffer and convert to list as ray needs serializable data
+        # (pytorch dataloader cannot be serialized and sent to ray workers).
         train_batches = list(DataLoader(dataset=replay_buffer,
                                         batch_size=config.train.train_batch_size_per_gpu,
                                         shuffle=True,
@@ -401,11 +415,37 @@ if __name__ == "__main__":
                                         ))
 
         # 3. update the policy based on the current replay buffer
+        # shard batches across training engines
+        num_train_engines = len(training_engine_runners)
+
+        # ensure all ranks get equal number of batches to prevent deepspeed hang
+        # pad train_batches to be divisible by num_train_engines
+        num_batches = len(train_batches)
+        batches_per_engine = (num_batches + num_train_engines - 1) // num_train_engines
+        total_batches_needed = batches_per_engine * num_train_engines
+
+        if total_batches_needed > num_batches:
+            # Pad by repeating the last batch
+            padding = [train_batches[-1]] * (total_batches_needed - num_batches)
+            train_batches_padded = train_batches + padding
+
+        else:
+            train_batches_padded = train_batches
+
         for tidx in range(total_training_steps_per_epoch):
             # 3.1 send training task to all training engines
             train_futures = []
-            for engine in training_engine_runners:
-                train_futures.append(engine.train_step.remote(train_batches))
+
+            for i, engine in enumerate(training_engine_runners):
+                # shard the train_batches which is guaranteed to be equal size
+                # example for [i::step]: num_train_engines = 2 and 6 batches: [B0, B1, B2, B3, B4, B5]
+                # [0::2] -> [B0, B2, B4]
+                # [1::2] -> [B1, B3, B5]
+                shard = train_batches_padded[i::num_train_engines]
+
+                # All ranks MUST participate in training
+                assert len(shard) > 0, f"Rank {i} has empty shard - this will cause DeepSpeed hang"
+                train_futures.append(engine.train_step.remote(shard))
 
             # 3.2 gather training metrics from all engines
             train_metrics = ray.get(train_futures)
@@ -419,33 +459,43 @@ if __name__ == "__main__":
                       f"Step {tidx+1}/{total_training_steps_per_epoch}, "
                       f"Loss: {avg_loss:.4f}, KL: {avg_kl:.4f}")
 
-        # 4. update policy version and clear replay buffer
+        # 4. update policy version and reset replay buffer
         policy_version += 1
-        if config.train.update_after_full_replay:
-            replay_buffer.__reset__()
+        replay_buffer.__reset__()
 
         ################
         # Save current policy
         ################
         tag = f"iter{epoch:06d}_v{policy_version:06d}"
-        # save must run on *all ranks* for zero-3 correctness.
-        save_paths = []
-        for engine in training_engine_runners:
-            save_paths.append(engine.save_checkpoint.remote(output_path="./checkpoints", tag=tag))
+        save_dir = os.path.join("./checkpoints", tag)
 
-        save_paths = ray.get(save_paths)
+        # save tokenizer so it's ready when vllm loads the model
+        if rank == 0:
+            os.makedirs(save_dir, exist_ok=True)
+            tokenizer.save_pretrained(save_dir)
+
+        # save must run on *all ranks* for zero-3 correctness.
+        save_futures = []
+        for engine in training_engine_runners:
+            save_futures.append(engine.save_checkpoint.remote(output_path="./checkpoints", tag=tag))
+
+        # Wait for all saves to complete
+        save_paths = ray.get(save_futures)
 
         # Use the first saved path (all should be the same)
         model_path = save_paths[0] if save_paths else None
+
+        # barrier to ensure all files are written before vllm refresh
+        time.sleep(1)  # small delay to ensure filesystem consistency
 
         ################
         # Refresh rollout policy
         ################
         if model_path:
-            refs = []
+            refresh_futures = []
             for eng in rollout_engines:
-                refs.append(eng.refresh_model.remote(model_path, policy_version))
-            ray.get(refs)
+                refresh_futures.append(eng.refresh_model.remote(model_path, policy_version))
+            ray.get(refresh_futures)
 
     print("Training completed")
     ray.shutdown()

@@ -10,8 +10,8 @@ from tqdm import tqdm
 import ray
 
 # imports local methods, classes, etc.
-import config.load as cfg # all config arguments
-from custom_datasets.prompt_only_dataset import PromptOnlyDataset # our custom pytorch dataset
+import configs.load as cfg # all config arguments
+from custom_datasets.prompt_only import PromptOnlyDataset # our custom pytorch dataset
 from misc.utils import safe_string_to_torch_dtype
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
@@ -362,7 +362,9 @@ if __name__ == "__main__":
         for rollout_batch in rollout_dataloader:
             # 1.1 split data across rollout engines
             # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
-            rollout_shards = torch.split(rollout_batch, num_rollout_engines, dim=0)
+            # rollout_batch is a List[Dict].
+            shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
+            rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
 
             # 1.2 generate rollouts
             rollout_samples = []
@@ -388,21 +390,22 @@ if __name__ == "__main__":
         ################
         # Training step
         ################
-        # 2. create dataloader from replay buffer
-        train_dataloader = DataLoader(dataset=replay_buffer,
-                                      batch_size=config.train.train_batch_size_per_gpu,
-                                      shuffle=True,
-                                      num_workers=0,
-                                      pin_memory=True,
-                                      collate_fn=replay_buffer.collate_fn,
-                                      )
+        # 2. create dataloader from replay buffer and convert to list (serializable for Ray)
+        # as pytorch dataloader cannot be serialized and sent to ray workers.
+        train_batches = list(DataLoader(dataset=replay_buffer,
+                                        batch_size=config.train.train_batch_size_per_gpu,
+                                        shuffle=True,
+                                        num_workers=0,
+                                        pin_memory=False,
+                                        collate_fn=replay_buffer.collate_fn,
+                                        ))
 
         # 3. update the policy based on the current replay buffer
         for tidx in range(total_training_steps_per_epoch):
             # 3.1 send training task to all training engines
             train_futures = []
             for engine in training_engine_runners:
-                train_futures.append(engine.train_step.remote(train_dataloader))
+                train_futures.append(engine.train_step.remote(train_batches))
 
             # 3.2 gather training metrics from all engines
             train_metrics = ray.get(train_futures)
@@ -428,7 +431,7 @@ if __name__ == "__main__":
         # save must run on *all ranks* for zero-3 correctness.
         save_paths = []
         for engine in training_engine_runners:
-            save_paths.append(engine.save_hf_model.remote(output_path="./checkpoints", tag=tag))
+            save_paths.append(engine.save_checkpoint.remote(output_path="./checkpoints", tag=tag))
 
         save_paths = ray.get(save_paths)
 

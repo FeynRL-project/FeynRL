@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -36,10 +37,10 @@ class PG:
         self.micro_batch_size_per_gpu = micro_batch_size_per_gpu
 
         # policy related parameters
-        self.kl_coeff = kl_coeff
-        self.clip_low = clip_low
-        self.clip_high = clip_high
-        self.ent_coeff = entropy_coeff
+        self.kl_coeff = float(kl_coeff)
+        self.clip_low = float(clip_low)
+        self.clip_high = float(clip_high)
+        self.ent_coeff = float(entropy_coeff)
 
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
@@ -48,8 +49,15 @@ class PG:
         # treating the entire buffer as a single batch.
         self.update_only_after_full_replay = update_after_full_replay
 
-        # init training engine for each ray actor process
+        self.ready = False
         self.init_training_engine()
+        self.ready = True
+
+    def is_ready(self):
+        '''
+            Barrier method to ensure all Ray actors are initialized before DeepSpeed collective ops.
+        '''
+        return self.ready
 
     def init_training_engine(self):
         '''
@@ -224,6 +232,8 @@ class PG:
            This function implements a training step per rank/gpu for full replay buffer.
            The batch size for each gpu/rank should be micro_batch_size_per_gpu.
         '''
+        assert self.policy_engine is not None, "DeepSpeed engine not initialized"
+
         device = self.policy_engine.device
 
         # 1. Models to train mode
@@ -283,9 +293,11 @@ class PG:
             all_metrics.append(pi_metrics)
 
             if self.update_only_after_full_replay:
-                # is_boundary is true, deepspeed will only update the parameters
-                # after seeing all samples in the replay buffer.
+                # Accumulate gradients across all micro-batches, only update at the end
                 self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
+            else:
+                # Update after every micro-batch (treat each as a boundary)
+                self.policy_engine.set_gradient_accumulation_boundary(True)
 
             # backward pass
             self.policy_engine.backward(pi_loss)
@@ -301,17 +313,47 @@ class PG:
 
     def save_checkpoint(self, output_path: str, tag: str):
         '''
-            Minimal wrapper to access internal DeepSpeed engine for checkpoint saving.
-            This method must remain in PG class to access self.policy_engine.
+            Saves the model in hf compatible format for vllm, etc.
+            We rely on save_16bit_model which handles gathering partitioned weights in zero-3.
 
-            Args:
-                output_path: Base directory for checkpoints
-                tag: Checkpoint tag/name
-
-            Returns:
-                save_dir: Path where the checkpoint was saved
+            Note we must call this on ALL ranks for zero-3 correctness.
         '''
-        import os
         save_dir = os.path.join(output_path, tag)
-        self.policy_engine.save_checkpoint(output_path, tag=tag)
+        rank = torch.distributed.get_rank()
+
+        try:
+            # 1. Save model weights (gathered fp16/bf16)
+            # save_16bit_model internally handles zero-3 gathering from all ranks
+            self.policy_engine.save_16bit_model(save_dir)
+
+            # Barrier to ensure all ranks finished writing before rank 0 saves config
+            # Without this, rank 0 might save config before other ranks write their shards
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+            # 2. Save config (required for vllm) on rank 0 ONLY
+            if rank == 0:
+                if hasattr(self.policy_engine.module, 'config'):
+                    self.policy_engine.module.config.save_pretrained(save_dir)
+
+                else:
+                    # fallback by trying to get config from the model itself
+                    if hasattr(self.policy_engine.module, 'module'):
+                        # wrapped model e.g., deepspeed wrapper
+                        if hasattr(self.policy_engine.module.module, 'config'):
+                            self.policy_engine.module.module.config.save_pretrained(save_dir)
+
+            # make sure rank 0 finished writing config
+            # this ensures vLLM refresh can safely read all files
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        except Exception as e:
+            # log error but don't crash allows other ranks to continue
+            print(f"[Rank {rank}] Error saving checkpoint to {save_dir}: {e}")
+            if torch.distributed.is_initialized():
+                # still need barrier even on error to prevent deadlock
+                torch.distributed.barrier()
+            raise
+
         return save_dir

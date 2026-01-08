@@ -9,6 +9,7 @@ import numpy as np
 @ray.remote
 class VLLMRolloutEngine:
     def __init__(self,
+                 seed:int,
                  model_path: str,
                  trust_remote_code: bool,
                  temperature: float,
@@ -16,18 +17,19 @@ class VLLMRolloutEngine:
                  n_samples: int,
                  top_p: float,
                  top_k: int,
-                 seed: Optional[int],
                  ignore_eos: bool,
                  stop: Optional[List[str]],
                  stop_token_ids: Optional[List[int]],
-                 prompt_logprobs: Optional[int],
+                 prompt_logprobs: bool,
                  force_strict_on_policy: bool,
                  reward_func: Callable,
                  tensor_parallel_size: int,
                  eos_id: int,
                  reward_broadcast: bool,
                  eps_reward_norm: float,
+                 gpu_memory_utilization: float,
                  ):
+
 
         # reward function
         self.reward_func = reward_func
@@ -42,10 +44,11 @@ class VLLMRolloutEngine:
         self.top_k = int(top_k)
         self.seed = seed
         self.ignore_eos = bool(ignore_eos)
-        self.stop = stop
-        self.stop_token_ids = stop_token_ids
+        self.stop = stop if stop else None
+        self.stop_token_ids = stop_token_ids if stop_token_ids else None
         self.prompt_logprobs = prompt_logprobs
         self.force_strict_on_policy = bool(force_strict_on_policy)
+        self.gpu_memory_utilization = float(gpu_memory_utilization)
 
         # vllm engine config
         self.model_path = model_path
@@ -55,11 +58,11 @@ class VLLMRolloutEngine:
         self.refresh_model(model_path, 0)
         self.sampling_params = self.make_sampling_params()
 
-        # reward normalization for group normalization
+        # reward normalization
         self.eps_reward_norm = float(eps_reward_norm)
         # If True, broadcast a single scalar reward across all tokens in the sequence.
-        # This is used when the reward function provides a single score for the entire completion.
         self.reward_broadcast = bool(reward_broadcast)
+
 
     def refresh_model(self, model_path: str, version: int) -> bool:
         '''
@@ -73,14 +76,11 @@ class VLLMRolloutEngine:
 
         print(f"[VLLMEngine] Refreshing model to version {version} from {model_path}")
 
-        # Verify ckpt files exist before loading
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
-
-        # Check for config.json as vllm needs that as well
-        config_path = os.path.join(model_path, "config.json")
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"config.json not found in {model_path}")
+        # only for local paths not HF model identifier (e.g., google/gemma-3-1b-it)
+        if os.path.exists(model_path):
+            config_path = os.path.join(model_path, "config.json")
+            if not os.path.exists(config_path):
+                raise FileNotFoundError(f"config.json not found in {model_path}")
 
         self.model_path = model_path
         self.load_model()
@@ -119,7 +119,8 @@ class VLLMRolloutEngine:
         try:
             self.vllm_engine = LLM(model=self.model_path,
                                    trust_remote_code=self.trust_remote_code,
-                                   tensor_parallel_size=self.tensor_parallel_size
+                                   tensor_parallel_size=self.tensor_parallel_size,
+                                   gpu_memory_utilization=self.gpu_memory_utilization,
                                   )
             print(f"Successfully loaded vLLM model from {self.model_path}")
 
@@ -133,35 +134,32 @@ class VLLMRolloutEngine:
            This function makes sure that sampling policy stays in on-policy regime
            (i.e., same policy as training)
         '''
-        if not self.force_strict_on_policy:
-            raise ValueError("force_strict_on_policy must be True during training (strict mode).")
+        if self.force_strict_on_policy:
+            if self.temperature != 1.0:
+                raise ValueError("Strict on-policy requires temperature = 1.0 (no scaling).")
 
-        if self.temperature != 1.0:
-            raise ValueError("Strict on-policy requires temperature = 1.0 (no scaling).")
+            if self.top_p != 1.0:
+                raise ValueError("Strict on-policy requires top_p = 1.0 (no nucleus truncation).")
 
-        if self.top_p != 1.0:
-            raise ValueError("Strict on-policy requires top_p = 1.0 (no nucleus truncation).")
+            if self.top_k != -1:
+                raise ValueError("Strict on-policy requires top_k = -1 (no top-k truncation).")
 
-        if self.top_k != -1:
-            raise ValueError("Strict on-policy requires top_k = -1 (no top-k truncation).")
+            if self.n_samples < 1:
+                raise ValueError("Strict on-policy requires n_samples >= 1.")
 
-        if self.n_samples < 1:
-            raise ValueError("Strict on-policy requires n_samples >= 1.")
+            # vllm can return empty responses for max_tokens <= 0 which will break the rest of the code.
+            if self.max_tokens <= 0:
+                raise ValueError("max_tokens must be > 0.")
 
-        # vllm can return empty responses for max_tokens <= 0 which will break the rest of the code.
-        if self.max_tokens <= 0:
-            raise ValueError("max_tokens must be > 0.")
-
-        if self.stop is not None or self.stop_token_ids is not None or self.ignore_eos:
-            raise ValueError(
-                "Strict on-policy requires stop=None, stop_token_ids=None, ignore_eos=False "
-                "(these change the trajectory distribution)."
-            )
+            if self.stop is not None or self.stop_token_ids is not None or self.ignore_eos:
+                raise ValueError(
+                    "Strict on-policy requires stop=None, stop_token_ids=None, ignore_eos=False "
+                    "(these change the trajectory distribution)."
+                )
 
         return SamplingParams(
             seed=self.seed,
             n=self.n_samples,
-            best_of=None, # best_of != n implies reranking/selection
 
             temperature=self.temperature,
             top_p=self.top_p, 
@@ -180,12 +178,11 @@ class VLLMRolloutEngine:
             logit_bias=None,
             allowed_token_ids=None,
             bad_words=None,
-            guided_decoding=None,
             logits_processors=None,
 
             # setup to returns required info
             logprobs=1, # it returns logprobs for each token
-            prompt_logprobs=self.prompt_logprobs if self.prompt_logprobs is not None else 0, # it returns logprobs for each token in the prompt which is memory intensive
+            prompt_logprobs=(1 if self.prompt_logprobs else None), # it returns logprobs for each token in the prompt which is memory intensive
         )
 
     def extract_logprobs(self, response_ids: List[int], logprobs_by_pos: Any) -> torch.Tensor:
@@ -250,7 +247,7 @@ class VLLMRolloutEngine:
                                      f"but loaded_version={int(self.loaded_version)}. ")
 
                 assert self.vllm_engine is not None, f"{self.model_path} not loaded."
-                print(f"[VLLMEngine] Generating {len(prompts)} prompts with n_samples={self.n_samples}")
+                print(f"[VLLMEngine] Generating completions for {len(prompts)} prompts with {self.n_samples} samples each")
                 generated_outputs = self.vllm_engine.generate(prompts,
                                                              sampling_params=self.sampling_params,
                                                              use_tqdm=False)
@@ -261,7 +258,7 @@ class VLLMRolloutEngine:
                 rollout_samples = []
                 for data in generated_outputs:
                     group_samples = []
-                    group_stats   = {'reward': [], 'length': []}
+                    group_stats   = {'rewards': [], 'lengths': []}
                     prompt_ids = list(data.prompt_token_ids or [])
                     prompt_len = len(prompt_ids)
                     if prompt_len == 0:
@@ -294,8 +291,8 @@ class VLLMRolloutEngine:
                         rewards[prompt_len:] = rewards_resp
 
                         # is_per_token is False, then rewards_resp will only have value for the last element
-                        group_stats['reward'].append(rewards_resp.sum().item())
-                        group_stats['length'].append(len(response_ids))
+                        group_stats['rewards'].append(rewards_resp.sum().item())
+                        group_stats['lengths'].append(len(response_ids))
 
                         if response_len > 0:
                             if response.logprobs is None:
@@ -369,27 +366,11 @@ class VLLMRolloutEngine:
                                                 "response_text": getattr(response, "text", ""),
                                                 "response_len": response_len,
                                                 })
-                    if len(group_samples) > 1:
-                        # add zscore to the above samples
-                        self.normalize_rewards(
-                                                samples=group_samples,
-                                                stats=group_stats,
-                                                prompt_len=prompt_len,
-                                                is_per_token=is_per_token)
-                    else:
-                        # For single sample (n_samples=1), still need to add pred_zscores
-                        # Since there's no group to normalize against, zscores = rewards (no baseline)
-                        for sample in group_samples:
-                            # Create pred-aligned zscores from token-aligned rewards
-                            pred_zscores = torch.zeros_like(sample['rewards'], dtype=torch.float)
-                            response_len = sample['response_len']
-                            if response_len > 0:
-                                pred_start = prompt_len - 1
-                                pred_end = len(sample['rewards']) - 1
-                                # Copy response rewards to pred-aligned positions
-                                pred_zscores[pred_start:pred_end] = sample['rewards'][prompt_len:]
-                            sample["pred_zscores"] = pred_zscores
-
+                    self.normalize_rewards(
+                                            samples=group_samples,
+                                            stats=group_stats,
+                                            prompt_len=prompt_len,
+                                            is_per_token=is_per_token)
                     rollout_samples.extend(group_samples)
 
                 return rollout_samples
@@ -425,9 +406,15 @@ class VLLMRolloutEngine:
             stats: {"reward": [...], "length": [...]} or {"reward": [...], "length": [...], "reward": [...], "length": [...]} if reward_broadcast is True
          '''
         denom = len(samples) # number of samples in the group
-        rewards_array = np.array(stats['reward'])
-        mean_scores = rewards_array.sum() / denom
-        std_scores  = np.sqrt(((rewards_array - mean_scores)**2).sum() / denom)
+        if len(samples) > 1:
+            rewards_array = np.array(stats['rewards'])
+            mean_scores = rewards_array.sum() / denom
+            std_scores  = np.sqrt(((rewards_array - mean_scores)**2).sum() / denom)
+        else:
+            # For a single sample, we don't normalize (i.e. advantage is 0 if we subtract mean)
+            # but usually for n=1 we keep the raw reward.
+            mean_scores = 0.0
+            std_scores  = 1.0 - self.eps_reward_norm
 
         if is_per_token:
             raise ValueError("per token rewards are not supported yet as normalization is done assuming per response rewards")
@@ -436,16 +423,69 @@ class VLLMRolloutEngine:
         for i, sample in enumerate(samples):
             # sample['reward']: [T] where prompt tokens would get 0
             # sample['reward'][-1]: means the last token reward
-            zscore = torch.zeros_like(sample['reward'], dtype=torch.float)
-            zscore[-1] = (sample['reward'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
+            zscore = torch.zeros_like(sample['rewards'], dtype=torch.float)
+            zscore[-1] = (sample['rewards'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
             sample["zscores"] = zscore
             if self.reward_broadcast:
                 sample["zscores"][prompt_len:] = zscore[-1]
 
             # prediction-aligned zscores
             # zscore[prompt_len:] corresponds to response tokens 0..N-1
-            pred_zscores = torch.zeros_like(sample['reward'], dtype=torch.float)
+            pred_zscores = torch.zeros_like(sample['rewards'], dtype=torch.float)
             pred_start = prompt_len - 1
-            pred_end   = len(sample['reward']) - 1
+            pred_end   = len(sample['rewards']) - 1
             pred_zscores[pred_start:pred_end] = sample["zscores"][prompt_len:]
             sample["pred_zscores"] = pred_zscores
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+    import ray
+    ray.init(local_mode=True)
+    tokenizer = AutoTokenizer.from_pretrained('google/gemma-3-1b-it')
+
+    def default_reward_func(prompt_ids, response_ids, finish_reason):
+        is_per_token = False
+        r = torch.zeros((len(response_ids),), dtype=torch.float32)
+
+        if len(response_ids) == 0:
+            return r, is_per_token
+
+        r[-1] = 1.0 if str(finish_reason) == "stop" else 0.0
+
+        return r, is_per_token
+
+    vllm = VLLMRolloutEngine.remote(model_path='google/gemma-3-1b-it',
+                                    trust_remote_code=True,
+                                    temperature=1,
+                                    max_tokens=1024,
+                                    n_samples=5,
+                                    top_p=1,
+                                    top_k=-1,
+                                    seed=50,
+                                    ignore_eos=False,
+                                    stop=None,
+                                    stop_token_ids=None,
+                                    prompt_logprobs=None,
+                                    force_strict_on_policy=True,
+                                    reward_func=default_reward_func,
+                                    tensor_parallel_size=1,
+                                    eos_id=tokenizer.eos_token_id,
+                                    reward_broadcast=True,
+                                    eps_reward_norm=1e-8,
+                                    gpu_memory_utilization=0.5)
+
+    dummy_data = ["Hello, how are you?",
+                  "Summer is the best season!",
+                  "I love playing chess.",
+                  ]
+    samples_ids = []
+    for i in dummy_data:
+        prompt_ids = tokenizer.apply_chat_template(
+                                        conversation= [{"role": "user", "content": i}],
+                                        add_generation_prompt=True,
+                                        tokenize=True,
+                                        return_tensors=None,
+                                        )
+        samples_ids.append({"prompt_token_ids": prompt_ids})
+    output = vllm.generate.remote(samples_ids, 1, 0)
+    print(output)

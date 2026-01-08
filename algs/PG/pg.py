@@ -253,7 +253,12 @@ class PG:
 
         # 3. create progress bar
         num_micro = len(micro_batches)
-        progress_bar = tqdm(micro_batches, total=num_micro, desc="[Alg:PG] Training Step in engine {}".format(engine_id))
+        # torch.distributed.get_rank() would be the same thing as engine_id
+        if engine_id == 0:
+            progress_bar = tqdm(micro_batches, total=num_micro, desc="[Alg:PG] Training Step in rank {}".format(engine_id))
+
+        else:
+            progress_bar = micro_batches # No tqdm for other ranks
 
         ga_pi_attr = getattr(self.policy_engine, 'gradient_accumulation_steps', 1)
         ga_pi = int(ga_pi_attr() if callable(ga_pi_attr) else ga_pi_attr)
@@ -297,11 +302,12 @@ class PG:
 
             # store metrics
             all_metrics.append(pi_metrics)
-            progress_bar.set_postfix({
-                "loss": f"{pi_loss.item():.4f}",
-                "clip": f"{pi_metrics['clipfrac']:.3f}",
-                "kl": f"{pi_metrics['approx_kl']:.4f}"
-            })
+            if engine_id == 0:
+                progress_bar.set_postfix({
+                    "loss": f"{pi_loss.item():.4f}",
+                    "clip": f"{pi_metrics['clipfrac']:.3f}",
+                    "kl": f"{pi_metrics['approx_kl']:.4f}"
+                })
 
             if self.update_only_after_full_replay:
                 # Accumulate gradients across all micro-batches, only update at the end

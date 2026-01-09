@@ -222,7 +222,8 @@ if __name__ == "__main__":
                                                             model_dtype=config.model.dtype,
                                                             ref_model_name=config.model.ref_model,
                                                             trust_remote_code=config.model.trust_remote_code,
-                                                            attn_impl=config.model.attn_implementation)
+                                                            attn_impl=config.model.attn_implementation,
+                                                            rank=rank)
 
     ########
     # 5. Setup trainiing and inference engines
@@ -274,13 +275,31 @@ if __name__ == "__main__":
         print("Starting training...")
 
     total_number_of_train_samples = len(train_dataloader.dataset)
-    number_sample_per_epoch = total_number_of_train_samples // world_size
+    micro_batches_per_epoch = config.train.micro_batches_per_epoch
+    optimizer_steps_per_epoch = micro_batches_per_epoch // config.train.gradient_accumulation_steps
+
+    # Warn if micro_batches_per_epoch is not divisible by gradient_accumulation_steps
+    if micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
+        remainder = micro_batches_per_epoch % config.train.gradient_accumulation_steps
+        # raising error to enforce correctness
+        raise ValueError(
+            f"micro_batches_per_epoch ({micro_batches_per_epoch}) MUST be divisible by "
+            f"gradient_accumulation_steps ({config.train.gradient_accumulation_steps}) to ensure "
+            "all gradients are applied within the epoch boundaries. "
+            f"Adjust configuration. Remainder: {remainder}"
+        )
+
     logger.info("=" * 50)
     logger.info(f"Starting training: {config.train.total_number_of_epochs} epochs")
     logger.info(
         f"Train set: {len(train_dataloader.dataset)} samples | "
-        f"{len(train_dataloader)} steps/epoch | "
-        f"batch_size_per_gpu={config.train.train_batch_size_per_gpu}"
+        f"micro_batches/epoch={micro_batches_per_epoch} | "
+        f"optimizer_steps/epoch={optimizer_steps_per_epoch} | "
+        f"grad_accum={config.train.gradient_accumulation_steps}"
+    )
+    logger.info(
+        f"batch_size_per_gpu={config.train.train_batch_size_per_gpu} | "
+        f"global_batch_size={config.train.train_batch_size_per_gpu * config.train.gradient_accumulation_steps * world_size}"
     )
     logger.info("=" * 50)
     global_step = 0
@@ -292,6 +311,9 @@ if __name__ == "__main__":
     for epoch in range(config.train.total_number_of_epochs):
         epoch_start_time = time.time()
         train_sampler.set_epoch(epoch)
+        # Ensure gradients are zeroed at the start of epoch to prevent any bleeding from previous epoch
+        # if accumulation steps were not perfectly aligned (though we enforce alignment above).
+        model_engine.optimizer.zero_grad()
 
         ########
         # 8.1 Training loop
@@ -301,9 +323,13 @@ if __name__ == "__main__":
         else:
             progress_bar = train_dataloader
 
+        # micro_batches_per_epoch = number of micro-batch iterations per epoch.
+        # This allows processing a subset of the data per epoch (useful for large datasets).
+        # Optimizer steps per epoch = micro_batches_per_epoch // gradient_accumulation_steps
+
         for step, micro_batch in enumerate(progress_bar):
-            # Limit to train_steps_per_epoch iterations per epoch
-            if step >= config.train.train_steps_per_epoch:
+            # Limit to micro_batches_per_epoch iterations
+            if step >= micro_batches_per_epoch:
                 break
 
             # Move batch to gpu (deepspeed engine device)
@@ -319,7 +345,7 @@ if __name__ == "__main__":
             # logging
             if rank == 0:
                 progress_bar.set_postfix(loss=metric['loss'])
-                if mlflow_run:
+                if mlflow_run and model_engine.is_gradient_accumulation_boundary():
                     mlflow.log_metrics({
                         "train/loss": metric['loss'],
                     }, step=global_step)
@@ -381,3 +407,7 @@ if __name__ == "__main__":
             torch.distributed.barrier()
 
     logger.info("Training completed successfully!")
+
+    # End MLflow run cleanly
+    if rank == 0 and mlflow_run:
+        mlflow.end_run()

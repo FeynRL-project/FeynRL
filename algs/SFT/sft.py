@@ -122,11 +122,10 @@ class SFT:
         # make sure model is in training mode
         self.model_engine.train()
 
-        # 1. For DeepSpeed, zero_grad should be called at the start of the training step
-        # especially important with gradient accu.
-        self.model_engine.zero_grad()
+        # Don't need to zero_grad() here as ds handles gradient zeroing
+        # internally after step() when gradient_accumulation_steps boundary is reached.
 
-        # 2. forward pass per gpu/rank
+        # 1. forward pass per gpu/rank
         logits, target_ids, loss_mask = self.forward(micro_batch)
 
         # 3. compute loss pass

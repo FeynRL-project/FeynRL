@@ -54,12 +54,17 @@ def setup_mlflow(config, tracking_uri: str, rank: int):
         "train_batch_size_per_gpu": config.train.train_batch_size_per_gpu,
         "gradient_accumulation_steps": config.train.gradient_accumulation_steps,
         "total_epochs": config.train.total_number_of_epochs,
-        "train_steps_per_epoch": config.train.train_steps_per_epoch,
         "seed": config.run.seed,
     })
 
-    if config.run.method == "rl":
+    # Log method-specific step config
+    if config.run.method == "sl":
         mlflow.log_params({
+            "micro_batches_per_epoch": config.train.micro_batches_per_epoch,
+        })
+    elif config.run.method == "rl":
+        mlflow.log_params({
+            "train_steps_per_epoch": config.train.train_steps_per_epoch,
             "n_samples": config.rollout.n_samples,
             "max_tokens": config.rollout.max_tokens,
             "kl_coeff": config.train.kl_coeff,

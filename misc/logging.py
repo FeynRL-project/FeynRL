@@ -46,7 +46,7 @@ def setup_mlflow(config, tracking_uri: str, rank: int):
     # Start run
     run = mlflow.start_run(run_name=config.run.experiment_id)
 
-    # Log config parameters
+    # Log base config parameters (common to SL and RL)
     mlflow.log_params({
         "alg_name": config.train.alg_name,
         "model_name": config.model.name,
@@ -55,15 +55,19 @@ def setup_mlflow(config, tracking_uri: str, rank: int):
         "gradient_accumulation_steps": config.train.gradient_accumulation_steps,
         "total_epochs": config.train.total_number_of_epochs,
         "train_steps_per_epoch": config.train.train_steps_per_epoch,
-        "kl_coeff": config.train.kl_coeff,
-        "clip_low": config.train.clip_low,
-        "clip_high": config.train.clip_high,
-        "entropy_coeff": config.train.entropy_coeff,
-        "training_gpus": config.run.training_gpus,
-        "rollout_gpus": config.run.rollout_gpus,
-        "n_samples": config.rollout.n_samples,
-        "max_tokens": config.rollout.max_tokens,
         "seed": config.run.seed,
     })
+
+    if config.run.method == "rl":
+        mlflow.log_params({
+            "n_samples": config.rollout.n_samples,
+            "max_tokens": config.rollout.max_tokens,
+            "kl_coeff": config.train.kl_coeff,
+            "clip_low": config.train.clip_low,
+            "clip_high": config.train.clip_high,
+            "entropy_coeff": config.train.entropy_coeff,
+            "training_gpus": config.run.training_gpus,
+            "rollout_gpus": config.run.rollout_gpus,
+        })
 
     return run

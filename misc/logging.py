@@ -40,7 +40,7 @@ def setup_mlflow(config, tracking_uri: str, rank: int):
     mlflow.set_tracking_uri(tracking_uri)
 
     # Set experiment name
-    experiment_name = f"{config.run.project_name}_{config.run.experiment_id}"
+    experiment_name = config.run.project_name
     mlflow.set_experiment(experiment_name)
 
     # Start run

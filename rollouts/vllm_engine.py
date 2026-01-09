@@ -28,6 +28,7 @@ class VLLMRolloutEngine:
                  reward_broadcast: bool,
                  eps_reward_norm: float,
                  gpu_memory_utilization: float,
+                 engine_id: int = 0,
                  ):
 
 
@@ -49,6 +50,7 @@ class VLLMRolloutEngine:
         self.prompt_logprobs = prompt_logprobs
         self.force_strict_on_policy = bool(force_strict_on_policy)
         self.gpu_memory_utilization = float(gpu_memory_utilization)
+        self.engine_id = int(engine_id)
 
         # vllm engine config
         self.model_path = model_path
@@ -63,6 +65,13 @@ class VLLMRolloutEngine:
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
 
+    def log(self, msg: str) -> None:
+        '''
+            Log message only if this is the first engine to avoid clutter.
+        '''
+        if self.engine_id == 0:
+            print(f"[VLLMEngine][Rank {self.engine_id}] {msg}")
+
 
     def refresh_model(self, model_path: str, version: int) -> bool:
         '''
@@ -71,10 +80,10 @@ class VLLMRolloutEngine:
         if self.vllm_engine is not None and \
            self.loaded_version == version and \
            model_path == self.model_path:
-            print(f"[VLLMEngine] Model already at version {version}, skipping refresh")
+            self.log(f"Model already at version {version}, skipping refresh")
             return False
 
-        print(f"[VLLMEngine] Refreshing model to version {version} from {model_path}")
+        self.log(f"Refreshing model to version {version} from {model_path}")
 
         # only for local paths not HF model identifier (e.g., google/gemma-3-1b-it)
         if os.path.exists(model_path):
@@ -85,7 +94,7 @@ class VLLMRolloutEngine:
         self.model_path = model_path
         self.load_model()
         self.loaded_version = version
-        print(f"[VLLMEngine] Model refreshed to version {version}")
+        self.log(f"Model refreshed to version {version}")
         return True
 
     def load_model(self) -> None:
@@ -122,7 +131,7 @@ class VLLMRolloutEngine:
                                    tensor_parallel_size=self.tensor_parallel_size,
                                    gpu_memory_utilization=self.gpu_memory_utilization,
                                   )
-            print(f"Successfully loaded vLLM model from {self.model_path}")
+            self.log(f"Successfully loaded vLLM model from {self.model_path}")
 
         except Exception as e:
             print(f"Failed to load vLLM model from {self.model_path}: {e}")
@@ -247,11 +256,11 @@ class VLLMRolloutEngine:
                                      f"but loaded_version={int(self.loaded_version)}. ")
 
                 assert self.vllm_engine is not None, f"{self.model_path} not loaded."
-                print(f"[VLLMEngine] Generating completions for {len(prompts)} prompts with {self.n_samples} samples each")
+                self.log(f"Generating completions for {len(prompts)} prompts with {self.n_samples} samples each")
                 generated_outputs = self.vllm_engine.generate(prompts,
                                                              sampling_params=self.sampling_params,
                                                              use_tqdm=False)
-                print(f"[VLLMEngine] Generation complete for {len(prompts)} prompts")
+                self.log(f"Generation complete for {len(prompts)} prompts")
 
                 # generated_outputs has prompt_ids and other outputs
                 # this works even if n_samples >= 1

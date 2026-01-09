@@ -144,7 +144,8 @@ def rollout_engine_setup(params, reward_fnc, eos_id):
 
     num_rollout_engines = max(1, rollout_gpus // tp)
     rollout_engines = []
-    for _ in range(num_rollout_engines):
+    for i in range(num_rollout_engines):
+        kwargs['engine_id'] = i
         rollout_engines.append(VLLMRolloutEngine.options(num_gpus=tp).remote(**kwargs))
 
     return num_rollout_engines, rollout_engines

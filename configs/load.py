@@ -13,6 +13,7 @@ class Run(BaseModel):
     seed: int
     project_name: str
     tracking_uri: str
+    method: str = None
 
     # RL-specific fields
     training_gpus: int | None = None
@@ -54,7 +55,14 @@ class Train(BaseModel):
     # We define epochs this way to control how different datasets are mixed during training and
     # to have more control over the training process.
     total_number_of_epochs: int
-    train_steps_per_epoch: int
+
+    # RL: train_steps_per_epoch = number of optimizer steps per epoch
+    train_steps_per_epoch: int | None = None
+
+    # SL: micro_batches_per_epoch = number of micro-batch iterations per epoch
+    # Optimizer steps = micro_batches_per_epoch // gradient_accumulation_steps
+    micro_batches_per_epoch: int | None = None
+
     dynamic_ratio_every_step: bool
 
     ###############
@@ -190,16 +198,13 @@ class Config(BaseModel):
             """
             Sync DeepSpeed config from train/model without duplicating YAML fields.
             """
-            # 1 — Batch Sizes
-            if self.method == "sl":
-                self.deepspeed.train_micro_batch_size_per_gpu = self.train.train_batch_size_per_gpu
-
+            # 1 — Batch Sizes (required for both SL and RL)
+            self.deepspeed.train_micro_batch_size_per_gpu = self.train.train_batch_size_per_gpu
             self.deepspeed.gradient_accumulation_steps = self.train.gradient_accumulation_steps
 
             # Explicitly calculate and set train_batch_size for DeepSpeed logging/sanity check
             # This is only for SL training, for RL training we don't need that.
-            if world_size is not None and self.method == "sl":
-                # this is purely informational for ds's internal logging/sanity checks.
+            if world_size is not None and self.run.method == "sl":
                 self.deepspeed.train_batch_size = self.train.train_batch_size_per_gpu * self.train.gradient_accumulation_steps * world_size
 
             # 2 — Gradient Clipping
@@ -241,13 +246,28 @@ class Config(BaseModel):
 
             # 5 — Scheduler (Auto-Sync)
             if self.train.lr_scheduler == "WarmupCosineLR":
+                # SL uses micro_batches_per_epoch (convert to optimizer steps)
+                # RL uses train_steps_per_epoch (already optimizer steps)
+                if self.run.method == "sl":
+                    if self.train.micro_batches_per_epoch is None:
+                        raise ValueError("micro_batches_per_epoch must be set for SL training")
+                    optimizer_steps_per_epoch = self.train.micro_batches_per_epoch // self.train.gradient_accumulation_steps
+
+                else:
+                    if self.train.train_steps_per_epoch is None:
+                        raise ValueError("train_steps_per_epoch must be set for RL training")
+                    optimizer_steps_per_epoch = self.train.train_steps_per_epoch
+
+                total_optimizer_steps = self.train.total_number_of_epochs * optimizer_steps_per_epoch
+                warmup_steps = int(total_optimizer_steps * self.train.warmup_steps_ratio)
+
                 self.deepspeed.scheduler = {
                     "type": self.train.lr_scheduler,
                     "params": {
-                        "total_num_steps": self.train.total_number_of_epochs * self.train.train_steps_per_epoch,
+                        "total_num_steps": total_optimizer_steps,
                         "warmup_min_ratio": 0.0,
                         "cos_min_ratio": 0.1, # standard default, decays to 10% of max LR
-                        "warmup_num_steps": int(self.train.total_number_of_epochs * self.train.train_steps_per_epoch * self.train.warmup_steps_ratio)
+                        "warmup_num_steps": warmup_steps
                     }
                 }
             else:
@@ -287,17 +307,17 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size
 
         # now verify the config
         config = Config(**raw_config)
-        config.method = method
+        config.run.method = method
         # Update Run details
         config.run.experiment_id = experiment_id
-        if method == "sl" and world_size is not None:
-            world_size = world_size
+
+        # Determine world_size based on method
+        if method == "sl":
+            if world_size is None:
+                raise ValueError("world_size must be specified for SL training")
 
         elif method == "rl":
             world_size = config.run.training_gpus
-
-        else:
-            raise ValueError("world_size must be specified for SL training")
 
         # Sync AFTER updating world_size
         config.sync_deepspeed_config(world_size)
@@ -324,5 +344,5 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size
 
 if __name__ == "__main__":
     # load config
-    config = load_and_verify("sl", "./configs/sl_args.yaml", experiment_id="run_1", world_size=4)
-    config = load_and_verify("rl", "./configs/rl_args.yaml", experiment_id="run_2")
+    config = load_and_verify(method="sl", input_yaml="./configs/sl_args.yaml", experiment_id="run_1", world_size=4)
+    config = load_and_verify(method="rl", input_yaml="./configs/rl_args.yaml", experiment_id="run_2")

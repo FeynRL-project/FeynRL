@@ -91,7 +91,8 @@ def training_engine_setup(params, alg, world_size, master_addr, master_port):
                'update_after_full_replay':params.train.update_after_full_replay,
 
                # deepspeed related arguments
-               'deepspeed_config':params.deepspeed
+               'deepspeed_config':params.deepspeed,
+               'deepspeed_ref_config':params.deepspeed_ref,
     }
     # setup ray runners
     ray_runners = []
@@ -140,6 +141,10 @@ def rollout_engine_setup(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "eps_reward_norm":params.reward.eps_reward_norm,
+
+              # reference model
+              "ref_model_path":params.model.ref_model if params.model.ref_model else None,
+              "ref_model_dtype":safe_string_to_torch_dtype(params.model.dtype),
             }
 
     num_rollout_engines = max(1, rollout_gpus // tp)
@@ -450,7 +455,8 @@ if __name__ == "__main__":
         ################
         # Policy learning and training
         ################
-        epoch_metrics = {'loss_total': [], 'loss_pi': [], 'loss_ent': [], 'approx_kl': [], 'clipfrac': []}
+        epoch_metrics = {'loss_total': [], 'loss_pi': [], 'loss_ent': [],
+                         'kl_ref': [], 'kl_old': [], 'clipfrac': []}
         for tidx in range(number_of_training_steps_per_epoch):
 
             # Schedule training engines to run update step
@@ -467,21 +473,23 @@ if __name__ == "__main__":
                 train_futures.append(engine.train_step.remote(engine_id=eid, micro_batches=shard))
 
             # Gather training metrics from all engines
-            # train_metrics: clipfrac, approx_kl, loss_ent, loss_pi, loss_total
+            # train_metrics: clipfrac, kl_old, kl_ref, loss_ent, loss_pi, loss_total
             train_metrics = ray.get(train_futures)
 
             # Aggregate metrics across all training engines
             avg_loss     = np.mean([m.get('loss_total', 0.0) for m in train_metrics])
             avg_loss_pi  = np.mean([m.get('loss_pi', 0.0) for m in train_metrics])
             avg_loss_ent = np.mean([m.get('loss_ent', 0.0) for m in train_metrics])
-            avg_kl       = np.mean([m.get('approx_kl', 0.0) for m in train_metrics])
+            avg_kl_ref   = np.mean([m.get('kl_ref', 0.0) for m in train_metrics])
+            avg_kl_old   = np.mean([m.get('kl_old', 0.0) for m in train_metrics])
             avg_clipfrac = np.mean([m.get('clipfrac', 0.0) for m in train_metrics])
 
             # Epoch average of average across all training engines
             epoch_metrics['loss_total'].append(avg_loss)
             epoch_metrics['loss_pi'].append(avg_loss_pi)
             epoch_metrics['loss_ent'].append(avg_loss_ent)
-            epoch_metrics['approx_kl'].append(avg_kl)
+            epoch_metrics['kl_ref'].append(avg_kl_ref)
+            epoch_metrics['kl_old'].append(avg_kl_old)
             epoch_metrics['clipfrac'].append(avg_clipfrac)
 
             global_step += 1
@@ -490,7 +498,7 @@ if __name__ == "__main__":
             if tidx % 10 == 0:
                 logger.info(f"[Epoch {epoch+1}][Step {tidx+1}/{number_of_training_steps_per_epoch}] "
                            f"loss={avg_loss:.4f}, pi_loss={avg_loss_pi:.4f}, ent_loss={avg_loss_ent:.4f}, "
-                           f"kl={avg_kl:.6f}, clipfrac={avg_clipfrac:.4f}")
+                           f"kl_ref={avg_kl_ref:.4f}, kl_old={avg_kl_old:.6f}, clipfrac={avg_clipfrac:.4f}")
 
             # Log to MLflow every step (only rank 0)
             if rank == 0 and mlflow_run:
@@ -498,31 +506,34 @@ if __name__ == "__main__":
                     "train/loss_total": avg_loss,
                     "train/loss_pi": avg_loss_pi,
                     "train/loss_ent": avg_loss_ent,
-                    "train/approx_kl": avg_kl,
+                    "train/kl_ref": avg_kl_ref,
+                    "train/kl_old": avg_kl_old,
                     "train/clipfrac": avg_clipfrac,
                 }, step=global_step)
 
         # 4. update policy version and reset replay buffer
         policy_version += 1
-        if alg_name.lower() in {"pg", "ppo", "grpo", "cispo"}:
-            replay_buffer.__reset__()
+        if alg_name.lower() in {"ppo", "grpo", "cispo"}:
+            replay_buffer.reset()
 
         # Log epoch summary
         train_time = time.time() - train_start_time
         epoch_time = time.time() - epoch_start_time
 
         epoch_avg_loss = np.mean(epoch_metrics['loss_total'])
-        epoch_avg_kl   = np.mean(epoch_metrics['approx_kl'])
+        epoch_avg_kl_old = np.mean(epoch_metrics['kl_old'])
+        epoch_avg_kl_ref = np.mean(epoch_metrics['kl_ref'])
         epoch_avg_clipfrac = np.mean(epoch_metrics['clipfrac'])
 
         logger.info(f"[Epoch {epoch+1}] Training complete: time={train_time:.2f}s, "
-                    f"avg_loss={epoch_avg_loss:.4f}, avg_kl={epoch_avg_kl:.6f}")
+                    f"avg_loss={epoch_avg_loss:.4f}, avg_kl_ref={epoch_avg_kl_ref:.4f}, avg_kl_old={epoch_avg_kl_old:.6f}")
 
         # Log epoch metrics to MLflow
         if rank == 0 and mlflow_run:
             mlflow.log_metrics({
                     "epoch/avg_loss": epoch_avg_loss,
-                    "epoch/avg_kl": epoch_avg_kl,
+                    "epoch/avg_kl_old": epoch_avg_kl_old,
+                    "epoch/avg_kl_ref": epoch_avg_kl_ref,
                     "epoch/avg_clipfrac": epoch_avg_clipfrac,
                     "epoch/avg_reward": rollout_stats['avg_reward'],
                     "epoch/avg_response_len": rollout_stats['avg_response_len'],

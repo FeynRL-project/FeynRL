@@ -21,9 +21,7 @@ To make things easier, we provide scripts and selected results on a few datasets
 
 ### Installation
 
-```bash
-pip install -r requirements.txt
-```
+TODO
 
 ## Contributing
 

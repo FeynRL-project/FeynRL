@@ -6,7 +6,7 @@ import deepspeed
 from transformers import AutoModelForCausalLM, AutoConfig
 
 @ray.remote
-class PG:
+class SGRPO:
     def __init__(self,
                  model_path: str,
                  model_dtype: torch.dtype,

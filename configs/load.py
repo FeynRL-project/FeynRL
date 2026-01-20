@@ -368,6 +368,14 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size
         # Sync AFTER updating world_size
         config.sync_deepspeed_config(world_size)
 
+        # Validate rollout engine resources
+        if method == "rl" and config.rollout:
+            tp = config.rollout.tensor_parallel_size
+            rg = config.run.rollout_gpus
+            if tp and rg and tp > rg:
+                raise ValueError(f"tensor_parallel_size ({tp}) cannot be greater than rollout_gpus ({rg}). "
+                                f"Please increase rollout_gpus or decrease tensor_parallel_size.")
+
         print( "\n" + 20*"=" + "Config" + 20*"=")
         print(f"Contents of {input_yaml}")
         print(config.model_dump_json(indent=4))

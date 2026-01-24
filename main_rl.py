@@ -365,6 +365,7 @@ if __name__ == "__main__":
     config = cfg.load_and_verify(method="rl",
                                  input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
+                                 rank=rank,
                                  )
     set_random_seeds(seed=config.run.seed)
 

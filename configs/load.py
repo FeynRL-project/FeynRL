@@ -22,6 +22,11 @@ class Run(BaseModel):
     ray_master_port: int | None = None
     checkpoint_dir: str | None = None
 
+    # Overlap training and rollout generation
+    overlap_enabled: bool | None = None # Enable overlap mode
+    overlap_max_lag: int | None = None # Max training steps ahead of rollout policy version
+    overlap_weight_update_interval: int | None = None # Update rollout weights every N training steps
+
 class Train(BaseModel):
     '''
         Everything related to training goes here like optimizer, scheduler, etc.
@@ -340,7 +345,7 @@ class Config(BaseModel):
                     activation_checkpointing=ds_dict.get("activation_checkpointing"),
                 )
 
-def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size: int | None = None):
+def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int, world_size: int | None = None):
     '''
         method: "sl" or "rl"
         input_yaml: path to the yaml file
@@ -376,10 +381,11 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size
                 raise ValueError(f"tensor_parallel_size ({tp}) cannot be greater than rollout_gpus ({rg}). "
                                 f"Please increase rollout_gpus or decrease tensor_parallel_size.")
 
-        print( "\n" + 20*"=" + "Config" + 20*"=")
-        print(f"Contents of {input_yaml}")
-        print(config.model_dump_json(indent=4))
-        print(46*"=")
+        if rank == 0:
+            print( "\n" + 20*"=" + "Config" + 20*"=")
+            print(f"Contents of {input_yaml}")
+            print(config.model_dump_json(indent=4))
+            print(46*"=")
 
     except ValidationError as e:
         print("Configuration Error:")
@@ -398,5 +404,5 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, world_size
 
 if __name__ == "__main__":
     # load config
-    config = load_and_verify(method="sl", input_yaml="./configs/sl_args.yaml", experiment_id="run_1", world_size=4)
-    config = load_and_verify(method="rl", input_yaml="./configs/rl_args.yaml", experiment_id="run_2")
+    config = load_and_verify(method="sl", input_yaml="./configs/sl_args.yaml", experiment_id="run_1", rank=0, world_size=4)
+    config = load_and_verify(method="rl", input_yaml="./configs/rl_args.yaml", experiment_id="run_2", rank=0)

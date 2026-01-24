@@ -28,7 +28,7 @@ def setup_logging(rank: int, log_level: str = "INFO", exp_name: str = "") -> log
 
     return logger
 
-def setup_mlflow(config, tracking_uri: str, rank: int):
+def setup_viz(config, tracking_uri: str, rank: int):
     '''
         Setup MLflow tracking. Only rank 0 logs to MLflow.
     '''

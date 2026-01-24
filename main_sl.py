@@ -6,7 +6,7 @@ import deepspeed
 import torch
 from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from torch.utils.data import DataLoader, DistributedSampler
-import torch.distributed as torch_dist
+import torch.distributed
 from tqdm import tqdm
 import gc
 import mlflow
@@ -15,8 +15,13 @@ import time
 # imports local methods, classes, etc.
 import configs.load as cfg# all config arguments
 from custom_datasets.prompt_response import PromptResponseDataset
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name
-from misc.logging import setup_logging, setup_mlflow
+from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
+from misc.logging import setup_logging, setup_viz
+
+Algorithm_Registry = {
+    # supported algorithms
+    'sft': ('algs.SFT.sft', 'SFT'),
+}
 
 def set_random_seeds(seed):
     '''
@@ -29,7 +34,7 @@ def set_random_seeds(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def rank_world_size_setup():
+def init_rank_world_size():
     '''
         Detect rank and world size from environment variables.
         we way to run is to use torchrun (torchrun --nnodes=2 --nproc_per_node=4 main_sl.py) where we can specify
@@ -107,7 +112,7 @@ def load_models_and_tokenizer(model_name, model_dtype, ref_model_name, trust_rem
 
     return model, ref_model, tokenizer  
 
-def training_engine_setup(deepspeed_config, model, ref_model=None):
+def create_training_engine(deepspeed_config, model, ref_model=None):
     '''
         This function is responsible for setting up distributed training engine.
         For now, it only supports deepspeed.
@@ -144,7 +149,7 @@ def training_engine_setup(deepspeed_config, model, ref_model=None):
 
     return model_engine, ref_model_engine, optimizer
 
-def data_loader_setup(params, tokenizer, rank, world_size, batch_size, split):
+def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     '''
        Setup DataLoader for distributed training.
        Notes:
@@ -198,7 +203,7 @@ if __name__ == "__main__":
     ########
     # 1. Setup Environment
     ########
-    rank, world_size, local_rank = rank_world_size_setup()
+    rank, world_size, local_rank = init_rank_world_size()
     logger = setup_logging(rank=rank, log_level=args.log_level)
 
     ########
@@ -208,11 +213,12 @@ if __name__ == "__main__":
                                  input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
                                  world_size=world_size,
+                                 rank=rank,
                                  )
     set_random_seeds(seed=config.run.seed)
 
     # Setup MLflow (only on rank 0)
-    mlflow_run = setup_mlflow(config=config, tracking_uri=config.run.tracking_uri, rank=rank)
+    mlflow_run = setup_viz(config=config, tracking_uri=config.run.tracking_uri, rank=rank)
     logger.info(f"Config loaded. experiment_id: {config.run.experiment_id}")
 
     ########
@@ -228,7 +234,7 @@ if __name__ == "__main__":
     ########
     # 5. Setup trainiing and inference engines
     ########
-    model_engine, ref_model_engine, optimizer = training_engine_setup(deepspeed_config=config.deepspeed,
+    model_engine, ref_model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed,
                                                                       model=model,
                                                                       ref_model=ref_model)
 
@@ -239,14 +245,14 @@ if __name__ == "__main__":
     ########
     # 6. Build env or data loader
     ########
-    train_dataloader, train_sampler = data_loader_setup(params=config,
+    train_dataloader, train_sampler = create_data_loader(params=config,
                                                         tokenizer=tokenizer,
                                                         batch_size=config.train.train_batch_size_per_gpu,
                                                         split='train',
                                                         world_size=world_size,
                                                         rank=rank)
 
-    val_dataloader, _ = data_loader_setup(params=config,
+    val_dataloader, _ = create_data_loader(params=config,
                                           tokenizer=tokenizer,
                                           batch_size=config.train.val_batch_size_per_gpu,
                                           split='val',
@@ -256,17 +262,11 @@ if __name__ == "__main__":
     ########
     # 7. Intitate the learning algorithm (e.g., ppo)
     ########
-    if str.lower(config.train.alg_name) in {'sft'}:
-        if str.lower(config.train.alg_name) == 'sft':
-            import algs.SFT.sft as calg
-            alg = calg.SFT(
-                           model_engine=model_engine,
-                           optimizer=optimizer,
-                           use_cache=config.model.use_cache,
-                           normalize_loss=config.train.normalize_loss)
-
-    else:
-        raise ValueError(f"Unknown algorithm: {config.train.alg_name}")
+    alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
+    alg = alg_class(model_engine=model_engine,
+                    optimizer=optimizer,
+                    use_cache=config.model.use_cache,
+                    normalize_loss=config.train.normalize_loss)
 
     ########
     # 8. Training and evaluation loop

@@ -1,5 +1,6 @@
 import torch
 import os
+import importlib
 
 def safe_string_to_torch_dtype(dtype_in):
     '''
@@ -93,3 +94,16 @@ def get_gpus_per_node(ray_obj):
 
     else:
         return 1
+
+def load_algorithm(alg_name: str, registry: dict):
+    '''
+        Load algorithm class from registry.
+    '''
+    alg_name = alg_name.lower()
+    if alg_name not in registry:
+        available = list(registry.keys())
+        raise ValueError(f"Unknown algorithm: {alg_name}. Available: {available}")
+
+    module_path, class_name = registry[alg_name]
+    module = importlib.import_module(module_path)
+    return getattr(module, class_name)

@@ -63,3 +63,33 @@ def get_experiment_dir_name(output_dir: str, tag: str, experiment_id: str):
     '''
     experiment_dir = os.path.join(output_dir, experiment_id, tag)
     return experiment_dir
+
+
+def get_gpus_per_node(ray_obj):
+    '''
+        Get number of GPUs per node from Ray cluster state.
+        Falls back to torch.cuda.device_count() if Ray fails.
+        Multi-node cluster: queries Ray, gets actual GPUs per node
+        Single-node: queries Ray, falls back to torch if needed
+        Orchestrator on CPU head node: queries Ray (gets worker node GPUs per node)
+        Ray not initialized properly: falls back to torch/1
+    '''
+    try:
+        # Get all nodes in the cluster
+        nodes = ray_obj.nodes()
+        # Filter for alive nodes that have GPUs
+        gpu_nodes = [n for n in nodes if n['Alive'] and n.get('Resources', {}).get('GPU', 0) > 0]
+
+        if gpu_nodes:
+            # We assume homogeneous cluster for now
+            return int(gpu_nodes[0]['Resources']['GPU'])
+
+    except Exception as e:
+        print(f"Warning: Could not get GPU count from Ray: {e}")
+
+    # Fallback
+    if torch.cuda.is_available():
+        return torch.cuda.device_count()
+
+    else:
+        return 1

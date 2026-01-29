@@ -28,6 +28,7 @@ class VLLMRolloutEngine:
                  reward_broadcast: bool,
                  eps_reward_norm: float,
                  gpu_memory_utilization: float,
+                 model_dtype: str,
                  engine_id: int = 0,
                  ):
 
@@ -54,6 +55,7 @@ class VLLMRolloutEngine:
 
         # vllm engine config
         self.model_path = model_path
+        self.model_dtype = model_dtype
         self.loaded_version = -1
         self.trust_remote_code = trust_remote_code
         self.vllm_engine = None
@@ -130,6 +132,7 @@ class VLLMRolloutEngine:
                                    trust_remote_code=self.trust_remote_code,
                                    tensor_parallel_size=self.tensor_parallel_size,
                                    gpu_memory_utilization=self.gpu_memory_utilization,
+                                   dtype=self.model_dtype,
                                   )
             self.log(f"Successfully loaded vLLM model from {self.model_path}")
 

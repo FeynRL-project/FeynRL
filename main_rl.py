@@ -123,6 +123,8 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "force_strict_on_policy":params.rollout.force_strict_on_policy,
               "eos_id":eos_id,
               "tensor_parallel_size":tp,
+              "model_dtype":params.model.dtype,
+
 
               # reward related arguments
               "reward_func":reward_fnc,

@@ -3,7 +3,7 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import os
 from datasets import load_dataset
 
-class PromptResponseDataset(Dataset):
+class PairedFeed(Dataset):
     '''
         This is a general dataset to handle prompt and answer pairs.
         The data should be in a parquet format and system prompt is optional.

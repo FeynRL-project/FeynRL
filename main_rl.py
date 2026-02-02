@@ -12,7 +12,7 @@ import mlflow
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
-from custom_datasets.prompt_only import PromptOnlyDataset # our custom pytorch dataset
+from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
@@ -167,11 +167,11 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
        would be used to train the policy.
     '''
     # 1. Initialize our custom datasets
-    prompt_ds = PromptOnlyDataset(prompt_key=params.data.prompt_key,
-                                  max_seq_len=params.data.max_seq_len,
-                                  tokenizer=tokenizer,
-                                  data_path=params.data.train_files_path,
-                                  return_text=False)
+    prompt_ds = PromptsFeed(prompt_key=params.data.prompt_key,
+                            max_seq_len=params.data.max_seq_len,
+                            tokenizer=tokenizer,
+                            data_path=params.data.train_files_path,
+                            return_text=False)
 
     # since we split the data across the rollout engines
     bsz = num_rollout_engines * params.rollout.rollout_batch_size_per_gpu

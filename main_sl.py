@@ -14,7 +14,7 @@ import time
 
 # imports local methods, classes, etc.
 import configs.load as cfg# all config arguments
-from custom_datasets.prompt_response import PromptResponseDataset
+from data_feeds.paired import PairedFeed
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
 from misc.logging import setup_logging, setup_viz
 
@@ -158,11 +158,11 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     '''
     # 1. Initialize our custom datasets
     data_path = params.data.train_files_path if split == 'train' else params.data.val_files_path
-    dataset = PromptResponseDataset(prompt_key=params.data.prompt_key,
-                                    answer_key=params.data.answer_key,
-                                    max_seq_len=params.data.max_seq_len,
-                                    tokenizer=tokenizer,
-                                    data_path=data_path)
+    dataset = PairedFeed(prompt_key=params.data.prompt_key,
+                        answer_key=params.data.answer_key,
+                        max_seq_len=params.data.max_seq_len,
+                        tokenizer=tokenizer,
+                        data_path=data_path)
 
     shuffle = True if split == 'train' else False
     drop_last = True if split == 'train' else False

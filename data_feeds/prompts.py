@@ -2,7 +2,7 @@ import os
 from torch.utils.data import Dataset
 from datasets import load_dataset
 
-class PromptOnlyDataset(Dataset):
+class PromptsFeed(Dataset):
     '''
         Returns tokenized prompt ids as a list[int] which can be a variable length.
     '''

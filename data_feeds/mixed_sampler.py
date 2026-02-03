@@ -232,8 +232,7 @@ def create_prompt_dataset_and_sampler(data_paths,
                               solution_key=solution_key,
                               max_seq_len=max_seq_len,
                               tokenizer=tokenizer,
-                              data_path=d_path,
-                              return_text=False)
+                              data_path=d_path)
 
         all_datasets.append(dataset)
         len_datasets[dname] = len(dataset)

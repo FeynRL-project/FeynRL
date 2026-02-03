@@ -12,7 +12,6 @@ class PromptsFeed(Dataset):
                 max_seq_len: int,
                 data_path: str,
                 solution_key: str = None,
-                return_text: bool=False,
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
         assert max_seq_len > 0, "max_seq_len must be > 0"
@@ -34,7 +33,6 @@ class PromptsFeed(Dataset):
         self.max_seq_len = int(max_seq_len)
         self.tokenizer   = tokenizer
         self.data_path   = data_path
-        self.return_text = return_text
         self._load_data()
 
     def _load_data(self):
@@ -86,16 +84,6 @@ class PromptsFeed(Dataset):
             raise ValueError(f"Prompt in sample {idx}:{sample}: too long: "
                              f"prompt must be at most {self.max_seq_len} tokens (got {len(prompt_ids)})")
 
-        if not self.return_text:
-            if self.solution_key:
-                if self.solution_key not in sample:
-                    raise KeyError(f"Missing value for key '{self.solution_key}' in sample {sample}")
-
-                return {"prompt_token_ids": prompt_ids, "solution": sample[self.solution_key]}
-
-            else:
-                return {"prompt_token_ids": prompt_ids}
-
         # Get the prompt text for debugging.
         prompt_text = self.tokenizer.apply_chat_template(
                                         conversation=message,
@@ -121,23 +109,7 @@ class PromptsFeed(Dataset):
             Otherwise, we will get all sequences must have equal size error.
             This function keeps variable-length items as python objects
         '''
-        if not self.return_text:
-            return batch
-
-        prompt_token_ids = []
-        prompt_texts = []
-        solutions = []
-
-        for x in batch:
-            prompt_token_ids.append(x["prompt_token_ids"])
-            prompt_texts.append(x["text"])
-            if self.solution_key:
-                solutions.append(x["solution"])
-
-        if self.solution_key:
-            return prompt_token_ids, prompt_texts, solutions
-
-        return prompt_token_ids, prompt_texts
+        return batch
 
 if __name__ == "__main__":
     '''
@@ -166,7 +138,6 @@ if __name__ == "__main__":
                         tokenizer=tokenizer,
                         max_seq_len=1024,
                         data_path="./promptonly.parquet",
-                        return_text=False,
                         solution_key="",
                         )
     dataloader = DataLoader(dataset,

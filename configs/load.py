@@ -88,15 +88,15 @@ class Data(BaseModel):
         Everything related to data goes here.
     '''
     model_config = ConfigDict(extra='forbid')
-    train_dnames: list[str] = None
     train_ratios: dict[str, float] = None
-    train_files_path: str = None
-    val_files_path: str = None
+    train_files_path: list[str] = None
+    val_files_path: list[str] = None
     test_files_path: str = None
     num_workers: int
     max_seq_len: int
     prompt_key: str
     answer_key: str
+    solution_key: str | None = None
 
 class Model(BaseModel):
     '''
@@ -192,6 +192,7 @@ class Rollout(BaseModel):
     force_strict_on_policy: bool | None = None
     tensor_parallel_size: int | None = None
     rollout_batch_size_per_gpu: int | None = None
+    rollout_samples_per_epoch: int | None = None
 
 class Config(BaseModel):
     '''

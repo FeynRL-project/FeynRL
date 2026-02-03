@@ -13,7 +13,8 @@ from tqdm import tqdm
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
-from custom_datasets.prompt_only import PromptOnlyDataset # our custom pytorch dataset
+from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
+from data_feeds.mixed_sampler import create_prompt_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
@@ -162,30 +163,39 @@ def load_tokenizer(model_name, trust_remote_code=False, rank=0):
 
     return tokenizer
 
-def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
+def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch):
     '''
-       This dataloader is used for rollout generation which 
+       This dataloader is used for rollout generation which
        would be used to train the policy.
+       Uses MixedDatasetSampler for mixed sampling across datasets.
     '''
-    # 1. Initialize our custom datasets
-    reward_function_name = params.reward.reward_func
-    return_answer = True if reward_function_name in ['gsm8k_reward_func'] else False
-    prompt_ds = PromptOnlyDataset(prompt_key=params.data.prompt_key,
-                                  max_seq_len=params.data.max_seq_len,
-                                  tokenizer=tokenizer,
-                                  data_path=params.data.train_files_path,
-                                  return_text=False,
-                                  return_answer=return_answer)
+    if samples_per_epoch <= 0:
+        raise ValueError(f"samples_per_epoch must be > 0, got {samples_per_epoch}")
 
-    # since we split the data across the rollout engines
     bsz = num_rollout_engines * params.rollout.rollout_batch_size_per_gpu
-    dataloader = DataLoader(dataset=prompt_ds,
-                            batch_size=bsz,
+    # Calculate number of batches from total samples
+    num_batches = (samples_per_epoch + bsz - 1) // bsz
+
+    dataset, sampler, collate_fn = create_prompt_dataset_and_sampler(
+                                                data_paths=params.data.train_files_path,
+                                                prompt_key=params.data.prompt_key,
+                                                solution_key=params.data.solution_key,
+                                                max_seq_len=params.data.max_seq_len,
+                                                tokenizer=tokenizer,
+                                                train_ratios=params.data.train_ratios,
+                                                seed=params.run.seed,
+                                                local_batch_size=bsz,
+                                                dataset_cls=PromptsFeed,
+                                                steps_per_epoch=num_batches,
+                                                shuffle_within_batch=True,
+                                                dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                )
+    # MixedDatasetSampler is a batch sampler (yields batches of indices)
+    dataloader = DataLoader(dataset=dataset,
+                            batch_sampler=sampler,
                             num_workers=params.data.num_workers,
-                            shuffle=True,
                             pin_memory=True,
-                            drop_last=False,
-                            collate_fn=prompt_ds.collate_fn,
+                            collate_fn=collate_fn,
                             )
 
     return dataloader
@@ -206,18 +216,17 @@ def collect_rollouts(dataloader,
     total_reward_sum = 0.0
     total_response_len = 0
 
-    # Note dataLoader's batch_size is already num_rollout_engines * rollout_batch_size,
-    batch_size   = dataloader.batch_size
-    dataset_size = len(dataloader.dataset)
-    num_steps_to_generate_all = (dataset_size + batch_size - 1) // batch_size
+    # example: 2 rollout engines * 8 batch_size_per_gpu = 16 batch_size
+    # rollout_samples_per_epoch=100 -> ceil(100/16)=7 batches -> 112 actual samples
+    batch_size = dataloader.batch_sampler.local_batch_size
+    num_batches_per_epoch = len(dataloader)
+    samples_per_epoch = num_batches_per_epoch * batch_size
 
-    logger.info(f"[Rollout] Dataset: {dataset_size}, Batch: {batch_size} "
-                f"({num_rollout_engines} engines × {batch_size // num_rollout_engines} per engine), "
-                f"Steps to generate all samples: {num_steps_to_generate_all}")
+    logger.info(f"[Rollout] Batch: {batch_size} "
+                f"({num_rollout_engines} engines * {batch_size // num_rollout_engines} per engine), "
+                f"Samples this epoch: {samples_per_epoch}")
 
-
-    tqdm_dataloader = tqdm(dataloader, desc="Rollout", leave=False)
-    for rollout_batch in tqdm_dataloader:
+    for rollout_batch in dataloader:
         # 1. split data across rollout engines
         # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
         # and rollout_batch is a list of dictionaries.
@@ -459,7 +468,9 @@ if __name__ == "__main__":
     logger.info(f"Loading rollout dataloader from {config.data.train_files_path}")
     rollout_dataloader = create_rollout_dataloader(params=config,
                                                   tokenizer=tokenizer,
-                                                  num_rollout_engines=num_rollout_engines)
+                                                  num_rollout_engines=num_rollout_engines,
+                                                  samples_per_epoch=config.rollout.rollout_samples_per_epoch)
+
     logger.info(f"Rollout dataloader ready. Total batches per epoch: {len(rollout_dataloader)}")
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
@@ -491,6 +502,9 @@ if __name__ == "__main__":
     for epoch in range(number_of_epochs):
         epoch_start_time = time.time()
         logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Starting rollout generation...")
+
+        # Set epoch on sampler to reshuffle data
+        rollout_dataloader.batch_sampler.set_epoch(epoch)
 
         ################
         # 1. Collect rollouts

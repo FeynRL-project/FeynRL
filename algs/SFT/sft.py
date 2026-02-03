@@ -41,7 +41,7 @@ class SFT:
 
         # To avoid gradient accumulation error caused by loss.mean(),
         # we use sum of loss instead but play with learning rate to account for this.
-        loss = masked_per_token_loss.sum()
+        loss_sum = masked_per_token_loss.sum()
 
         # Loss_accumulated \neq Loss_full_batch when sequence lengths vary.
         # to address that, we normalize by total sequence length (constant)
@@ -53,9 +53,11 @@ class SFT:
                 # This shouldn't happen
                 raise ValueError("Cannot compute loss: total_possible_tokens is 0")
 
-            loss = loss / total_possible_tokens
+            loss = loss_sum / total_possible_tokens
+        else:
+            loss = loss_sum
 
-        return loss
+        return loss, loss_sum.item(), loss_mask.sum().item()
 
     def forward(self, batch):
         '''
@@ -108,10 +110,9 @@ class SFT:
             logits, target_ids, loss_mask = self.forward(micro_batch)
 
             # compute loss pass
-            loss = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
-            val_loss = loss.item()
+            _, loss_sum, num_tokens = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
 
-        return {"loss": float(val_loss)}
+        return {"loss_sum": float(loss_sum), "num_tokens": float(num_tokens)}
 
     def train_step(self, micro_batch):
         '''
@@ -129,7 +130,7 @@ class SFT:
         logits, target_ids, loss_mask = self.forward(micro_batch)
 
         # 3. compute loss pass
-        loss = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
+        loss, _, _ = self.compute_loss(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
 
         # 4. backward step
         # deepspeed aggregates gradients and only updates weights when accumulation_steps is reached.

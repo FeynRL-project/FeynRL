@@ -2,7 +2,7 @@ import os
 from torch.utils.data import Dataset
 from datasets import load_dataset
 
-class PromptOnlyDataset(Dataset):
+class PromptsFeed(Dataset):
     '''
         Returns tokenized prompt ids as a list[int] which can be a variable length.
     '''
@@ -11,6 +11,7 @@ class PromptOnlyDataset(Dataset):
                 tokenizer,
                 max_seq_len: int,
                 data_path: str,
+                solution_key: str = None,
                 return_text: bool=False,
                 return_answer: bool=False,
                 ):
@@ -23,6 +24,14 @@ class PromptOnlyDataset(Dataset):
         assert tokenizer.eos_token_id is not None, "tokenizer must have an eos token"
 
         self.prompt_key  = prompt_key
+
+        # this is required for reward function of datatset where solution is provided.
+        if solution_key:
+            self.solution_key = solution_key
+
+        else:
+            self.solution_key = None
+
         self.max_seq_len = int(max_seq_len)
         self.tokenizer   = tokenizer
         self.data_path   = data_path
@@ -48,11 +57,10 @@ class PromptOnlyDataset(Dataset):
         '''
            data is a dict with the following format:
            {
-            {
                 "prompt": [{"role": "system", "content": "..."},
                            {"role": "user", "content": "..."}
-                           ],
-            },...
+                          ],
+                "solution": "..." # optional
            }
            Note system prompt is optional.
         '''
@@ -80,24 +88,31 @@ class PromptOnlyDataset(Dataset):
             raise ValueError(f"Prompt in sample {idx}:{sample}: too long: "
                              f"prompt must be at most {self.max_seq_len} tokens (got {len(prompt_ids)})")
 
+        if not self.return_text:
+            if self.solution_key:
+                if self.solution_key not in sample:
+                    raise KeyError(f"Missing value for key '{self.solution_key}' in sample {sample}")
 
-        outputs = {"prompt_token_ids": prompt_ids}
-        if self.return_answer:
-            answer = sample["answer"]
-            answer_ids = self.tokenizer.encode(answer, add_special_tokens=False)
-            outputs["answer_token_ids"] = answer_ids
+                return {"prompt_token_ids": prompt_ids, "solution": sample[self.solution_key]}
 
-        if self.return_text:
-            # Get the prompt text for debugging. it can be used for vLLM rollout too
-            prompt_text = self.tokenizer.apply_chat_template(
+            else:
+                return {"prompt_token_ids": prompt_ids}
+
+        # Get the prompt text for debugging.
+        prompt_text = self.tokenizer.apply_chat_template(
                                         conversation=message,
                                         add_generation_prompt=True,
                                         tokenize=False,
                                         return_tensors=None,
+                                        skip_special_tokens=False,
                                         )
-            outputs["text"] = prompt_text
+        if self.solution_key:
+            solution = sample[self.solution_key]
+            return  {"prompt_token_ids": prompt_ids, "text": prompt_text, "solution": solution}
 
-        return  outputs
+        else:
+            return  {"prompt_token_ids": prompt_ids, "text": prompt_text}
+
 
     def __len__(self):
         return self.len_data
@@ -108,18 +123,23 @@ class PromptOnlyDataset(Dataset):
             Otherwise, we will get all sequences must have equal size error.
             This function keeps variable-length items as python objects
         '''
-        if self.return_text == False:
-            # batch: List[List[int]]
+        if not self.return_text:
             return batch
 
+        prompt_token_ids = []
         prompt_texts = []
-        prompt_token_ids   = []
+        solutions = []
 
         for x in batch:
             prompt_token_ids.append(x["prompt_token_ids"])
             prompt_texts.append(x["text"])
+            if self.solution_key:
+                solutions.append(x["solution"])
 
-        return prompt_texts, prompt_token_ids
+        if self.solution_key:
+            return prompt_token_ids, prompt_texts, solutions
+
+        return prompt_token_ids, prompt_texts
 
 if __name__ == "__main__":
     '''
@@ -135,22 +155,22 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
 
     random_prompts = [
-        {'prompt': [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello, how are you?"}]},
-        {'prompt': [{"role": "user", "content": "What is the meaning of life?"}]},
-        {'prompt': [{"role": "user", "content": "What is the meaning of the universe?"}]},
-        {'prompt': [{"role": "user", "content": "This is is a just rather long prompt that is going to be tokenized. This is a test to make sure the dataset works."}]},
-
+        {'prompt': [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello, how are you?"}], 'solution': 'two'},
+        {'prompt': [{"role": "user", "content": "What is the meaning of life?"}], 'solution': 'it is hard to say.'},
+        {'prompt': [{"role": "user", "content": "What is the meaning of the universe?"}], 'solution': 'haha.'},
+        {'prompt': [{"role": "user", "content": "This is is a just rather long prompt that is going to be tokenized. This is a test to make sure the dataset works."}], 'solution': '42'},
     ]
     df = pd.DataFrame(random_prompts)
     df.to_parquet("./promptonly.parquet", index=False)
 
-    dataset = PromptOnlyDataset(
-                prompt_key="prompt",
-                tokenizer=tokenizer,
-                max_seq_len=1024,
-                data_path="./promptonly.parquet",
-                return_text=False,
-                )
+    dataset = PromptsFeed(
+                        prompt_key="prompt",
+                        tokenizer=tokenizer,
+                        max_seq_len=1024,
+                        data_path="./promptonly.parquet",
+                        return_text=False,
+                        solution_key="",
+                        )
     dataloader = DataLoader(dataset,
                             batch_size=3,
                             collate_fn=dataset.collate_fn,

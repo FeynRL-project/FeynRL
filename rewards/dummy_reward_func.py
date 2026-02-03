@@ -1,16 +1,18 @@
 import torch
-from typing import List, Any
+from typing import List, Any, Dict
 
-def dummy_reward_func(prompt_ids: List[int], response_ids: List[int], finish_reason: Any):
+def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any]):
     '''
       input args:
-        prompt_ids: List[int] - list of token ids in the prompt
-        response_ids: List[int] - list of token ids in the response
-        finish_reason: Any - reason for the finish (e.g., stop, length, etc.)
+        reward_data: Dict[str, Any] - dictionary containing reward data
       output args:
         r: torch.Tensor - reward tensor
         is_per_token: bool - whether the reward is per token
     '''
+
+    response_ids = list(response_data.token_ids)
+    finish_reason = response_data.finish_reason
+
     is_per_token = False
     r = torch.zeros((len(response_ids),), dtype=torch.float32)
     

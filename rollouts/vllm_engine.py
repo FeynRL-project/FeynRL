@@ -244,7 +244,8 @@ class VLLMRolloutEngine:
                 current_iter: int,
                 policy_version: int) -> List[Dict[str, Any]]:
                 ''' 
-                    prompts: [{'prompt_token_ids': [2,..]}, {'prompt_token_ids': [...]}, ...]
+                    prompts: Data provided by the dataloader. For example:
+                        [{'prompt_token_ids': [2,..], 'solution': '1'}, {'prompt_token_ids': [...], 'solution': '2'}, ...]
                     Returns a list of rollout samples. length ~ B * n_samples.
 
                     token-aligned and prediction-aligned logprobs/mask/done are returned.
@@ -268,7 +269,7 @@ class VLLMRolloutEngine:
                 # generated_outputs has prompt_ids and other outputs
                 # this works even if n_samples >= 1
                 rollout_samples = []
-                for data in generated_outputs:
+                for prompt_data, data in zip(prompts, generated_outputs):
                     group_samples = []
                     group_stats   = {'rewards': [], 'lengths': []}
                     prompt_ids = list(data.prompt_token_ids or [])
@@ -299,7 +300,7 @@ class VLLMRolloutEngine:
                         rewards   = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
                         # it is important to score the response regardless of its length if it is empty
-                        rewards_resp, is_per_token = self.score_response(prompt_ids, response_ids, finish_reason)
+                        rewards_resp, is_per_token = self.score_response(prompt_data, response)
                         rewards[prompt_len:] = rewards_resp
 
                         # is_per_token is False, then rewards_resp will only have value for the last element
@@ -387,14 +388,14 @@ class VLLMRolloutEngine:
 
                 return rollout_samples
 
-    def score_response(self, prompt_ids, response_ids, finish_reason) -> torch.Tensor:
+    def score_response(self, prompt: Dict[str, Any], response: Dict[str, Any]) -> torch.Tensor:
         '''
             Calculate the reward for each response token.
             it returns a float tensor of len(response_ids).
         '''
         with torch.no_grad():
             # per token rewards or scalar reward
-            rewards, is_per_token = self.reward_func(prompt_ids, response_ids, finish_reason)
+            rewards, is_per_token = self.reward_func(prompt, response)
 
         if isinstance(rewards, torch.Tensor):
             rewards = rewards.to(dtype=torch.float32, device='cpu')
@@ -402,8 +403,8 @@ class VLLMRolloutEngine:
         else:
             rewards = torch.tensor(rewards, dtype=torch.float32, device='cpu')
 
-        if rewards.numel() != len(response_ids):
-            raise ValueError(f"score_response must return len={len(response_ids)} rewards, got {rewards.numel()}")
+        if rewards.numel() != len(response.token_ids):
+            raise ValueError(f"score_response must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
 
         return rewards, is_per_token
 

@@ -225,6 +225,7 @@ def collect_rollouts(dataloader,
                 f"({num_rollout_engines} engines * {batch_size // num_rollout_engines} per engine), "
                 f"Samples this epoch: {samples_per_epoch}")
 
+
     for rollout_batch in dataloader:
         # 1. split data across rollout engines
         # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
@@ -265,6 +266,7 @@ def collect_rollouts(dataloader,
 
     return {"total_samples_generated": total_samples_generated,
             "avg_reward": avg_reward,
+            "total_reward": total_reward_sum,
             "avg_response_len": avg_response_len,
             "rollout_time": rollout_time}
 
@@ -436,10 +438,11 @@ if __name__ == "__main__":
     # 6. initialize inference engine
     ########
     logger.info("Setting up inference/rollout engines...")
-    if config.reward.reward_func:
-        reward_module = importlib.import_module("rewards.compute_score")
-        reward_fnc = getattr(reward_module, config.reward.reward_func)
-        logger.info(f"Using reward function: {config.reward.reward_func}")
+    reward_func_name = config.reward.reward_func if config.reward.reward_func else None
+    if reward_func_name:
+        reward_module = importlib.import_module("rewards." + reward_func_name)
+        reward_fnc = getattr(reward_module, "compute_score")
+        logger.info(f"Using reward function: {reward_func_name}")
 
     else:
         raise ValueError("Reward function not specified")
@@ -505,7 +508,8 @@ if __name__ == "__main__":
                                          logger=logger)
 
         logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
-                    f"avg_reward={rollout_stats['avg_reward']:.4f}, avg_response_len={rollout_stats['avg_response_len']:.1f}, "
+                    f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
+                    f"avg_response_len={rollout_stats['avg_response_len']:.1f}, "
                     f"time={rollout_stats['rollout_time']:.2f}s")
 
         ################
@@ -571,6 +575,7 @@ if __name__ == "__main__":
                     "epoch/avg_kl_ref": epoch_avg_kl_ref,
                     "epoch/avg_clipfrac": epoch_avg_clipfrac,
                     "epoch/avg_reward": rollout_stats['avg_reward'],
+                    "epoch/total_reward": rollout_stats['total_reward'],
                     "epoch/avg_response_len": rollout_stats['avg_response_len'],
                     "epoch/total_samples": rollout_stats['total_samples_generated'],
                     "epoch/rollout_time_sec": rollout_stats['rollout_time'],

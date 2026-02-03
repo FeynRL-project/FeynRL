@@ -244,7 +244,8 @@ class VLLMRolloutEngine:
                 current_iter: int,
                 policy_version: int) -> List[Dict[str, Any]]:
                 ''' 
-                    prompts: [{'prompt_token_ids': [2,..]}, {'prompt_token_ids': [...]}, ...]
+                    prompts: Data provided by the dataloader. For example:
+                        [{'prompt_token_ids': [2,..], 'solution': '1'}, {'prompt_token_ids': [...], 'solution': '2'}, ...]
                     Returns a list of rollout samples. length ~ B * n_samples.
 
                     token-aligned and prediction-aligned logprobs/mask/done are returned.

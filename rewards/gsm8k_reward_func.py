@@ -3,10 +3,6 @@ from typing import Dict, Any
 import torch
 
 def extract_solution(solution_str, clip_chars=300):
-    # Optimization: Regular expression matching on very long strings can be slow.
-    # For math problems, the final answer is usually at the end.
-    # We only match on the last 300 characters, which is a safe approximation for 300 tokens.
-    
     if len(solution_str) > clip_chars:
         solution_str = solution_str[-clip_chars:]
 
@@ -23,7 +19,8 @@ def extract_solution(solution_str, clip_chars=300):
 def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any], format_score=0.0, score=1.0):
     '''
       input args:
-        reward_data: Dict[str, Any] - dictionary containing reward data
+        prompt_data: Dict[str, Any] - dictionary containing prompt data
+        response_data: Dict[str, Any] - dictionary containing response data
       output args:
         r: torch.Tensor - reward tensor
         is_per_token: bool - whether the reward is per token

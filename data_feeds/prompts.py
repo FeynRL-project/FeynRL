@@ -13,7 +13,6 @@ class PromptsFeed(Dataset):
                 data_path: str,
                 solution_key: str = None,
                 return_text: bool=False,
-                return_answer: bool=False,
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
         assert max_seq_len > 0, "max_seq_len must be > 0"
@@ -36,7 +35,6 @@ class PromptsFeed(Dataset):
         self.tokenizer   = tokenizer
         self.data_path   = data_path
         self.return_text = return_text
-        self.return_answer = return_answer
         self._load_data()
 
     def _load_data(self):

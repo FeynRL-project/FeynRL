@@ -272,7 +272,6 @@ class VLLMRolloutEngine:
                     group_samples = []
                     group_stats   = {'rewards': [], 'lengths': []}
                     prompt_ids = list(data.prompt_token_ids or [])
-                    answer_ids = list(prompt['answer_token_ids'] or [])
                     prompt_len = len(prompt_ids)
                     if prompt_len == 0:
                         raise ValueError(f"No prompt token ids found in generated output: {data}")
@@ -300,7 +299,7 @@ class VLLMRolloutEngine:
                         rewards   = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
                         # it is important to score the response regardless of its length if it is empty
-                        rewards_resp, is_per_token = self.score_response(prompt_ids, response_ids, finish_reason, answer_ids)
+                        rewards_resp, is_per_token = self.score_response(prompt, response)
                         rewards[prompt_len:] = rewards_resp
 
                         # is_per_token is False, then rewards_resp will only have value for the last element
@@ -388,14 +387,14 @@ class VLLMRolloutEngine:
 
                 return rollout_samples
 
-    def score_response(self, prompt_ids, response_ids, finish_reason, answer_ids=None) -> torch.Tensor:
+    def score_response(self, prompt: Dict[str, Any], response: Dict[str, Any]) -> torch.Tensor:
         '''
             Calculate the reward for each response token.
             it returns a float tensor of len(response_ids).
         '''
         with torch.no_grad():
             # per token rewards or scalar reward
-            rewards, is_per_token = self.reward_func(prompt_ids, response_ids, finish_reason, answer_ids)
+            rewards, is_per_token = self.reward_func(prompt, response)
 
         if isinstance(rewards, torch.Tensor):
             rewards = rewards.to(dtype=torch.float32, device='cpu')
@@ -403,8 +402,8 @@ class VLLMRolloutEngine:
         else:
             rewards = torch.tensor(rewards, dtype=torch.float32, device='cpu')
 
-        if rewards.numel() != len(response_ids):
-            raise ValueError(f"score_response must return len={len(response_ids)} rewards, got {rewards.numel()}")
+        if rewards.numel() != len(response.token_ids):
+            raise ValueError(f"score_response must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
 
         return rewards, is_per_token
 

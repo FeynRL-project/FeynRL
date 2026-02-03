@@ -4,8 +4,8 @@ import numpy as np
 import argparse
 import deepspeed
 import torch
-from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from torch.utils.data import DataLoader, DistributedSampler
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from torch.utils.data import DataLoader
 import torch.distributed
 from tqdm import tqdm
 import gc
@@ -15,8 +15,10 @@ import time
 # imports local methods, classes, etc.
 import configs.load as cfg# all config arguments
 from data_feeds.paired import PairedFeed
+from data_feeds.mixed_sampler import create_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
 from misc.logging import setup_logging, setup_viz
+
 
 Algorithm_Registry = {
     # supported algorithms
@@ -63,10 +65,9 @@ def init_rank_world_size():
 
     return rank, world_size, local_rank
 
-def load_models_and_tokenizer(model_name, model_dtype, ref_model_name, trust_remote_code, attn_impl, rank):
+def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_impl, rank):
     '''
         Load models and tokenizer.
-        It also loads the ref model if provided.
     '''
     assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
     assert attn_impl=='' or attn_impl in ['eager', 'flash_attention_2'], "attn_impl must be one of 'eager', 'flash_attention_2' or empty string"
@@ -81,16 +82,6 @@ def load_models_and_tokenizer(model_name, model_dtype, ref_model_name, trust_rem
                                                 trust_remote_code=trust_remote_code,
                                                 config=model_config,
                                                 attn_implementation=None if attn_impl == '' else attn_impl)
-
-    # if ref model is provided to use it in kl for example.
-    if ref_model_name:
-        ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
-                                                         dtype=model_dtype,
-                                                         trust_remote_code=trust_remote_code,
-                                                         config=model_config,
-                                                         attn_implementation=None if attn_impl == '' else attn_impl)
-    else:
-        ref_model = None
 
     # 2. Tokenizer initialization
     tokenizer = AutoTokenizer.from_pretrained(model_name,
@@ -110,9 +101,9 @@ def load_models_and_tokenizer(model_name, model_dtype, ref_model_name, trust_rem
             # fallback to eos token id
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    return model, ref_model, tokenizer  
+    return model, tokenizer
 
-def create_training_engine(deepspeed_config, model, ref_model=None):
+def create_training_engine(deepspeed_config, model):
     '''
         This function is responsible for setting up distributed training engine.
         For now, it only supports deepspeed.
@@ -131,49 +122,37 @@ def create_training_engine(deepspeed_config, model, ref_model=None):
                                                         model_parameters=model.parameters(),
                                                         config=ds_config_dict
                                                         )
-    ref_model_engine = None
-    if ref_model is not None:
-        # ref_model is supported here in case if we want to add
-        # additional metrics, divergence, etc. Note, ref_model will not be optimized.
-        try:
-            ref_model.to(model_engine.device)
-            ref_model.eval()
-            ref_model_engine = ref_model
-
-        except:
-            # fallback: initialize with DeepSpeed
-            ref_model_engine, _, _, _ = deepspeed.initialize(
-                                                    model=ref_model,
-                                                    config=ds_config_dict
-                                                    )
-
-    return model_engine, ref_model_engine, optimizer
+    return model_engine, optimizer
 
 def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     '''
        Setup DataLoader for distributed training.
-       Notes:
-           - batch_size is the per-gpu-micro-batch size. Global batch size = batch_size * world_size * gradient_accumulation_steps.
-           - Sampler is DistributedSampler; caller must call sampler.set_epoch(epoch) each epoch.
+       As a reminder, batch_size is the per-gpu-micro-batch size.
+       Hence, global batch size = batch_size * world_size * gradient_accumulation_steps.
     '''
     # 1. Initialize our custom datasets
     data_path = params.data.train_files_path if split == 'train' else params.data.val_files_path
-    dataset = PairedFeed(prompt_key=params.data.prompt_key,
-                        answer_key=params.data.answer_key,
-                        max_seq_len=params.data.max_seq_len,
-                        tokenizer=tokenizer,
-                        data_path=data_path)
 
-    shuffle = True if split == 'train' else False
-    drop_last = True if split == 'train' else False
+    # steps_per_epoch is only needed for training (MixedDatasetSampler)
+    steps_per_epoch = params.train.micro_batches_per_epoch if split == 'train' else None
 
-    # 2. Initialize distributed sampler
-    sampler = DistributedSampler(dataset,
-                                 shuffle=shuffle,
-                                 num_replicas=world_size,
-                                 rank=rank)
+    dataset, sampler = create_dataset_and_sampler(data_paths=data_path,
+                                                  prompt_key=params.data.prompt_key,
+                                                  answer_key=params.data.answer_key,
+                                                  max_seq_len=params.data.max_seq_len,
+                                                  tokenizer=tokenizer,
+                                                  train_ratios=params.data.train_ratios,
+                                                  split=split,
+                                                  rank=rank,
+                                                  world_size=world_size,
+                                                  seed=params.run.seed,
+                                                  local_batch_size=batch_size,
+                                                  dataset_cls=PairedFeed,
+                                                  steps_per_epoch=steps_per_epoch,
+                                                  shuffle_within_batch=True,
+                                                  dynamic_ratio_every_step=params.train.dynamic_ratio_every_step)
 
-    # 3. Initialize data loader
+    # 2. Initialize data loader
     def worker_init_fn(worker_id):
         # each worker gets a different seed but deterministic across runs when seed fixed
         worker_seed = params.run.seed + worker_id + (rank * 100000)
@@ -181,14 +160,22 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
         random.seed(worker_seed)
         torch.manual_seed(worker_seed)
 
-    dataloader = DataLoader(dataset=dataset,
-                            batch_size=batch_size,
-                            sampler=sampler,
-                            num_workers=params.data.num_workers,
-                            pin_memory=True,
-                            drop_last=drop_last,
-                            worker_init_fn=worker_init_fn # for reproducibility
-                            )
+    if split == 'train':
+        # MixedDatasetSampler is a batch sampler (yields batches of indices).
+        dataloader = DataLoader(dataset=dataset,
+                                batch_sampler=sampler,
+                                num_workers=params.data.num_workers,
+                                pin_memory=True,
+                                worker_init_fn=worker_init_fn)
+    else:
+        # DistributedSampler yields individual indices.
+        dataloader = DataLoader(dataset=dataset,
+                                batch_size=batch_size,
+                                sampler=sampler,
+                                num_workers=params.data.num_workers,
+                                pin_memory=True,
+                                drop_last=False,  # ensure all validation samples are used
+                                worker_init_fn=worker_init_fn)
 
     return dataloader, sampler
 
@@ -224,19 +211,16 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                            model_dtype=config.model.dtype,
-                                                            ref_model_name=config.model.ref_model,
-                                                            trust_remote_code=config.model.trust_remote_code,
-                                                            attn_impl=config.model.attn_implementation,
-                                                            rank=rank)
+    model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+                                                 model_dtype=config.model.dtype,
+                                                 trust_remote_code=config.model.trust_remote_code,
+                                                 attn_impl=config.model.attn_implementation,
+                                                 rank=rank)
 
     ########
     # 5. Setup trainiing and inference engines
     ########
-    model_engine, ref_model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed,
-                                                                      model=model,
-                                                                      ref_model=ref_model)
+    model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed, model=model)
 
     if config.model.gradient_checkpointing:
         logger.info("Gradient checkpointing enabled")
@@ -278,7 +262,7 @@ if __name__ == "__main__":
     micro_batches_per_epoch = config.train.micro_batches_per_epoch
     optimizer_steps_per_epoch = micro_batches_per_epoch // config.train.gradient_accumulation_steps
 
-    # Warn if micro_batches_per_epoch is not divisible by gradient_accumulation_steps
+    # if micro_batches_per_epoch is not divisible by gradient_accumulation_steps
     if micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
         remainder = micro_batches_per_epoch % config.train.gradient_accumulation_steps
         # raising error to enforce correctness
@@ -328,10 +312,6 @@ if __name__ == "__main__":
         # Optimizer steps per epoch = micro_batches_per_epoch // gradient_accumulation_steps
 
         for step, micro_batch in enumerate(progress_bar):
-            # Limit to micro_batches_per_epoch iterations
-            if step >= micro_batches_per_epoch:
-                break
-
             # Move batch to gpu (deepspeed engine device)
             micro_batch = {k: v.to(model_engine.device) for k, v in micro_batch.items()}
 
@@ -365,22 +345,28 @@ if __name__ == "__main__":
         # 8.2 Validation loop
         ########
         # to be safe and caculate loss average across batches and across GPUs correctly, we use
-        # the following instead computes per-rank average and then all-reduces averages
-        local_sum   = torch.tensor(0.0, device=model_engine.device)
-        local_count = torch.tensor(0.0, device=model_engine.device)
+        # the following method: sum total loss and total tokens, then divide.
+        local_loss_sum   = torch.tensor(0.0, device=model_engine.device)
+        local_token_count = torch.tensor(0.0, device=model_engine.device)
 
         for data in val_dataloader:
             val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
             val_metric = alg.eval_step(val_batch)
-            local_sum += float(val_metric['loss'])
-            local_count += 1
+            local_loss_sum += float(val_metric['loss_sum'])
+            local_token_count += float(val_metric['num_tokens'])
 
-        # Aggregate across all ranks. it's safe to do this even if not distributed as it skips.
+        # Aggregate across all ranks.
         if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(local_count, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(local_loss_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(local_token_count, op=torch.distributed.ReduceOp.SUM)
 
-        global_avg_loss = (local_sum / torch.clamp(local_count, min=1.0)).item()
+        # Avoid division by zero
+        if local_token_count.item() == 0:
+            global_avg_loss = 0.0
+
+        else:
+            global_avg_loss = (local_loss_sum / local_token_count).item()
+
         if rank == 0:
             print(f"Epoch {epoch+1}, Validation Loss: {global_avg_loss}")
             if mlflow_run:

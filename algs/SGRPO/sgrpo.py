@@ -186,7 +186,13 @@ class SGRPO(COMMON):
         all_metrics = []
         for step, micro_batch in enumerate(progress_bar):
             is_last = (step == (num_micro - 1))
-            is_boundary = (((step + 1) % ga_pi) == 0) or is_last
+
+            # If update_only_after_full_replay is True, we only update at the very end
+            # of the shard. Otherwise, we respect ga_pi.
+            if self.update_only_after_full_replay:
+                is_boundary = is_last
+            else:
+                is_boundary = (((step + 1) % ga_pi) == 0) or is_last
 
             ########
             # 1. Data from buffer
@@ -238,12 +244,8 @@ class SGRPO(COMMON):
                     "kl_ref": f"{pi_metrics['kl_ref']:.4f}"
                 })
 
-            if self.update_only_after_full_replay:
-                # Accumulate gradients across all micro-batches, only update at the end
-                self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
-            else:
-                # Update after every micro-batch (treat each as a boundary)
-                self.policy_engine.set_gradient_accumulation_boundary(True)
+            # For DeepSpeed, we must coordinate is_boundary with the backward pass.
+            self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
             # backward pass
             self.policy_engine.backward(pi_loss)

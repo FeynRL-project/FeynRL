@@ -5,12 +5,10 @@ class SFT:
     def __init__(self,
                 model_engine,
                 optimizer,
-                use_cache=False,
                 normalize_loss=False):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
-        self.use_cache = use_cache
         self.normalize_loss = normalize_loss
 
         # use cross entropy loss
@@ -82,7 +80,7 @@ class SFT:
         output = self.model_engine(input_ids=input_ids,
                                    attention_mask=att_mask,
                                    position_ids=pos_ids,
-                                   use_cache=self.use_cache)
+                                   use_cache=False)
 
         # [B, T, vocab_size]
         every_token_logits = output.logits

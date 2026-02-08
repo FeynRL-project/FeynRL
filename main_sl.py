@@ -220,11 +220,11 @@ if __name__ == "__main__":
     ########
     # 5. Setup trainiing and inference engines
     ########
-    model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed, model=model)
-
     if config.model.gradient_checkpointing:
         logger.info("Gradient checkpointing enabled")
-        model_engine.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable()
+
+    model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed, model=model)
 
     ########
     # 6. Build env or data loader
@@ -249,7 +249,6 @@ if __name__ == "__main__":
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
     alg = alg_class(model_engine=model_engine,
                     optimizer=optimizer,
-                    use_cache=config.model.use_cache,
                     normalize_loss=config.train.normalize_loss)
 
     ########
@@ -392,11 +391,12 @@ if __name__ == "__main__":
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        # Save model config on rank 0 only
+        # Save model config and tokenizer on rank 0 only
         if rank == 0:
             if hasattr(model_engine.module, 'config'):
                 model_engine.module.config.save_pretrained(model_path)
-                logger.info(f"[Epoch {epoch+1}] Model config saved")
+            tokenizer.save_pretrained(model_path)
+            logger.info(f"[Epoch {epoch+1}] Model config and tokenizer saved")
 
         # Wait for saving to complete on all ranks
         if torch.distributed.is_initialized():

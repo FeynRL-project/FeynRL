@@ -65,7 +65,6 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                'model_dtype':safe_string_to_torch_dtype(params.model.dtype),
                'trust_remote_code':params.model.trust_remote_code,
                'attn_impl':params.model.attn_implementation,
-               'use_cache':params.model.use_cache,
 
                # training related arguments
                'kl_coeff':params.train.kl_coeff,
@@ -78,6 +77,9 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                # deepspeed related arguments
                'deepspeed_config':params.deepspeed,
                'deepspeed_ref_config':params.deepspeed_ref,
+
+               # gradient checkpointing
+               'gradient_checkpointing':params.model.gradient_checkpointing,
     }
     # setup ray runners
     ray_runners = []
@@ -89,6 +91,13 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                     "RANK": str(rank),
                     "WORLD_SIZE": str(world_size),
                     "LOCAL_RANK": "0",}
+
+        # NCCL env vars for multi-node clusters with multiple NICs
+        # if params.run.nccl_socket_ifname:
+        #     ray_vars["NCCL_SOCKET_IFNAME"] = params.run.nccl_socket_ifname
+        # if params.run.nccl_ib_hca:
+        #     ray_vars["NCCL_IB_HCA"] = params.run.nccl_ib_hca
+
         runner = alg.options(num_gpus=1, runtime_env={"env_vars": ray_vars}
                             ).remote(**kwargs)
         ray_runners.append(runner)
@@ -298,20 +307,29 @@ def prepare_training_batches(replay_buffer, batch_size: int, num_engines: int) -
 
     return batches_padded
 
-def run_training_step(engines, batches):
+def shard_and_put(batches, num_engines):
     '''
-       Execute one training step across all engines.
+       Pre-shard batches across engines and store in Ray object store.
+       Returns a list of ObjectRefs, one per engine.
     '''
-    futures = []
-    num_engines = len(engines)
-    for eid, engine in enumerate(engines):
-        # Send equal number of batches to each training engine
+    shard_refs = []
+    for eid in range(num_engines):
         # engine 0 gets [0, 2, 4, ...], engine 1 gets [1, 3, 5, ...]
         shard = batches[eid::num_engines]
-
-        # All ranks MUST participate in training, hence no empty shards
         assert len(shard) > 0, f"Engine {eid} has empty shard. This will cause DeepSpeed hang"
-        futures.append(engine.train_step.remote(engine_id=eid, micro_batches=shard))
+        shard_refs.append(ray.put(shard))
+
+    return shard_refs
+
+def run_training_step(engines, shard_refs):
+    '''
+       Execute one training step across all engines.
+       shard_refs: list of Ray ObjectRefs (one per engine), created by shard_and_put().
+       Ray auto-resolves ObjectRefs passed to .remote(), so the engine receives the actual data.
+    '''
+    futures = []
+    for eid, engine in enumerate(engines):
+        futures.append(engine.train_step.remote(engine_id=eid, micro_batches=shard_refs[eid]))
 
     # Gather training metrics from all engines
     metrics_list = ray.get(futures)
@@ -500,6 +518,7 @@ if __name__ == "__main__":
         ################
         # 1. Collect rollouts
         ################
+        # data is collected in parallel across all rollout engines and saved to replay buffer
         rollout_stats = collect_rollouts(dataloader=rollout_dataloader,
                                          rollout_engines=rollout_engines,
                                          epoch=epoch,
@@ -525,13 +544,19 @@ if __name__ == "__main__":
                                                         batch_size=config.train.train_batch_size_per_gpu,
                                                         num_engines=len(training_engine))
         logger.info(f"[Epoch {epoch+1}] Created {len(train_batches_padded)} training batches")
+
+        # Pre-shard and store in Ray object store once.
+        # Avoids re-serializing the same data on every step (batches are
+        # reused unchanged across all steps_per_epoch iterations).
+        shard_refs = shard_and_put(train_batches_padded, num_engines=len(training_engine))
+
         ################
         # 3. Training loop
         ################
         epoch_metrics = {'loss_total': [], 'loss_pi': [], 'loss_ent': [],
                          'kl_ref': [], 'kl_old': [], 'clipfrac': []}
         for step in range(steps_per_epoch):
-            train_metrics = run_training_step(training_engine, train_batches_padded)
+            train_metrics = run_training_step(training_engine, shard_refs)
 
             # Epoch average of average across all training engines
             for k, v in train_metrics.items():

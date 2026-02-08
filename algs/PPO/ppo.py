@@ -26,10 +26,10 @@ class PPO(COMMON):
                  vf_clip: float,
                  tau: float,
                  gamma: float,
-                 use_cache: bool,
                  micro_batch_size_per_gpu: int,
                  update_after_full_replay: bool,
                  deepspeed_config: deepspeed.DeepSpeedConfig,
+                 gradient_checkpointing: bool,
                  ref_model_path: str = None,
                  deepspeed_ref_config = None,
                  ):
@@ -41,7 +41,6 @@ class PPO(COMMON):
         self.vf_model_path = value_model_path
         self.vf_dtype = value_model_dtype
         self.ref_model_path = ref_model_path
-        self.use_cache = use_cache
         self.attn_impl = attn_impl
         self.trust_remote_code = trust_remote_code
 
@@ -49,6 +48,7 @@ class PPO(COMMON):
         self.deepspeed_config = deepspeed_config
         self.deepspeed_ref_config = deepspeed_ref_config
         self.micro_batch_size_per_gpu = micro_batch_size_per_gpu
+        self.gradient_checkpointing = gradient_checkpointing
 
         # policy related parameters
         self.kl_coeff = float(kl_coeff)
@@ -271,7 +271,7 @@ class PPO(COMMON):
         output = self.value_engine(input_ids=input_ids,
                                    attention_mask=att_mask,
                                    position_ids=pos_ids,
-                                   use_cache=self.use_cache)
+                                   use_cache=False)
 
         # [B, T, 1] -> [B, T]
         logits = output.logits.squeeze(-1).contiguous()
@@ -381,14 +381,14 @@ class PPO(COMMON):
 
             # we need old values from rollout for advantage computation.
             v_olds_full = micro_batch.get('v_olds', None)
-            last_val_full = micro_batch.get('last_val', None)
 
-            if v_olds_full is None or last_val_full is None:
-                raise ValueError("Missing v_olds and last_val from rollout buffer.")
+            if v_olds_full is None:
+                raise ValueError("Missing v_olds from rollout buffer. PPO requires v_olds.")
 
             # Slice v_olds to match prediction alignment [B, T] -> [B, T-1]
+            # The last element in v_olds is the 'last_val' (value of the last state/token) needed for bootstrapping GAE
             v_olds = v_olds_full[:, :-1].to(device, non_blocking=True)
-            last_val = last_val_full.to(device, non_blocking=True)
+            last_val = v_olds_full[:, -1].to(device, non_blocking=True)
 
             input_ids = micro_batch['input_ids'].to(device, non_blocking=True)
             att_mask  = micro_batch['attn_mask'].to(device, non_blocking=True)

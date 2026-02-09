@@ -8,6 +8,10 @@ class WeightSyncExtension:
         destroying and recreating the vllm engine (no disk I/O).
     '''
 
+
+    def __init__(self, model_runner):
+        self.model_runner = model_runner
+
     def update_weights(self, weights):
         '''
             Update model weights in-place on this vllm worker.

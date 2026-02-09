@@ -28,6 +28,13 @@ class Run(BaseModel):
     overlap_max_lag: int | None = None # Max training steps ahead of rollout policy version
     overlap_weight_update_interval: int | None = None # Update rollout weights every N training steps
 
+    # Weight sync: "direct" pushes weights via gpu memory (no disk I/O),
+    # "disk" uses save-to-disk + vllm reload.
+    weight_sync_method: str | None = "direct"
+    # Save a disk checkpoint every N epochs for persistence/resumability.
+    # 0 = only at end.
+    checkpoint_save_interval: int | None = 1
+
     # NCCL configuration for multi-node clusters with multiple NICs
     # nccl_socket_ifname: str | None = None  # e.g., "eth0", "ens3", "bond0"
     # nccl_ib_hca: str | None = None         # e.g., "mlx5_0" for InfiniBand HCA selection

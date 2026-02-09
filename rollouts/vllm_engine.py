@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import gc
 import ray
@@ -31,7 +32,6 @@ class VLLMRolloutEngine:
                  model_dtype: str,
                  engine_id: int = 0,
                  ):
-
 
         # reward function
         self.reward_func = reward_func
@@ -66,6 +66,10 @@ class VLLMRolloutEngine:
         self.eps_reward_norm = float(eps_reward_norm)
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
+
+        # Ensure current working directory is in sys.path for this actor and spawned vllm workers
+        if os.getcwd() not in sys.path:
+            sys.path.append(os.getcwd())
 
     def log(self, msg: str) -> None:
         '''
@@ -133,13 +137,44 @@ class VLLMRolloutEngine:
                                    tensor_parallel_size=self.tensor_parallel_size,
                                    gpu_memory_utilization=self.gpu_memory_utilization,
                                    dtype=self.model_dtype,
-                                  )
-            self.log(f"Successfully loaded vLLM model from {self.model_path}")
+                                   # This enables collective_rpc("update_weights", ...) on all TP workers
+                                   # for direct weight updates. If update_weights_direct is never called,
+                                   # this sits idle and there is no real overhead since it is just a class
+                                   # attached to the vllm worker.
+                                   worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
+                                   )
+            self.log(f"Successfully loaded vllm model from {self.model_path}")
 
         except Exception as e:
-            print(f"Failed to load vLLM model from {self.model_path}: {e}")
+            print(f"Failed to load vllm model from {self.model_path}: {e}")
             self.vllm_engine = None
             raise
+
+    def update_weights_direct(self, state_dict: dict, version: int) -> bool:
+        '''
+            Update vllm model weights directly in gpu memory without disk I/O.
+            Uses collective_rpc with WeightSyncExtension (works for any TP size).
+            Requires vllm >= 0.7 with worker_extension_cls support.
+            Note: state_dict is created in RL/common.py
+
+            state_dict: {param_name: cpu_tensor} from training engine rank 0.
+
+        '''
+        if self.vllm_engine is None:
+            self.log("Cannot update weights: vLLM engine not loaded")
+            return False
+
+        if self.loaded_version == version:
+            self.log(f"Model already at version {version}, skipping weight update")
+            return True
+
+        self.log(f"Updating weights directly to version {version} ({len(state_dict)} parameters)")
+
+        weights = [(name, tensor) for name, tensor in state_dict.items()]
+        self.vllm_engine.collective_rpc("update_weights", args=(weights,))
+        self.loaded_version = version
+        self.log(f"Weights updated to version {version}")
+        return True
 
     def make_sampling_params(self) -> SamplingParams:
         '''

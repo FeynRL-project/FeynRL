@@ -48,9 +48,9 @@ def setup_ray(ray_address):
 
     try:
         master_addr = ray.util.get_node_ip_address()
-
     except Exception:
-        print("Warning: Could not get master address, using localhost")
+        # Fallback to localhost if we cannot get the IP (e.g. single node without network)
+        print("Warning: Could not get master address, using localhost. This is fine for single-node but will fail for multi-node.")
         master_addr = "127.0.0.1"
 
     return master_addr
@@ -90,7 +90,9 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                     "MASTER_PORT": str(master_port),
                     "RANK": str(rank),
                     "WORLD_SIZE": str(world_size),
-                    "LOCAL_RANK": "0",}
+                    "LOCAL_RANK": "0",
+                    "PYTHONPATH": os.getcwd(), # Ensure current directory is in path for all workers
+                    }
 
         # NCCL env vars for multi-node clusters with multiple NICs
         # if params.run.nccl_socket_ifname:
@@ -135,12 +137,10 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "tensor_parallel_size":tp,
               "model_dtype":params.model.dtype,
 
-
               # reward related arguments
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "eps_reward_norm":params.reward.eps_reward_norm,
-
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
@@ -148,7 +148,9 @@ def create_rollout_engines(params, reward_fnc, eos_id):
     engines = []
     for i in range(num_engines):
         kwargs['engine_id'] = i
-        engines.append(VLLMRolloutEngine.options(num_gpus=tp).remote(**kwargs))
+        engines.append(VLLMRolloutEngine.options(num_gpus=tp,
+                                                 runtime_env={"env_vars": {"PYTHONPATH": os.getcwd()}}
+                                                ).remote(**kwargs))
 
     return engines
 
@@ -208,6 +210,21 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
 
     return dataloader
 
+def shard_batch_for_engines(rollout_batch, num_rollout_engines):
+    '''
+        Shard a batch of prompts across rollout engines.
+    '''
+    if not rollout_batch:
+        return []
+
+    # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
+    # and rollout_batch is a list of dictionaries.
+    # it is not necessary to have equal number of samples per engine, though they can't be empty.
+    shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
+    rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
+    rollout_shards = [shard for shard in rollout_shards if len(shard) > 0]
+    return rollout_shards
+
 def collect_rollouts(dataloader,
                      rollout_engines,
                      epoch,
@@ -224,8 +241,10 @@ def collect_rollouts(dataloader,
     total_reward_sum = 0.0
     total_response_len = 0
 
-    # example: 2 rollout engines * 8 batch_size_per_gpu = 16 batch_size
-    # rollout_samples_per_epoch=100 -> ceil(100/16)=7 batches -> 112 actual samples
+    # here is an example:
+    # local_batch_size is the batch size per gpu
+    # 2 rollout engines * 8 local_batch_size = 16 batches
+    # samples_per_epoch= 100 -> ceil(100/16)=7 batches -> 112 actual examples
     batch_size = dataloader.batch_sampler.local_batch_size
     num_batches_per_epoch = len(dataloader)
     samples_per_epoch = num_batches_per_epoch * batch_size
@@ -234,15 +253,11 @@ def collect_rollouts(dataloader,
                 f"({num_rollout_engines} engines * {batch_size // num_rollout_engines} per engine), "
                 f"Samples this epoch: {samples_per_epoch}")
 
-
     for rollout_batch in dataloader:
         # 1. split data across rollout engines
-        # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
-        # and rollout_batch is a list of dictionaries.
-        shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
-        # it is not necessary to have equal number of samples per engine, though they can't be empty.
-        rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
-        rollout_shards = [shard for shard in rollout_shards if len(shard) > 0]
+        rollout_shards = shard_batch_for_engines(rollout_batch, num_rollout_engines)
+        if not rollout_shards:
+            continue
 
         # 2. schedule rollout generation
         rollout_samples = []
@@ -251,7 +266,8 @@ def collect_rollouts(dataloader,
                                                                       current_iter=epoch,
                                                                       policy_version=policy_version))
 
-        # 3. gather rollouts
+        # 3. gather rollouts. This is a blocking call means all engines must
+        # finish generating rollouts before we can proceed.
         rollout_lists = ray.get(rollout_samples)
 
         # 4. merge rollouts across all engines and collect stats
@@ -262,22 +278,31 @@ def collect_rollouts(dataloader,
                 total_samples_generated += 1
                 total_reward_sum += sample['rewards'].sum().item()
                 total_response_len += sample['response_len']
+                total_tokens += len(sample['prompt_ids']) + len(sample['response_ids'])
 
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
-    rollout_time = time.time() - rollout_start_time
-    avg_reward = total_reward_sum / max(1, total_samples_generated)
-    avg_response_len = total_response_len / max(1, total_samples_generated)
-
     if len(replay_buffer) <= 1:
         raise ValueError("Replay buffer is empty")
+
+    rollout_time = time.time() - rollout_start_time
+    if total_samples_generated == 0:
+        logger.warning("No samples generated during rollout phase!")
+        avg_reward = 0.0
+        avg_response_len = 0.0
+    else:
+        avg_reward = total_reward_sum / total_samples_generated
+        avg_response_len = total_response_len / total_samples_generated
+
+    tps = total_tokens / max(1e-6, rollout_time)
 
     return {"total_samples_generated": total_samples_generated,
             "avg_reward": avg_reward,
             "total_reward": total_reward_sum,
             "avg_response_len": avg_response_len,
-            "rollout_time": rollout_time}
+            "rollout_time": rollout_time,
+            "tokens_per_sec": tps}
 
 def prepare_training_batches(replay_buffer, batch_size: int, num_engines: int) -> list:
     '''
@@ -369,9 +394,67 @@ def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir,
     logger.info(f"[Epoch {epoch+1}] Checkpoint saved: {model_path}")
     return model_path
 
+def sync_weights_direct(training_engines, rollout_engines, version, logger):
+    '''
+        Transfer weights directly from deepspeed training engines to vllm rollout
+        engines via ray object store. No disk I/O.
+    '''
+    state_dict_ref, _ = gather_training_weights(training_engines, logger)
+    if state_dict_ref is None:
+        return False
+
+    return push_weights_to_rollout(rollout_engines, state_dict_ref, version, logger)
+
+def gather_training_weights(training_engines, logger):
+    '''
+        Gather state_dict from ZeRO-3 training engines and store in Ray object store.
+    '''
+    start_time = time.time()
+    logger.info(f"[WeightSync] Gathering state_dict from training engines...")
+
+    # All training engines must participate in gather_state_dict(). see common.py.
+    gather_futures = [engine.gather_state_dict.remote() for engine in training_engines]
+    gather_results = ray.get(gather_futures)
+
+    state_dict = gather_results[0]
+    if not state_dict:
+        logger.error("[WeightSync] Rank 0 returned empty state_dict")
+        return None, 0
+
+    end_time = time.time() - start_time
+    logger.info(f"[WeightSync] Gathered {len(state_dict)} parameters in {end_time:.2f}s")
+
+    # Takes a local state_dict, serializes it, and stores it in
+    # the ray object store which is distributed shared memory.
+    # it is mostly non-blocking (upload to shared memory)
+    state_dict_ref = ray.put(state_dict)
+    del state_dict
+
+    return state_dict_ref, end_time
+
+def push_weights_to_rollout(rollout_engines, state_dict_ref, version, logger):
+    '''
+        Push pre-gathered weights to rollout engines. Blocks until all engines updated.
+        Returns True if all engines updated successfully.
+    '''
+    start_time = time.time()
+    update_futures = [eng.update_weights_direct.remote(state_dict_ref, version) for eng in rollout_engines]
+    results = ray.get(update_futures)
+
+    end_time = time.time() - start_time
+    success = all(results)
+
+    if success:
+        logger.info(f"[WeightSync] Pushed weights v{version} to rollout engines in {end_time:.2f}s")
+
+    else:
+        logger.warning(f"[WeightSync] Some rollout engines failed to update to v{version}")
+
+    return success
+
 def refresh_rollout_engine(rollout_engines, updated_policy_path, version):
     '''
-        Refresh rollout engine with the latest policy.
+        Refresh rollout engine with the latest policy using disk-based fallback.
     '''
     refresh_futures = []
     for eng in rollout_engines:
@@ -493,6 +576,10 @@ if __name__ == "__main__":
     number_of_epochs  = config.train.total_number_of_epochs
     steps_per_epoch = config.train.train_steps_per_epoch
 
+    # Weight sync settings
+    weight_sync_method = config.run.weight_sync_method or "direct"
+    checkpoint_save_interval = config.run.checkpoint_save_interval or 1
+
     # Overlap mode settings
     overlap_enabled = config.run.overlap_enabled
     # Max training steps ahead of rollout policy version
@@ -503,6 +590,8 @@ if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info(f"Starting training: {number_of_epochs} epochs, {steps_per_epoch} steps/epoch")
     logger.info(f"Training GPUs: {training_gpus}, Rollout GPUs: {rollout_gpus}")
+    logger.info(f"Weight sync: {weight_sync_method}, Checkpoint save interval: {checkpoint_save_interval}")
+
     if overlap_enabled:
         logger.info(f"Overlap mode ENABLED: max_lag={overlap_max_lag}, weight_update_interval={overlap_weight_update_interval}")
 
@@ -529,7 +618,7 @@ if __name__ == "__main__":
         logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
                     f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
                     f"avg_response_len={rollout_stats['avg_response_len']:.1f}, "
-                    f"time={rollout_stats['rollout_time']:.2f}s")
+                    f"time={rollout_stats['rollout_time']:.2f}s, tps={rollout_stats['tokens_per_sec']:.2f}")
 
         ################
         # 2. Prepare training batches
@@ -604,29 +693,51 @@ if __name__ == "__main__":
                     "epoch/avg_response_len": rollout_stats['avg_response_len'],
                     "epoch/total_samples": rollout_stats['total_samples_generated'],
                     "epoch/rollout_time_sec": rollout_stats['rollout_time'],
+                    "epoch/tokens_per_sec": rollout_stats['tokens_per_sec'],
                     "epoch/train_time_sec": train_time,
-                    "epoch/total_time_sec": epoch_time,
                     }, step=epoch + 1)
 
         ################
-        # 5. Save current policy
+        # 5. Refresh rollout policy via direct weight sync
         ################
-        model_path = save_checkpoint(epoch=epoch,
-                                     version=policy_version,
-                                     tokenizer=tokenizer,
-                                     training_engines=training_engine,
-                                     checkpoint_dir=config.run.checkpoint_dir,
-                                     experiment_id=config.run.experiment_id,
-                                     rank=rank,
-                                     logger=logger)
+        sync_success = False
+        if weight_sync_method == "direct":
+            logger.info(f"[Epoch {epoch+1}] Syncing weights directly to rollout engines (version {policy_version})...")
+            sync_success = sync_weights_direct(training_engines=training_engine,
+                                               rollout_engines=rollout_engines,
+                                               version=policy_version,
+                                               logger=logger)
+            if sync_success:
+                logger.info(f"[Epoch {epoch+1}] Direct sync successful")
+
+            else:
+                logger.warning(f"[Epoch {epoch+1}] Direct sync failed, falling back to disk-based refresh")
         ################
-        # 6. Refresh rollout policy
+        # 5. save checkpoint
         ################
-        logger.info(f"[Epoch {epoch+1}] Refreshing rollout engines with new policy (version {policy_version})...")
-        refresh_rollout_engine(rollout_engines=rollout_engines,
-                               updated_policy_path=model_path,
-                               version=policy_version)
-        logger.info(f"[Epoch {epoch+1}] Rollout engines refreshed")
+        is_last_epoch = (epoch == number_of_epochs - 1)
+        should_save_disk = (checkpoint_save_interval > 0 and
+                           ((epoch + 1) % checkpoint_save_interval == 0 or is_last_epoch))
+
+        if weight_sync_method == "disk" or sync_success == False or should_save_disk == True:
+            model_path = save_checkpoint(epoch=epoch,
+                                         version=policy_version,
+                                         tokenizer=tokenizer,
+                                         training_engines=training_engine,
+                                         checkpoint_dir=config.run.checkpoint_dir,
+                                         experiment_id=config.run.experiment_id,
+                                         rank=rank,
+                                         logger=logger)
+            logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
+        ################
+        # 6. Refresh rollout policy via disk-based fallback
+        ################
+        if sync_success == False:
+            logger.info(f"[Epoch {epoch+1}] Refreshing rollout engines with new policy (version {policy_version})...")
+            refresh_rollout_engine(rollout_engines=rollout_engines,
+                                   updated_policy_path=model_path,
+                                   version=policy_version)
+            logger.info(f"[Epoch {epoch+1}] Rollout engines refreshed")
 
         logger.info(f"[Epoch {epoch+1}] Complete! Total epoch time: {epoch_time:.2f}s")
         logger.info("=" * 50)

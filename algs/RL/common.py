@@ -257,3 +257,38 @@ class COMMON:
                 # still need barrier even on error to prevent deadlock
                 torch.distributed.barrier()
             raise
+
+    def gather_state_dict(self):
+        '''
+            Gather ZeRO-3 partitioned policy weights into a full state_dict on rank 0.
+            Must be called on ALL ranks, as each rank participates in the ZeRO-3 gather.
+            However, only rank 0 returns the actual state_dict and others return {}.
+            This is used for direct sync of weights with vllm rather than saving them on disk.
+
+            Returns:
+                dict: {param_name: cpu_tensor} on rank 0, empty dict on other ranks.
+        '''
+        rank = torch.distributed.get_rank()
+        state_dict = {}
+
+        # 1. Get all parameters
+        params = []
+        names = []
+        for name, param in self.policy_engine.module.named_parameters():
+            params.append(param)
+            names.append(name)
+
+        # 2. Gather all parameters in a single collective call
+        # This is much faster than gathering them one by one
+        with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+            if rank == 0:
+                for name, param in zip(names, params):
+                    # .data avoids autograd overhead.
+                    # .cpu().clone() ensures the tensor lives in CPU memory and is independent of the
+                    # ZeRO-3 partition buffer which gets freed after the context.
+                    state_dict[name] = param.data.cpu().clone()
+
+        if rank == 0:
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict: {len(state_dict)} parameters")
+
+        return state_dict

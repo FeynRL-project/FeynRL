@@ -6,6 +6,7 @@ import ray
 from vllm import LLM, SamplingParams
 from typing import Optional, List, Callable, Any, Dict
 import numpy as np
+import pickle
 
 @ray.remote
 class VLLMRolloutEngine:
@@ -32,6 +33,11 @@ class VLLMRolloutEngine:
                  model_dtype: str,
                  engine_id: int = 0,
                  ):
+        # Ensure current working directory is in sys.path for this actor
+        # and spawned vllm workers. This is required the model so
+        # worker_extension_cls resolves to local source.
+        if os.getcwd() not in sys.path:
+            sys.path.append(os.getcwd())
 
         # reward function
         self.reward_func = reward_func
@@ -66,10 +72,6 @@ class VLLMRolloutEngine:
         self.eps_reward_norm = float(eps_reward_norm)
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
-
-        # Ensure current working directory is in sys.path for this actor and spawned vllm workers
-        if os.getcwd() not in sys.path:
-            sys.path.append(os.getcwd())
 
     def log(self, msg: str) -> None:
         '''
@@ -158,7 +160,6 @@ class VLLMRolloutEngine:
             Note: state_dict is created in RL/common.py
 
             state_dict: {param_name: cpu_tensor} from training engine rank 0.
-
         '''
         if self.vllm_engine is None:
             self.log("Cannot update weights: vLLM engine not loaded")
@@ -168,10 +169,15 @@ class VLLMRolloutEngine:
             self.log(f"Model already at version {version}, skipping weight update")
             return True
 
-        self.log(f"Updating weights directly to version {version} ({len(state_dict)} parameters)")
+        self.log(f"Updating weights directly to version {version}")
 
-        weights = [(name, tensor) for name, tensor in state_dict.items()]
-        self.vllm_engine.collective_rpc("update_weights", args=(weights,))
+        # pickle the state_dict and encode to latin-1 string to pass through vllm rpc safely.
+        # This avoids vllm trying to interpret list of ints or other structures.
+        # This doesn't work so that is why I use pickle.dumps
+        # weights = [(name, tensor) for name, tensor in state_dict.items()]
+        # self.vllm_engine.collective_rpc("update_weights", args=(weights,))
+        serialized_state = pickle.dumps(state_dict).decode('latin-1')
+        self.vllm_engine.collective_rpc("update_weights", args=(serialized_state,))
         self.loaded_version = version
         self.log(f"Weights updated to version {version}")
         return True
@@ -423,7 +429,7 @@ class VLLMRolloutEngine:
 
                 return rollout_samples
 
-    def score_response(self, prompt: Dict[str, Any], response: Dict[str, Any]) -> torch.Tensor:
+    def score_response(self, prompt: Dict[str, Any], response: Any) -> torch.Tensor:
         '''
             Calculate the reward for each response token.
             it returns a float tensor of len(response_ids).
@@ -457,7 +463,9 @@ class VLLMRolloutEngine:
         if len(samples) > 1:
             rewards_array = np.array(stats['rewards'])
             mean_scores = rewards_array.sum() / denom
-            std_scores  = np.sqrt(((rewards_array - mean_scores)**2).sum() / denom)
+            # Bessel's correction (n-1) for unbiased sample std with small n_samples
+            std_scores  = np.sqrt(((rewards_array - mean_scores)**2).sum() / max(denom - 1, 1))
+
         else:
             # For a single sample, we don't normalize (i.e. advantage is 0 if we subtract mean)
             # but usually for n=1 we keep the raw reward.

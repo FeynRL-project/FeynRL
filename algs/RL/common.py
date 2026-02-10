@@ -289,6 +289,6 @@ class COMMON:
                     state_dict[name] = param.data.cpu().clone()
 
         if rank == 0:
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict: {len(state_dict)} parameters")
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict!")
 
         return state_dict

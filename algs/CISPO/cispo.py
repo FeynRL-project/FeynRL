@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from tqdm import tqdm
+from typing import Any
 import ray
 import deepspeed
 
@@ -23,10 +24,10 @@ class CISPO(COMMON):
                  entropy_coeff: float,
                  micro_batch_size_per_gpu: int,
                  update_after_full_replay: bool,
-                 deepspeed_config: deepspeed.DeepSpeedConfig,
+                 deepspeed_config: Any,
                  gradient_checkpointing: bool,
                  ref_model_path: str = None,
-                 deepspeed_ref_config = None,
+                 deepspeed_ref_config: Any = None,
                  ):
 
         self.alg_name = self.__class__.__name__
@@ -245,6 +246,14 @@ class CISPO(COMMON):
                     "kl_old": f"{pi_metrics['kl_old']:.4f}",
                     "kl_ref": f"{pi_metrics['kl_ref']:.4f}"
                 })
+
+            # When accumulating over the full replay shard, normalize the loss
+            # by the number of micro-batches so the gradient magnitude equals the
+            # mean (not the sum) of per-micro-batch gradients. DeepSpeed will
+            # still divide by gradient_accumulation_steps, so we multiply by
+            # ga_pi to keep the effective scale consistent with standard GA.
+            if self.update_only_after_full_replay:
+                pi_loss = pi_loss * (ga_pi / num_micro)
 
             # For DeepSpeed, we must coordinate is_boundary with the backward pass.
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)

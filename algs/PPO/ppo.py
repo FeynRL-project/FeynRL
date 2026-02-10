@@ -28,7 +28,7 @@ class PPO(COMMON):
                  gamma: float,
                  micro_batch_size_per_gpu: int,
                  update_after_full_replay: bool,
-                 deepspeed_config: deepspeed.DeepSpeedConfig,
+                 deepspeed_config: Any,
                  gradient_checkpointing: bool,
                  ref_model_path: str = None,
                  deepspeed_ref_config = None,

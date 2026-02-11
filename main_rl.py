@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader
 import ray
 import time
 import mlflow
-from tqdm import tqdm
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments

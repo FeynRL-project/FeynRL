@@ -118,3 +118,7 @@ logs/
 
 # checkpoints
 checkpoints/
+
+# wandb
+wandb/
+.wandb_key

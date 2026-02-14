@@ -185,6 +185,7 @@ if __name__ == "__main__":
     parser.add_argument("--config-file", type=str, default="./config/dummy.yaml", help="config file")
     parser.add_argument("--experiment_id", type=str, default="run_1", help="experiment id")
     parser.add_argument("--log-level", type=str, default="INFO", help="logging level")
+    parser.add_argument("--local_rank", type=int, default=0, help="local rank")
     args = parser.parse_args()
 
     ########

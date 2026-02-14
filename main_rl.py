@@ -412,7 +412,7 @@ def sync_weights_direct(training_engines, rollout_engines, version, logger):
 
 def gather_training_weights(training_engines, logger):
     '''
-        Gather state_dict from ZeRO-3 training engines and store in Ray object store.
+        Gather state_dict from training engines and store in ray object store.
     '''
     start_time = time.time()
     logger.info(f"[WeightSync] Gathering state_dict from training engines...")

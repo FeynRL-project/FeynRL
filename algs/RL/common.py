@@ -260,9 +260,11 @@ class COMMON:
 
     def gather_state_dict(self):
         '''
-            Gather ZeRO-3 partitioned policy weights into a full state_dict on rank 0.
-            Must be called on ALL ranks, as each rank participates in the ZeRO-3 gather.
-            However, only rank 0 returns the actual state_dict and others return {}.
+            Gather policy weights into a full state_dict on rank 0.
+            Works for all ds stages (0/1/2/3):
+              - Stage 0/1/2: params are already full on each rank, so rank 0 copies directly.
+              - Stage 3: uses GatheredParameters to collect partitioned params before copying.
+            Only rank 0 returns the actual state_dict; others return {}.
             This is used for direct sync of weights with vllm rather than saving them on disk.
 
             Returns:
@@ -272,23 +274,32 @@ class COMMON:
         state_dict = {}
 
         # 1. Get all parameters
+        # Must be called on ALL ranks as zero-3 requires collective participation.
         params = []
         names = []
         for name, param in self.policy_engine.module.named_parameters():
             params.append(param)
             names.append(name)
 
-        # 2. Gather all parameters in a single collective call
-        # This is much faster than gathering them one by one
-        with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+        # 2. Check if we're using stage-3 where parameters are partitioned
+        is_zero3 = hasattr(params[0], 'ds_id') if params else False
+
+        if is_zero3:
+            # gather partitioned parameters in a single collective call
+            with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+                if rank == 0:
+                    for name, param in zip(names, params):
+                        # .data avoids autograd overhead.
+                        # .cpu().clone() ensures the tensor lives in CPU memory and is independent of the
+                        # ZeRO-3 partition buffer which gets freed after the context.
+                        state_dict[name] = param.data.cpu().clone()
+        else:
+            # Stages 0/1/2: params are already full, just copy on rank 0
             if rank == 0:
                 for name, param in zip(names, params):
-                    # .data avoids autograd overhead.
-                    # .cpu().clone() ensures the tensor lives in CPU memory and is independent of the
-                    # ZeRO-3 partition buffer which gets freed after the context.
                     state_dict[name] = param.data.cpu().clone()
 
         if rank == 0:
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict!")
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (zero3={is_zero3})!")
 
         return state_dict

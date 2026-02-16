@@ -3,11 +3,9 @@ import numpy as np
 from tqdm import tqdm
 from typing import Any
 import ray
-import deepspeed
 
-# Since the following functions are the same for all algorithms
-# we load them from common.py:
-# _load_single_model, init_training_engine,policy_forward,
+# load follwoings from common.py:
+# _load_single_model, init_training_engine, policy_forward,
 # ref_forward, compute_kl_distance, save_checkpoint
 from algs.RL.common import COMMON
 

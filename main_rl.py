@@ -16,7 +16,7 @@ from data_feeds.mixed_sampler import create_prompt_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
-from misc.logging import setup_logging, setup_viz
+from misc.logging import setup_logging, setup_tracker
 
 Algorithm_Registry = {
     # supported algorithms
@@ -493,15 +493,7 @@ if __name__ == "__main__":
     set_random_seeds(seed=config.run.seed)
 
     # setup remote experiment tracker
-    logger_type = getattr(config.run, "logger_type", "mlflow").lower()
-    logger.info(f"Tracking experiment with: {logger_type}")
-    if logger_type == "mlflow":
-        import mlflow
-    elif logger_type == "wandb":
-        import wandb
-    else:
-        raise ValueError(f"Unknown logger type: {logger_type}") 
-    tracker_run = setup_viz(config=config, tracking_uri=config.run.tracking_uri, rank=rank)
+    tracker = setup_tracker(config=config, rank=rank)
     logger.info(f"Config loaded. experiment_id: {config.run.experiment_id}")
 
     # number of gpus for training which is used by deepspeed
@@ -682,16 +674,10 @@ if __name__ == "__main__":
                            f"ent_loss={train_metrics['loss_ent']:.4f}, kl_ref={train_metrics['kl_ref']:.4f}, "
                            f"kl_old={train_metrics['kl_old']:.6f}, clipfrac={train_metrics['clipfrac']:.4f}")
 
-            # Log to experiment tracker every step (only rank 0)
-            if rank == 0 and tracker_run:
-                if logger_type == "mlflow":
-                    print("logging epoch stats with mlflow")
-                    mlflow.log_metrics({f"train/{k}": v for k, v in train_metrics.items()},
-                                       step=global_step)
-                elif logger_type == "wandb":
-                    print("logging epoch stats with wandb")
-                    wandb.log({f"train/{k}": float(v) for k, v in train_metrics.items()},
-                              step=global_step)
+            # Log to experiment tracker every step
+            if tracker:
+                tracker.log_metrics({f"train/{k}": v for k, v in train_metrics.items()},
+                                   step=global_step)
 
         policy_version += 1
         if config.train.alg_name.lower() in Algorithm_Registry.keys():
@@ -711,37 +697,20 @@ if __name__ == "__main__":
                     f"avg_loss={epoch_avg_loss:.4f}, avg_kl_ref={epoch_avg_kl_ref:.4f}, avg_kl_old={epoch_avg_kl_old:.6f}")
 
         # Log epoch metrics to experiment tracker
-        if rank == 0 and tracker_run:
-            if logger_type == "mlflow":
-                mlflow.log_metrics({
-                    "epoch/avg_loss": epoch_avg_loss,
-                    "epoch/avg_kl_old": epoch_avg_kl_old,
-                    "epoch/avg_kl_ref": epoch_avg_kl_ref,
-                    "epoch/avg_clipfrac": epoch_avg_clipfrac,
-                    "epoch/avg_reward": rollout_stats['avg_reward'],
-                    "epoch/total_reward": rollout_stats['total_reward'],
-                    "epoch/avg_response_len": rollout_stats['avg_response_len'],
-                    "epoch/total_samples": rollout_stats['total_samples_generated'],
-                    "epoch/rollout_time_sec": rollout_stats['rollout_time'],
-                    "epoch/tokens_per_sec": rollout_stats['tokens_per_sec'],
-                    "epoch/train_time_sec": train_time,
-                    }, step=epoch + 1)
-            elif logger_type == "wandb":
-                wandb.log({
-                    "epoch/avg_loss": float(epoch_avg_loss),
-                    "epoch/avg_kl_old": float(epoch_avg_kl_old),
-                    "epoch/avg_kl_ref": float(epoch_avg_kl_ref),
-                    "epoch/avg_clipfrac": float(epoch_avg_clipfrac),
-                    "epoch/avg_reward": float(rollout_stats['avg_reward']),
-                    "epoch/total_reward": float(rollout_stats['total_reward']),
-                    "epoch/avg_response_len": float(rollout_stats['avg_response_len']),
-                    "epoch/total_samples": int(rollout_stats['total_samples_generated']),
-                    "epoch/rollout_time_sec": float(rollout_stats['rollout_time']),
-                    "epoch/tokens_per_sec": float(rollout_stats['tokens_per_sec']),
-                    "epoch/train_time_sec": float(train_time),
-                }, step=int(epoch + 1))
-            else:
-                print("Failed to log metrics to experiment tracker")
+        if tracker:
+            tracker.log_metrics({
+                "epoch/avg_loss": epoch_avg_loss,
+                "epoch/avg_kl_old": epoch_avg_kl_old,
+                "epoch/avg_kl_ref": epoch_avg_kl_ref,
+                "epoch/avg_clipfrac": epoch_avg_clipfrac,
+                "epoch/avg_reward": rollout_stats['avg_reward'],
+                "epoch/total_reward": rollout_stats['total_reward'],
+                "epoch/avg_response_len": rollout_stats['avg_response_len'],
+                "epoch/total_samples": rollout_stats['total_samples_generated'],
+                "epoch/rollout_time_sec": rollout_stats['rollout_time'],
+                "epoch/tokens_per_sec": rollout_stats['tokens_per_sec'],
+                "epoch/train_time_sec": train_time,
+                }, step=epoch + 1)
 
         ################
         # 5. Refresh rollout policy via direct weight sync
@@ -789,11 +758,8 @@ if __name__ == "__main__":
         logger.info("=" * 50)
 
     # End experiment tracker run
-    if rank == 0 and tracker_run:
-        if logger_type == "mlflow":
-            mlflow.end_run()
-        elif logger_type == "wandb":
-            wandb.finish()
+    if tracker:
+        tracker.finish()
 
     logger.info("Training completed successfully!")
     entire_training_time = time.time() - entire_training_start_time

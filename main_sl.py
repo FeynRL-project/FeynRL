@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 import torch.distributed
 from tqdm import tqdm
 import gc
-import mlflow
 import time
 
 # imports local methods, classes, etc.
@@ -17,7 +16,7 @@ import configs.load as cfg# all config arguments
 from data_feeds.paired import PairedFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
-from misc.logging import setup_logging, setup_viz
+from misc.logging import setup_logging, setup_tracker
 
 
 Algorithm_Registry = {
@@ -205,18 +204,8 @@ if __name__ == "__main__":
                                  )
     set_random_seeds(seed=config.run.seed)
 
-    # Setup MLflow (only on rank 0)
-    # mlflow_run = setup_viz(config=config, tracking_uri=config.run.tracking_uri, rank=rank)
     # setup remote experiment tracker
-    logger_type = getattr(config.run, "logger_type", "mlflow").lower()
-    logger.info(f"Tracking experiment with: {logger_type}")
-    if logger_type == "mlflow":
-        import mlflow
-    elif logger_type == "wandb":
-        import wandb
-    else:
-        raise ValueError(f"Unknown logger type: {logger_type}") 
-    tracker_run = setup_viz(config=config, tracking_uri=config.run.tracking_uri, rank=rank)
+    tracker = setup_tracker(config=config, rank=rank)
     logger.info(f"Config loaded. experiment_id: {config.run.experiment_id}")
 
     ########
@@ -337,15 +326,10 @@ if __name__ == "__main__":
                 progress_bar.set_postfix(loss=metric['loss'])
 
 
-                if tracker_run and model_engine.is_gradient_accumulation_boundary():
-                    if logger_type == "mlflow":
-                        mlflow.log_metrics({
-                            "train/loss": metric['loss'],
-                        }, step=global_step)
-                    elif logger_type == "wandb":
-                        wandb.log({
-                            "train/loss": float(metric['loss']),
-                        }, step=global_step)
+                if tracker and model_engine.is_gradient_accumulation_boundary():
+                    tracker.log_metrics({
+                        "train/loss": metric['loss'],
+                    }, step=global_step)
 
         # Sync before validation to ensure consistent state
         if torch.distributed.is_initialized():
@@ -386,15 +370,10 @@ if __name__ == "__main__":
 
         if rank == 0:
             print(f"Epoch {epoch+1}, Validation Loss: {global_avg_loss}")
-            if tracker_run:
-                if logger_type == "mlflow":
-                    mlflow.log_metrics({
-                        "val/loss": global_avg_loss,
-                    }, step=global_step)
-                elif logger_type == "wandb":
-                    wandb.log({
-                        "val/loss": float(global_avg_loss),
-                    }, step=global_step)
+            if tracker:
+                tracker.log_metrics({
+                    "val/loss": global_avg_loss,
+                }, step=global_step)
 
         ########
         # 8.3 Save checkpoint
@@ -427,9 +406,6 @@ if __name__ == "__main__":
 
     logger.info("Training completed successfully!")
 
-    # End MLflow run cleanly
-    if rank == 0 and tracker_run:
-        if logger_type == "mlflow":
-            mlflow.end_run()
-        elif logger_type == "wandb":
-            wandb.finish()  
+    # End experiment tracker run
+    if tracker:
+        tracker.finish()  

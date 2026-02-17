@@ -331,9 +331,9 @@ class PPO(COMMON):
                 ids  = mb['input_ids'].to(device, non_blocking=True)
                 amsk = mb['attn_mask'].to(device, non_blocking=True)
                 pids = mb.get('position_ids', None)
-                vals, last_v = self.value_forward(ids, amsk, pids)
-
-                rewards = mb['rewards'][:, 1:].to(device, non_blocking=True)
+                vals, last_v = self.value_forward(input_ids=ids, attn_mask=amsk, position_ids=pids)
+                # all are prediction aligned
+                rewards = mb['rewards'][:, :-1].to(device, non_blocking=True)
                 done    = mb['done'][:, :-1].to(device, non_blocking=True)
                 mask    = mb['mask'][:, :-1].to(device, non_blocking=True)
 

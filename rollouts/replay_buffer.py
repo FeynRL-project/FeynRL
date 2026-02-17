@@ -31,14 +31,17 @@ class ReplayBuffer(Dataset):
             - policy_version: int        --> [Not added to replay buffer for now]
             - loaded_version: int        --> [Not added to replay buffer for now]
             - input_ids: torch.Tensor    --> [T]
-            - rewards: torch.Tensor      --> [T]
-            - zscores: torch.Tensor      --> [T] same as rewards if only one sample per prompt
-            - token_mask: torch.Tensor   --> [T] [Not added to replay buffer for now]
-            - token_done: torch.Tensor   --> [T] [Not added to replay buffer for now]
-            - token_old_logprobs: torch.Tensor --> [T] [Not added to replay buffer for now]
-            - pred_mask: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
-            - pred_done: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
-            - pred_old_logprobs: torch.Tensor --> [T] this is prediction aligned so no need to do any weired indexing
+            # token-aligned  -- NOT USED
+                - token_rewards: torch.Tensor --> [T] [Not added to replay buffer for now]
+                - token_zscores: torch.Tensor --> [T] [Not added to replay buffer for now]
+                - token_masks: torch.Tensor   --> [T] [Not added to replay buffer for now]
+                - token_dones: torch.Tensor   --> [T] [Not added to replay buffer for now]
+                - token_old_logprobs: torch.Tensor --> [T] [Not added to replay buffer for now]
+            # pred-aligned
+                - pred_masks: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
+                - pred_dones: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
+                - pred_old_logprobs: torch.Tensor --> [T] this is prediction aligned so no need to do any weired indexing
+                - pred_rewards: torch.Tensor --> [T] this is prediction aligned so no need to do any weired indexing
             - finish_reason: str         --> already used for done and mask
             - stop_reason: str           --> already used for done and mask
             - ended_on_eos: bool         --> already used for done and mask
@@ -52,7 +55,7 @@ class ReplayBuffer(Dataset):
                 continue
 
             self.add(input_ids=sample["input_ids"],
-                     rewards=sample["rewards"],
+                     rewards=sample["pred_rewards"],
                      zscores=sample["pred_zscores"],
                      masks=sample["pred_masks"],
                      dones=sample["pred_dones"],

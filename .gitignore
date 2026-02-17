@@ -118,3 +118,6 @@ logs/
 
 # checkpoints
 checkpoints/
+
+# Weights and Biases
+wandb/

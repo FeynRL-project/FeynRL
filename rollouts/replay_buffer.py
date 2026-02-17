@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from torch.utils.data import Dataset
 
 # local imports

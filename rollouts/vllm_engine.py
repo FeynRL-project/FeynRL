@@ -171,11 +171,10 @@ class VLLMRolloutEngine:
 
         self.log(f"Updating weights directly to version {version}")
 
-        # pickle the state_dict and encode to latin-1 string to pass through vllm rpc safely.
-        # This avoids vllm trying to interpret list of ints or other structures.
-        # This doesn't work so that is why I use pickle.dumps
-        # weights = [(name, tensor) for name, tensor in state_dict.items()]
-        # self.vllm_engine.collective_rpc("update_weights", args=(weights,))
+        # Pickle the state_dict and encode as latin-1 string to pass through vllm's
+        # msgspec-based RPC safely. vllm's RPC mangles bytes/ndarray/tensor types,
+        # but passes strings through reliably. Latin-1 is a lossless 1:1 byte↔char
+        # mapping, and CPython stores latin-1 strings at 1 byte/char internally.
         serialized_state = pickle.dumps(state_dict).decode('latin-1')
         self.vllm_engine.collective_rpc("update_weights", args=(serialized_state,))
         self.loaded_version = version
@@ -470,7 +469,7 @@ class VLLMRolloutEngine:
             # For a single sample, we don't normalize (i.e. advantage is 0 if we subtract mean)
             # but usually for n=1 we keep the raw reward.
             mean_scores = 0.0
-            std_scores  = 1.0 - self.eps_reward_norm
+            std_scores  = 1.0
 
         if is_per_token:
             raise ValueError("per token rewards are not supported yet as normalization is done assuming per response rewards")
@@ -528,7 +527,8 @@ if __name__ == "__main__":
                                     eos_id=tokenizer.eos_token_id,
                                     reward_broadcast=True,
                                     eps_reward_norm=1e-8,
-                                    gpu_memory_utilization=0.5)
+                                    gpu_memory_utilization=0.5,
+                                    model_dtype='bfloat16')
 
     dummy_data = ["Hello, how are you?",
                   "Summer is the best season!",

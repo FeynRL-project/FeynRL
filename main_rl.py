@@ -23,6 +23,7 @@ Algorithm_Registry = {
     # supported algorithms
     'sgrpo': ('algs.SGRPO.sgrpo', 'SGRPO'),
     'cispo': ('algs.CISPO.cispo', 'CISPO'),
+    'ppo':   ('algs.PPO.ppo', 'PPO'),
 }
 
 def set_random_seeds(seed):
@@ -59,7 +60,7 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
     '''
         This function is responsible for running the training engine.
     '''
-    kwargs = { # model relataed arguments
+    kwargs = { # model related arguments
                'model_path':params.model.name,
                'ref_model_path':params.model.ref_model,
                'model_dtype':safe_string_to_torch_dtype(params.model.dtype),
@@ -81,6 +82,14 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                # gradient checkpointing
                'gradient_checkpointing':params.model.gradient_checkpointing,
     }
+
+    # ppo arguments
+    alg_name = params.train.alg_name.lower()
+    if alg_name == 'ppo':
+        kwargs['value_model_path'] = params.model.value_model or params.model.name
+        kwargs['tau'] = params.train.tau
+        kwargs['gamma'] = params.train.gamma
+        kwargs['deepspeed_value_config'] = params.deepspeed_value
     # setup ray runners
     ray_runners = []
     for rank in range(world_size):
@@ -364,12 +373,17 @@ def run_training_step(engines, shard_refs):
     # Gather training metrics from all engines
     metrics_list = ray.get(futures)
 
-    return {'loss_total':np.mean([m.get('loss_total', 0.0) for m in metrics_list]),
-            'loss_pi': np.mean([m.get('loss_pi', 0.0) for m in metrics_list]),
-            'loss_ent': np.mean([m.get('loss_ent', 0.0) for m in metrics_list]),
-            'kl_ref': np.mean([m.get('kl_ref', 0.0) for m in metrics_list]),
-            'kl_old': np.mean([m.get('kl_old', 0.0) for m in metrics_list]),
-            'clipfrac': np.mean([m.get('clipfrac', 0.0) for m in metrics_list])}
+    # Dynamically aggregate all metric keys across engines.
+    # This works for both sgrpo (policy-only) and ppo (policy + value metrics).
+    # metrics_list: clipfrac, approx_kl, ent_loss, pi_loss, pi_loss_total, kl_ref
+    # if value network, add: v_loss
+    # pi_loss_total includes: pi_loss + ent_coef * ent_loss
+
+    all_keys = set()
+    for m in metrics_list:
+        all_keys.update(m.keys())
+
+    return {k: np.mean([m.get(k, 0.0) for m in metrics_list]) for k in all_keys}
 
 def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir, experiment_id, rank, logger):
     '''
@@ -653,26 +667,22 @@ if __name__ == "__main__":
         # Avoids re-serializing the same data on every step (batches are
         # reused unchanged across all steps_per_epoch iterations).
         shard_refs = shard_and_put(train_batches_padded, num_engines=len(training_engine))
-
         ################
         # 3. Training loop
         ################
-        epoch_metrics = {'loss_total': [], 'loss_pi': [], 'loss_ent': [],
-                         'kl_ref': [], 'kl_old': [], 'clipfrac': []}
+        epoch_metrics = {}
         for step in range(steps_per_epoch):
             train_metrics = run_training_step(training_engine, shard_refs)
 
-            # Epoch average of average across all training engines
+            # Epoch average of average across all training engines (dynamic keys)
             for k, v in train_metrics.items():
-                epoch_metrics[k].append(v)
+                epoch_metrics.setdefault(k, []).append(v)
             global_step += 1
 
             # Log progress
             if step % 10 == 0:
-                logger.info(f"[Epoch {epoch+1}][Step {step+1}/{steps_per_epoch}] "
-                           f"loss={train_metrics['loss_total']:.4f}, pi_loss={train_metrics['loss_pi']:.4f}, "
-                           f"ent_loss={train_metrics['loss_ent']:.4f}, kl_ref={train_metrics['kl_ref']:.4f}, "
-                           f"kl_old={train_metrics['kl_old']:.6f}, clipfrac={train_metrics['clipfrac']:.4f}")
+                metric_str = ", ".join(f"{k}={v:.4f}" for k, v in train_metrics.items())
+                logger.info(f"[Epoch {epoch+1}][Step {step+1}/{steps_per_epoch}] {metric_str}")
 
             # Log to MLflow every step (only rank 0)
             if rank == 0 and mlflow_run:
@@ -688,21 +698,17 @@ if __name__ == "__main__":
         train_time = time.time() - train_start_time
         epoch_time = time.time() - epoch_start_time
 
-        epoch_avg_loss = np.mean(epoch_metrics['loss_total'])
-        epoch_avg_kl_old = np.mean(epoch_metrics['kl_old'])
-        epoch_avg_kl_ref = np.mean(epoch_metrics['kl_ref'])
-        epoch_avg_clipfrac = np.mean(epoch_metrics['clipfrac'])
+        epoch_avg = {k: np.mean(v) for k, v in epoch_metrics.items()}
 
         logger.info(f"[Epoch {epoch+1}] Training complete: time={train_time:.2f}s, "
-                    f"avg_loss={epoch_avg_loss:.4f}, avg_kl_ref={epoch_avg_kl_ref:.4f}, avg_kl_old={epoch_avg_kl_old:.6f}")
+                    f"avg_loss={epoch_avg.get('loss_total', 0.0):.4f}, "
+                    f"avg_kl_ref={epoch_avg.get('kl_ref', 0.0):.4f}, "
+                    f"avg_kl_old={epoch_avg.get('kl_old', 0.0):.6f}")
 
         # Log epoch metrics to MLflow
         if rank == 0 and mlflow_run:
-            mlflow.log_metrics({
-                    "epoch/avg_loss": epoch_avg_loss,
-                    "epoch/avg_kl_old": epoch_avg_kl_old,
-                    "epoch/avg_kl_ref": epoch_avg_kl_ref,
-                    "epoch/avg_clipfrac": epoch_avg_clipfrac,
+            epoch_mlflow = {f"epoch/avg_{k}": v for k, v in epoch_avg.items()}
+            epoch_mlflow.update({
                     "epoch/avg_reward": rollout_stats['avg_reward'],
                     "epoch/total_reward": rollout_stats['total_reward'],
                     "epoch/avg_response_len": rollout_stats['avg_response_len'],
@@ -710,7 +716,8 @@ if __name__ == "__main__":
                     "epoch/rollout_time_sec": rollout_stats['rollout_time'],
                     "epoch/tokens_per_sec": rollout_stats['tokens_per_sec'],
                     "epoch/train_time_sec": train_time,
-                    }, step=epoch + 1)
+                    })
+            mlflow.log_metrics(epoch_mlflow, step=epoch + 1)
 
         ################
         # 5. Refresh rollout policy via direct weight sync
@@ -747,7 +754,7 @@ if __name__ == "__main__":
         ################
         # 6. Refresh rollout policy via disk-based fallback
         ################
-        if sync_success == False:
+        if sync_success == False and not is_last_epoch:
             logger.info(f"[Epoch {epoch+1}] Refreshing rollout engines with new policy (version {policy_version})...")
             refresh_rollout_engine(rollout_engines=rollout_engines,
                                    updated_policy_path=model_path,

@@ -105,11 +105,14 @@ class SGRPO(COMMON):
         # 1. make sure advantages are detached and
         # convert to float32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
-        mask = (mask.to(device=device) > 0.5).to(dtype=dtype)
+        mask_bool = (mask.to(device=device) > 0.5)
+        mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
         # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
-        logratio = (logprobs - old_logprobs).to(torch.float32)
+        raw_logratio = (logprobs - old_logprobs).to(torch.float32)
+        # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
+        logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
         ratio   = torch.exp(logratio)
 
         # 3. compute loss: -(min(ratio * adv, clip_adv)) * mask
@@ -123,6 +126,8 @@ class SGRPO(COMMON):
 
         if ref_logprobs is not None and self.kl_coeff > 0.0:
             kl_dist = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=ref_logprobs)
+            # avoid calculating kl for padded tokens.
+            kl_dist = torch.where(mask_bool, kl_dist, torch.zeros_like(kl_dist))
             kl_ref  = (kl_dist * mask).sum() / denom
 
         loss_total = loss_pi - self.ent_coeff * loss_ent + self.kl_coeff * kl_ref

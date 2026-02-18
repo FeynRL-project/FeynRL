@@ -168,14 +168,15 @@ def make_map_fn(split, args):
         if not chosen_turns or not rejected_turns:
             return None
 
-        # Enforce strict alternation
-        chosen_turns = enforce_strict_alternation(chosen_turns)
-        rejected_turns = enforce_strict_alternation(rejected_turns)
-
         prompt_turns, chosen_cont, rejected_cont = split_at_first_divergence(
             chosen_turns,
             rejected_turns,
         )
+
+        # Enforce strict alternation
+        prompt_turns = enforce_strict_alternation(prompt_turns)
+        chosen_cont = enforce_strict_alternation(chosen_cont) 
+        rejected_cont = enforce_strict_alternation(rejected_cont) 
 
         # Must have non-empty continuation
         if len(chosen_cont) == 0 or len(rejected_cont) == 0:
@@ -282,7 +283,7 @@ if __name__ == "__main__":
     # --------------------------------------------------------
     # Sanity Check Print
     # --------------------------------------------------------
-    sample = train_dataset[0]
+    sample = train_dataset[15]
 
     print(sample)
 

@@ -7,16 +7,16 @@ def extract_solution(solution_str, clip_chars=300):
         solution_str = solution_str[-clip_chars:]
 
     # this also tests the formatting of the model
-    solutions = re.search("#### (\-?[0-9\.\,]+)", solution_str)
-    if solutions is None:
+    solution = re.search(r"####\s*(-?[0-9.,]+)", solution_str)
+    if solution is None:
         final_answer = None
     else:
         # take the last solution
-        final_answer = solutions.group(1).replace(",", "").replace("$", "")
+        final_answer = solution.group(1).replace(",", "").replace("$", "").replace("\n", "")
 
     return final_answer
 
-def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any], format_score=0.0, score=1.0):
+def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any]):
     '''
       input args:
         prompt_data: Dict[str, Any] - dictionary containing prompt data
@@ -25,6 +25,10 @@ def compute_score(prompt_data: Dict[str, Any], response_data: Dict[str, Any], fo
         r: torch.Tensor - reward tensor
         is_per_token: bool - whether the reward is per token
     '''
+
+    format_score = 0.0
+    score = 1.0
+
     solution_str = response_data.text
     ground_truth = prompt_data["solution"]
 

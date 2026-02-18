@@ -3,6 +3,7 @@ from typing import Dict, Any
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
 import yaml
 import sys
+import copy
 
 class Run(BaseModel):
     '''
@@ -10,7 +11,6 @@ class Run(BaseModel):
     '''
     model_config = ConfigDict(extra='forbid')
     experiment_id: str
-    distributed_training_strategy: str = None
     seed: int
     project_name: str
     tracking_uri: str
@@ -24,9 +24,12 @@ class Run(BaseModel):
     checkpoint_dir: str | None = None
 
     # Overlap training and rollout generation
-    overlap_enabled: bool | None = None # Enable overlap mode
-    overlap_max_lag: int | None = None # Max training steps ahead of rollout policy version
-    overlap_weight_update_interval: int | None = None # Update rollout weights every N training steps
+    # Enable overlap mode
+    overlap_enabled: bool | None = None
+    # Max training steps ahead of rollout policy version
+    overlap_max_lag: int | None = None
+    # Update rollout weights every N training steps
+    overlap_weight_update_interval: int | None = None
 
     # Weight sync: "direct" pushes weights via gpu memory (no disk I/O),
     # "disk" uses save-to-disk + vllm reload.
@@ -64,6 +67,17 @@ class Train(BaseModel):
     entropy_coeff: float | None = None
     update_after_full_replay: bool | None = None
 
+    # PPO-specific arguments
+    # GAE lambda
+    tau: float | None = None
+    # discount factor
+    gamma: float | None = None
+    # defaults to train.lr if None
+    value_lr: float | None = None
+    # defaults to train.weight_decay if None
+    value_weight_decay: float | None = None
+    # defaults to train.clip_grad_norm if None
+    value_clip_grad_norm: float | None = None
     ###############
     # general training  loop arguments
     ###############
@@ -85,15 +99,16 @@ class Train(BaseModel):
     ###############
     # Arguments which are common to both deepspeed and standalone training.
     ###############
-    # Some of the below arguments also can be set in deepspeed config. However to avoid any confusion and increase code readability,
-    # we are setting them here and update deepspeed config accordingly.
-    # Note: train_batch_size_per_gpu is same as train_micro_batch_size_per_gpu
-    # global batch_size would be train_batch_size_per_gpu * gradient_accumulation_steps * number_of_gpus.
+    # Some of the below arguments also can be set in deepspeed. To avoid any
+    # confusion, we are setting them here and update deepspeed config accordingly.
     train_batch_size_per_gpu: int
     gradient_accumulation_steps: int
     val_batch_size_per_gpu: int
 
     normalize_loss: bool
+
+    # DPO specific arguments
+    cl_beta: float | None = None
 
 class Data(BaseModel):
     '''
@@ -118,6 +133,7 @@ class Model(BaseModel):
     name: str
     dtype: str
     ref_model: str = None
+    value_model: str = None  # PPO value model path if alg_name is ppo
     ref_model_offload_to_cpu: bool = False
     trust_remote_code: bool
     model_class: str = None
@@ -157,6 +173,13 @@ class DeepSpeed(BaseModel):
     # Monitor config
     monitor_config: Dict[str, Any] | None = None
 
+    def model_dump(self, **kwargs):
+        # Exclude None values by default for ds compatibility.
+        # DS crashes when config contains explicit None values because
+        # dict.get(key, default) returns None instead of the default when the key exists.
+        kwargs.setdefault('exclude_none', True)
+        return super().model_dump(**kwargs)
+
 class DeepSpeedRef(BaseModel):
     '''
         Inference-only deepspeed for ref model in rl(no optimizer, no updates).
@@ -166,8 +189,10 @@ class DeepSpeedRef(BaseModel):
     bf16: Dict[str, Any] = Field(default_factory=lambda: {"enabled": False})
     zero_optimization: Dict[str, Any] = Field(default_factory=dict)
     train_micro_batch_size_per_gpu: int | None = None
-    # Activation checkpointing (can help with memory)
-    activation_checkpointing: Dict[str, Any] | None = None
+
+    def model_dump(self, **kwargs):
+        kwargs.setdefault('exclude_none', True)
+        return super().model_dump(**kwargs)
 
 class Reward(BaseModel):
     '''
@@ -214,162 +239,236 @@ class Config(BaseModel):
     rollout: Rollout | None = None
     # Reference model DeepSpeed config
     deepspeed_ref: DeepSpeedRef | None = None
+    # Value model DeepSpeed config
+    deepspeed_value: DeepSpeed | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
     def sync_deepspeed_config(self, world_size: int):
-            """
-            Sync DeepSpeed config from train/model without duplicating YAML fields.
-            """
-            # 1 — Batch Sizes (required for both SL and RL)
-            self.deepspeed.train_micro_batch_size_per_gpu = self.train.train_batch_size_per_gpu
-            self.deepspeed.gradient_accumulation_steps = self.train.gradient_accumulation_steps
+        '''
+                Sync DeepSpeed config from train/model without duplicating YAML fields.
+        '''
+        if self.run is None or self.train is None or self.deepspeed is None or self.model is None:
+            raise ValueError("run, train, deepspeed, and model config sections are required for training")
 
-            # Explicitly calculate and set train_batch_size for DeepSpeed logging/sanity check.
-            # Without this, model_dump() emits train_batch_size: None which some DS
-            # versions misinterpret (key present with None vs key absent).
-            if world_size is not None:
-                self.deepspeed.train_batch_size = self.train.train_batch_size_per_gpu * self.train.gradient_accumulation_steps * world_size
+        # 1 — Batch Sizes (required for both SL and RL)
+        self.deepspeed.train_micro_batch_size_per_gpu = self.train.train_batch_size_per_gpu
+        self.deepspeed.gradient_accumulation_steps = self.train.gradient_accumulation_steps
 
-            # 2 — Gradient Clipping
-            self.deepspeed.gradient_clipping = float(self.train.clip_grad_norm)
+        # Explicitly calculate and set train_batch_size for DeepSpeed logging/sanity check.
+        # Without this, model_dump() emits train_batch_size: None which some DS
+        # versions misinterpret (key present with None vs key absent).
+        if world_size is not None:
+            self.deepspeed.train_batch_size = self.train.train_batch_size_per_gpu * self.train.gradient_accumulation_steps * world_size
 
-            # 3 — FP16 / BF16
-            dtype = self.model.dtype.lower()
-            if dtype in ("float16", "fp16"):
-                self.deepspeed.fp16["enabled"] = True
-                self.deepspeed.bf16["enabled"] = False
+        # 2 — Gradient Clipping
+        self.deepspeed.gradient_clipping = float(self.train.clip_grad_norm)
 
-            elif dtype in ("bfloat16", "bf16"):
-                self.deepspeed.fp16["enabled"] = False
-                self.deepspeed.bf16["enabled"] = True
+        # 3 — FP16 / BF16
+        dtype = self.model.dtype.lower()
+        if dtype in ("float16", "fp16"):
+            self.deepspeed.fp16["enabled"] = True
+            self.deepspeed.bf16["enabled"] = False
 
-            else:
-                self.deepspeed.fp16["enabled"] = False
-                self.deepspeed.bf16["enabled"] = False
+        elif dtype in ("bfloat16", "bf16"):
+            self.deepspeed.fp16["enabled"] = False
+            self.deepspeed.bf16["enabled"] = True
 
-            # 4 — Optimizer (Auto-Sync)
-            # We map generic "optimizer_name" to DeepSpeed's expected structure
-            # To use DeepSpeedCPUAdam (for offload), we simply specify "Adam" or "AdamW"
-            if "adamw" in self.train.optimizer_name.lower():
-                ds_opt_type = "AdamW"
-            elif "adam" in self.train.optimizer_name.lower():
-                ds_opt_type = "Adam"
-            else:
-                raise ValueError(f"Unsupported optimizer: {self.train.optimizer_name}")
+        else:
+            self.deepspeed.fp16["enabled"] = False
+            self.deepspeed.bf16["enabled"] = False
 
-            self.deepspeed.optimizer = {
-                "type": ds_opt_type,
-                "params": {
-                    "lr": self.train.lr,
-                    "betas": self.train.betas,
-                    "weight_decay": self.train.weight_decay,
-                    "eps": self.train.adam_epsilon
-                }
+        # 4 — Optimizer (Auto-Sync)
+        # We map generic "optimizer_name" to DeepSpeed's expected structure
+        if "adamw" in self.train.optimizer_name.lower():
+            ds_opt_type = "AdamW"
+        elif "adam" in self.train.optimizer_name.lower():
+            ds_opt_type = "Adam"
+        else:
+            raise ValueError(f"Unsupported optimizer: {self.train.optimizer_name}")
+
+        self.deepspeed.optimizer = {
+            "type": ds_opt_type,
+            "params": {
+                "lr": self.train.lr,
+                "betas": self.train.betas,
+                "weight_decay": self.train.weight_decay,
+                "eps": self.train.adam_epsilon
             }
+        }
 
-            # 5 — Scheduler (Auto-Sync)
-            if self.train.lr_scheduler == "WarmupCosineLR":
-                # SL uses micro_batches_per_epoch (convert to optimizer steps)
-                # RL uses train_steps_per_epoch (already optimizer steps)
-                if self.run.method == "sl":
-                    if self.train.micro_batches_per_epoch is None:
-                        raise ValueError("micro_batches_per_epoch must be set for SL training")
-                    optimizer_steps_per_epoch = self.train.micro_batches_per_epoch // self.train.gradient_accumulation_steps
+        # 5 — Scheduler
+        if self.train.lr_scheduler == "WarmupCosineLR":
+            # SL uses micro_batches_per_epoch (convert to optimizer steps)
+            # RL uses train_steps_per_epoch (already optimizer steps)
+            if self.run.method == "sl" or self.run.method == "cl":
+                if self.train.micro_batches_per_epoch is None:
+                    raise ValueError("micro_batches_per_epoch must be set for SL training")
+                optimizer_steps_per_epoch = self.train.micro_batches_per_epoch // self.train.gradient_accumulation_steps
+
+            elif self.run.method == "rl":
+                if self.train.train_steps_per_epoch is None:
+                    raise ValueError("train_steps_per_epoch must be set for RL training")
+
+                if self.rollout is None:
+                    raise ValueError("rollout config is required for RL training")
+
+                # When update_after_full_replay=True, each train_step call produces
+                # exactly 1 optimizer step (boundary only on last micro-batch).
+                # When False, each train_step produces ceil(micro_batches / ga_steps)
+                # optimizer steps, so we must account for this multiplier.
+                if self.train.update_after_full_replay:
+                    optimizer_steps_per_epoch = self.train.train_steps_per_epoch
 
                 else:
-                    if self.train.train_steps_per_epoch is None:
-                        raise ValueError("train_steps_per_epoch must be set for RL training")
+                    # Note: estimated_replay_size may be slightly larger than actual if some
+                    # responses have response_len==0 (filtered in replay_buffer.add_batch_seqs).
+                    # This can cause the lr schedule to not fully reach cos_min_ratio.
+                    estimated_replay_size = self.rollout.rollout_samples_per_epoch * self.rollout.n_samples
+                    total_micro_batches = math.ceil(estimated_replay_size / self.train.train_batch_size_per_gpu)
+                    micro_batches_per_engine = math.ceil(total_micro_batches / world_size)
+                    opt_steps_per_train_step = math.ceil(micro_batches_per_engine / self.train.gradient_accumulation_steps)
+                    optimizer_steps_per_epoch = self.train.train_steps_per_epoch * opt_steps_per_train_step
 
-                    # When update_after_full_replay=True, each train_step call produces
-                    # exactly 1 optimizer step (boundary only on last micro-batch).
-                    # When False, each train_step produces ceil(micro_batches / ga_steps)
-                    # optimizer steps, so we must account for this multiplier.
-                    if self.train.update_after_full_replay:
-                        optimizer_steps_per_epoch = self.train.train_steps_per_epoch
-                    else:
-                        estimated_replay_size = self.rollout.rollout_samples_per_epoch * self.rollout.n_samples
-                        total_micro_batches = math.ceil(estimated_replay_size / self.train.train_batch_size_per_gpu)
-                        micro_batches_per_engine = math.ceil(total_micro_batches / world_size)
-                        opt_steps_per_train_step = math.ceil(micro_batches_per_engine / self.train.gradient_accumulation_steps)
-                        optimizer_steps_per_epoch = self.train.train_steps_per_epoch * opt_steps_per_train_step
-
-                total_optimizer_steps = self.train.total_number_of_epochs * optimizer_steps_per_epoch
-                warmup_steps = int(total_optimizer_steps * self.train.warmup_steps_ratio)
-
-                self.deepspeed.scheduler = {
-                    "type": self.train.lr_scheduler,
-                    "params": {
-                        "total_num_steps": total_optimizer_steps,
-                        "warmup_min_ratio": 0.0,
-                        "cos_min_ratio": 0.1, # standard default, decays to 10% of max LR
-                        "warmup_num_steps": warmup_steps
-                    }
-                }
             else:
-                raise ValueError(f"Unsupported scheduler: {self.train.lr_scheduler}")
+                raise ValueError(f"Unsupported method '{self.run.method}' for scheduler calculation. Expected 'sl' or 'rl'.")
 
-            # 6 — ZeRO Defaults (Ensure robust ZeRO-3 settings)
-            if self.deepspeed.zero_optimization is None:
-                self.deepspeed.zero_optimization = {}
 
-            # Remove keys that are None or explicitly disabled via device="none"
-            keys_to_remove = []
-            for k, v in self.deepspeed.zero_optimization.items():
-                if v is None:
+            total_optimizer_steps = self.train.total_number_of_epochs * optimizer_steps_per_epoch
+            warmup_steps = int(total_optimizer_steps * self.train.warmup_steps_ratio)
+
+            self.deepspeed.scheduler = {
+                "type": self.train.lr_scheduler,
+                "params": {
+                    "total_num_steps": total_optimizer_steps,
+                    "warmup_min_ratio": 0.0,
+                    "cos_min_ratio": 0.1, # standard default, decays to 10% of max LR
+                    "warmup_num_steps": warmup_steps
+                }
+            }
+        else:
+            raise ValueError(f"Unsupported scheduler: {self.train.lr_scheduler}")
+
+        # 6 — ZeRO Defaults
+        if self.deepspeed.zero_optimization is None:
+            self.deepspeed.zero_optimization = {}
+
+        zero_stage = self.deepspeed.zero_optimization.get("stage", 0)
+
+        # Remove keys that are None or explicitly disabled via device="none"
+        keys_to_remove = []
+        for k, v in self.deepspeed.zero_optimization.items():
+            if v is None:
+                keys_to_remove.append(k)
+            elif isinstance(v, dict) and v.get("device") == "none":
+                keys_to_remove.append(k)
+
+        # Strip offload keys that are invalid for the current stage:
+        # - offload_param only works at stage 3
+        # - offload_optimizer only works at stages 2 and 3
+        if zero_stage < 3 and "offload_param" not in keys_to_remove:
+            if "offload_param" in self.deepspeed.zero_optimization:
+                keys_to_remove.append("offload_param")
+        if zero_stage < 2 and "offload_optimizer" not in keys_to_remove:
+            if "offload_optimizer" in self.deepspeed.zero_optimization:
+                keys_to_remove.append("offload_optimizer")
+
+        # Strip stage3-only keys when stage != 3 (DS ignores them but they clutter config dumps)
+        if zero_stage != 3:
+            for k in list(self.deepspeed.zero_optimization.keys()):
+                if k.startswith("stage3_") and k not in keys_to_remove:
                     keys_to_remove.append(k)
-                elif isinstance(v, dict) and v.get("device") == "none":
-                    keys_to_remove.append(k)
 
-            for k in keys_to_remove:
-                del self.deepspeed.zero_optimization[k]
+        for k in keys_to_remove:
+            del self.deepspeed.zero_optimization[k]
 
-            # Force crucial ZeRO-3 setting if Stage 3 is active
-            if self.deepspeed.zero_optimization.get("stage") == 3:
-                # This ensures we don't get 500 small files when saving
-                if "stage3_gather_16bit_weights_on_model_save" not in self.deepspeed.zero_optimization:
-                    self.deepspeed.zero_optimization["stage3_gather_16bit_weights_on_model_save"] = True
+        # Force crucial ZeRO-3 setting if stage 3 is active
+        if zero_stage == 3:
+            # This ensures we don't get 500 small files when saving
+            if "stage3_gather_16bit_weights_on_model_save" not in self.deepspeed.zero_optimization:
+                self.deepspeed.zero_optimization["stage3_gather_16bit_weights_on_model_save"] = True
 
-            # 7 — Generate ref model config (inference-only, no optimizer/updates)
-            if self.deepspeed_ref is None and self.model.ref_model:
-                # Start from the main deepspeed config
-                ds_dict = self.deepspeed.model_dump()
+        # 7 — Generate ref model config which is inference-only, no optimizer/updates
+        if self.deepspeed_ref is None and self.model.ref_model:
+            # Start from the main deepspeed config
+            ds_dict = self.deepspeed.model_dump()
 
-                # Remove optimizer/scheduler - ref model is frozen, no updates
-                ds_dict.pop("optimizer", None)
-                ds_dict.pop("scheduler", None)
+            # Remove optimizer/scheduler - ref model is frozen, no updates
+            ds_dict.pop("optimizer", None)
+            ds_dict.pop("scheduler", None)
 
-                # Configure zero_optimization for ref model
-                if ds_dict.get("zero_optimization"):
-                    # Remove offload_optimizer - no optimizer for ref model
-                    ds_dict["zero_optimization"].pop("offload_optimizer", None)
+            # Configure zero_optimization for ref model
+            if ds_dict.get("zero_optimization"):
+                # Zero stages 1/2 partition optimizer states and gradients respectively when
+                # which is not needed for inference-only models.
+                # Keep stage 3 as-is since it partitions parameters and DS handles inference at stage 3.
+                if zero_stage in (1, 2):
+                    ds_dict["zero_optimization"]["stage"] = 0
 
-                    # Configure CPU offloading based on ref_model_offload_to_cpu flag
-                    if self.model.ref_model_offload_to_cpu:
+                # Remove offload_optimizer - no optimizer for ref model
+                ds_dict["zero_optimization"].pop("offload_optimizer", None)
+
+                # Configure CPU offloading based on ref_model_offload_to_cpu flag
+                # offload_param is only valid at ZeRO stage 3
+                if self.model.ref_model_offload_to_cpu:
+                    if zero_stage == 3:
                         ds_dict["zero_optimization"]["offload_param"] = {
                             "device": "cpu",
                             "pin_memory": True
                         }
                     else:
-                        # Remove offload_param if not offloading
-                        ds_dict["zero_optimization"].pop("offload_param", None)
+                        raise ValueError(
+                            f"ref_model_offload_to_cpu=True requires ZeRO stage 3, "
+                            f"but current stage is {zero_stage}. "
+                            f"Set zero_optimization.stage to 3 or disable ref_model_offload_to_cpu."
+                        )
+                else:
+                    # Remove offload_param if not offloading
+                    ds_dict["zero_optimization"].pop("offload_param", None)
 
-                self.deepspeed_ref = DeepSpeedRef(
-                    fp16=ds_dict.get("fp16", {"enabled": False}),
-                    bf16=ds_dict.get("bf16", {"enabled": False}),
-                    zero_optimization=ds_dict.get("zero_optimization", {}),
-                    train_micro_batch_size_per_gpu=ds_dict.get("train_micro_batch_size_per_gpu"),
-                    activation_checkpointing=ds_dict.get("activation_checkpointing"),
-                )
+            self.deepspeed_ref = DeepSpeedRef(
+                fp16=ds_dict.get("fp16", {"enabled": False}),
+                bf16=ds_dict.get("bf16", {"enabled": False}),
+                zero_optimization=ds_dict.get("zero_optimization", {}),
+                train_micro_batch_size_per_gpu=ds_dict.get("train_micro_batch_size_per_gpu"),
+            )
+
+        # 8 — Always sync ref model batch size and dtype from main config
+        # (handles both auto-generated and user-provided deepspeed_ref)
+        if self.deepspeed_ref is not None:
+            self.deepspeed_ref.train_micro_batch_size_per_gpu = self.deepspeed.train_micro_batch_size_per_gpu
+            self.deepspeed_ref.fp16 = dict(self.deepspeed.fp16)
+            self.deepspeed_ref.bf16 = dict(self.deepspeed.bf16)
+
+        # 9 — Generate value model DS config.
+        # Clones the policy DS config and overrides optimizer params where specified.
+        if self.train.alg_name and self.train.alg_name.lower() == 'ppo':
+            value_ds = copy.deepcopy(self.deepspeed)
+
+            # Override optimizer lr if value_lr is set
+            v_lr = self.train.value_lr if self.train.value_lr is not None else self.train.lr
+            v_wd = self.train.value_weight_decay if self.train.value_weight_decay is not None else self.train.weight_decay
+            if value_ds.optimizer is not None:
+                value_ds.optimizer['params']['lr'] = v_lr
+                value_ds.optimizer['params']['weight_decay'] = v_wd
+
+            # Override gradient clipping if value_clip_grad_norm is set
+            v_clip = self.train.value_clip_grad_norm if self.train.value_clip_grad_norm is not None else self.train.clip_grad_norm
+            value_ds.gradient_clipping = float(v_clip)
+
+            self.deepspeed_value = value_ds
 
 def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int, world_size: int | None = None):
     '''
-        method: "sl" or "rl"
+        method: "sl", "rl", or "eval"
         input_yaml: path to the yaml file
         experiment_id: experiment identifier
         world_size: number of GPUs for SL training (optional for RL)
     '''
+    if method not in ("sl", "rl", "eval", "cl"):
+        raise ValueError(f"Unsupported method: '{method}'. Must be 'sl', 'rl', 'cl', or 'eval'.")
+
     try:
         with open(input_yaml, "r") as f:
             raw_config = yaml.safe_load(f)
@@ -385,6 +484,15 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if world_size is None:
                 raise ValueError("world_size must be specified for SL training")
 
+        elif method == "cl":
+            if world_size is None:
+                raise ValueError("world_size must be specified for CL training")
+            if config.train.alg_name == "dpo":
+                if config.train.cl_beta is None:
+                    raise ValueError("cl_beta must be specified for dpo")
+                if config.train.cl_beta < 0:
+                    raise ValueError("cl_beta must be >= 0 for dpo")
+
         elif method == "rl":
             # Validate GPU counts before using them
             if config.run.training_gpus is None or config.run.training_gpus < 1:
@@ -396,6 +504,10 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             # [1-clip_low, 1+clip_high] requires non-negative values
             if config.train.clip_low < 0 or config.train.clip_high < 0:
                 raise ValueError(f"clip_low and clip_high must be >= 0, got {config.train.clip_low} and {config.train.clip_high}.")
+
+            if config.train.alg_name == "ppo":
+                if config.train.tau is None or config.train.gamma is None or not config.model.value_model:
+                    raise ValueError("tau and gamma and value_model must be specified for ppo")
 
         if method != "eval":
             # Sync AFTER updating world_size
@@ -435,3 +547,4 @@ if __name__ == "__main__":
     config = load_and_verify(method="sl", input_yaml="./configs/sl_args.yaml", experiment_id="run_1", rank=0, world_size=4)
     config = load_and_verify(method="rl", input_yaml="./configs/rl_args.yaml", experiment_id="run_2", rank=0)
     config = load_and_verify(method="eval", input_yaml="./configs/eval_args.yaml", experiment_id="run_3", rank=0)
+    config = load_and_verify(method="cl", input_yaml="./configs/cl_args.yaml", experiment_id="run_4", rank=0, world_size=4)

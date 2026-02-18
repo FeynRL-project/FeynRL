@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Optional, Any, List
+from typing import Dict, Any, List, Optional
 from torch.utils.data import Dataset
 
 # local imports
@@ -31,14 +31,17 @@ class ReplayBuffer(Dataset):
             - policy_version: int        --> [Not added to replay buffer for now]
             - loaded_version: int        --> [Not added to replay buffer for now]
             - input_ids: torch.Tensor    --> [T]
-            - rewards: torch.Tensor      --> [T]
-            - zscores: torch.Tensor      --> [T] same as rewards if only one sample per prompt
-            - token_mask: torch.Tensor   --> [T] [Not added to replay buffer for now]
-            - token_done: torch.Tensor   --> [T] [Not added to replay buffer for now]
-            - token_old_logprobs: torch.Tensor --> [T] [Not added to replay buffer for now]
-            - pred_mask: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
-            - pred_done: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
-            - pred_old_logprobs: torch.Tensor --> [T] this is prediction aligned so no need to do any weired indexing
+            # token-aligned  -- NOT USED
+                - token_rewards: torch.Tensor --> [T] [Not added to replay buffer for now]
+                - token_zscores: torch.Tensor --> [T] [Not added to replay buffer for now]
+                - token_masks: torch.Tensor   --> [T] [Not added to replay buffer for now]
+                - token_dones: torch.Tensor   --> [T] [Not added to replay buffer for now]
+                - token_old_logprobs: torch.Tensor --> [T] [Not added to replay buffer for now]
+            # pred-aligned
+                - pred_masks: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
+                - pred_dones: torch.Tensor    --> [T] this is prediction aligned so no need to do any weired indexing
+                - pred_old_logprobs: torch.Tensor --> [T] this is prediction aligned so no need to do any weired indexing
+                - pred_rewards: torch.Tensor --> [T] this is prediction aligned so no need to do any weired indexing
             - finish_reason: str         --> already used for done and mask
             - stop_reason: str           --> already used for done and mask
             - ended_on_eos: bool         --> already used for done and mask
@@ -52,12 +55,11 @@ class ReplayBuffer(Dataset):
                 continue
 
             self.add(input_ids=sample["input_ids"],
-                     rewards=sample["rewards"],
+                     rewards=sample["pred_rewards"],
                      zscores=sample["pred_zscores"],
                      masks=sample["pred_masks"],
                      dones=sample["pred_dones"],
                      old_logprobs=sample["pred_old_logprobs"],
-                     v_olds=sample.get("v_old", None),
                      )
 
     def add(self,
@@ -67,7 +69,6 @@ class ReplayBuffer(Dataset):
             masks: torch.Tensor,
             dones: torch.Tensor,
             old_logprobs: torch.Tensor,
-            v_olds: Optional[torch.Tensor] = None,
             )-> None:
         '''
             input_ids, rewards, zscores, mask, done, old_logprobs
@@ -79,16 +80,12 @@ class ReplayBuffer(Dataset):
         masks     = ensure_1d(masks, "mask")
         dones     = ensure_1d(dones, "dones") # 1=eos, otherwise zero
         old_logps = ensure_1d(old_logprobs, "old_logprobs")
-        if v_olds is not None:
-            v_olds = ensure_1d(v_olds, "v_olds")
 
         # now create attn_masks
         attn_masks = torch.ones_like(input_ids)
 
         # all these should have the same length
         tensors = [input_ids, attn_masks, old_logps, masks, rewards, dones, zscores]
-        if v_olds is not None:
-            tensors.append(v_olds)
 
         all_len = {t.numel() for t in tensors}
         if len(all_len) != 1:
@@ -103,8 +100,6 @@ class ReplayBuffer(Dataset):
         rewards     = rewards[:keep]
         dones       = dones[:keep]
         zscores     = zscores[:keep]
-        if v_olds is not None:
-            v_olds = v_olds[:keep]
 
         # Keep on CPU; dataLoader can pin_memory for faster H2D.
         self.items.append({
@@ -115,7 +110,6 @@ class ReplayBuffer(Dataset):
             "rewards": rewards.detach().cpu(),
             "dones": dones.detach().cpu(),
             "zscores": zscores.detach().cpu(),
-            "v_olds": v_olds.detach().cpu() if v_olds is not None else None,
                         })
 
         # Count only tokens we will ever train on
@@ -136,12 +130,13 @@ class ReplayBuffer(Dataset):
         # pad to batch_max_seq
         input_ids, attn_masks, old_logps = [], [], []
         masks, rewards, dones, zscores = [], [], [], []
-        v_old_list = []
-        empty_v_count = 0
 
         for x in batch:
             # pad everything to zero except for input_ids which should
             # be padded to pad_token_id
+            # attn_mask vs mask:
+            # attn_mask:  [1, 1, 1, 1, 1, 0, 0]   -> prompt + response which all real tokens would be 1 and pad would be zero
+            # masks:      [0, 0, 1, 1, 0, 0, 0]   -> only valid prediction positions
             input_ids.append(pad_1d_to_length(x=x["input_ids"], pad_value=self.pad_token_id, target_len=target_len))
             attn_masks.append(pad_1d_to_length(x=x["attn_masks"], pad_value=0, target_len=target_len))
             old_logps.append(pad_1d_to_length(x=x["old_logps"], pad_value=0.0, target_len=target_len))
@@ -149,13 +144,6 @@ class ReplayBuffer(Dataset):
             rewards.append(pad_1d_to_length(x=x["rewards"], pad_value=0.0, target_len=target_len))
             dones.append(pad_1d_to_length(x=x["dones"], pad_value=0, target_len=target_len))
             zscores.append(pad_1d_to_length(x=x["zscores"], pad_value=0.0, target_len=target_len))
-
-            # if it is None, v_old_list will append None too
-            if x["v_olds"] is not None:
-                v_old_list.append(pad_1d_to_length(x["v_olds"], pad_value=0.0, target_len=target_len))
-
-            else:
-                empty_v_count += 1
 
         # convert from list of [T] to [B, T]
         input_ids   = torch.stack(input_ids, dim=0)
@@ -165,15 +153,6 @@ class ReplayBuffer(Dataset):
         rewards     = torch.stack(rewards, dim=0)
         dones       = torch.stack(dones, dim=0)
         zscores     = torch.stack(zscores, dim=0)
-
-        if empty_v_count == len(batch):
-            v_olds = None
-
-        elif empty_v_count== 0:
-            v_olds = torch.stack(v_old_list, dim=0)
-
-        else:
-            raise ValueError("Mixed None/non-None v_old inside the same batch")
 
         # info for scaling later
         batch_action_tokens = int((masks > 0.5).sum().item())
@@ -189,7 +168,6 @@ class ReplayBuffer(Dataset):
                 "rewards": rewards, # [B, T]
                 "done": dones, # [B, T]
                 "zscore": zscores, # [B, T]
-                "v_olds": v_olds, # [B, T] or None
                 "batch_action_tokens": batch_action_tokens, # scalar int
                 "action_token_weight": action_token_weight, # scalar float
                 }

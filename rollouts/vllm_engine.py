@@ -171,11 +171,10 @@ class VLLMRolloutEngine:
 
         self.log(f"Updating weights directly to version {version}")
 
-        # pickle the state_dict and encode to latin-1 string to pass through vllm rpc safely.
-        # This avoids vllm trying to interpret list of ints or other structures.
-        # This doesn't work so that is why I use pickle.dumps
-        # weights = [(name, tensor) for name, tensor in state_dict.items()]
-        # self.vllm_engine.collective_rpc("update_weights", args=(weights,))
+        # Pickle the state_dict and encode as latin-1 string to pass through vllm's
+        # msgspec-based RPC safely. vllm's RPC mangles bytes/ndarray/tensor types,
+        # but passes strings through reliably. Latin-1 is a lossless 1:1 byte↔char
+        # mapping, and CPython stores latin-1 strings at 1 byte/char internally.
         serialized_state = pickle.dumps(state_dict).decode('latin-1')
         self.vllm_engine.collective_rpc("update_weights", args=(serialized_state,))
         self.loaded_version = version
@@ -338,7 +337,8 @@ class VLLMRolloutEngine:
                         pred_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
                         pred_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
-                        rewards   = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
+                        rewards       = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
+                        pred_rewards  = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
                         # it is important to score the response regardless of its length if it is empty
                         rewards_resp, is_per_token = self.score_response(prompt_data, response)
@@ -371,6 +371,7 @@ class VLLMRolloutEngine:
                             pred_end   = seq_len - 1
                             pred_masks[pred_start:pred_end] = 1
                             pred_old_logprobs[pred_start:pred_end] = response_logprobs
+                            pred_rewards[pred_start:pred_end] = rewards[prompt_len:]
 
                             # Terminal handling:
                             #  1. stop: ended due to EOS or a stop condition so done should be 1.
@@ -393,38 +394,38 @@ class VLLMRolloutEngine:
                         # rollout sample in group if n_samples >= 1
                         # I didn't drop response_len == 0 here as it can be useful for logging, or even reward normalization as
                         # reward function should be designed in such way that it assigns negative rewards for example to empty responses.
-                        group_samples.append({
-                                                "iter": int(current_iter),
-                                                "policy_version": int(policy_version),
-                                                "loaded_version": int(self.loaded_version),
+                        group_samples.append({ "iter": int(current_iter),
+                                               "policy_version": int(policy_version),
+                                               "loaded_version": int(self.loaded_version),
 
-                                                # token-aligned
-                                                "input_ids": input_ids, #[T]
-                                                "rewards": rewards, #[T]
-                                                "zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
-                                                "token_masks": token_masks, #[T] 1 on response/valid tokens
-                                                "token_dones": token_dones, #[T] 1 on last token if terminal
-                                                "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
+                                               # token-aligned
+                                               "input_ids": input_ids, #[T]
+                                               "token_rewards": rewards, #[T]
+                                               "token_zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
+                                               "token_masks": token_masks, #[T] 1 on response/valid tokens
+                                               "token_dones": token_dones, #[T] 1 on last token if terminal
+                                               "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
 
-                                                # pred-aligned
-                                                "pred_masks": pred_masks, #[T]
-                                                "pred_dones": pred_dones, #[T]
-                                                "pred_old_logprobs": pred_old_logprobs, #[T]
+                                               # pred-aligned
+                                               "pred_rewards": pred_rewards, #[T]
+                                               "pred_masks": pred_masks, #[T]
+                                               "pred_dones": pred_dones, #[T]
+                                               "pred_old_logprobs": pred_old_logprobs, #[T]
+                                               "pred_zscores": pred_rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
 
-                                                "finish_reason": finish_reason,
-                                                "stop_reason": stop_reason,
-                                                "ended_on_eos": ended_on_eos,
+                                               "finish_reason": finish_reason,
+                                               "stop_reason": stop_reason,
+                                               "ended_on_eos": ended_on_eos,
 
-                                                "response_ids": response_ids, # list[int]
-                                                "prompt_ids": prompt_ids, # list[int]
-                                                "response_text": getattr(response, "text", ""),
-                                                "response_len": response_len,
+                                               "response_ids": response_ids, # list[int]
+                                               "prompt_ids": prompt_ids, # list[int]
+                                               "response_text": getattr(response, "text", ""),
+                                               "response_len": response_len,
                                                 })
-                    self.normalize_rewards(
-                                            samples=group_samples,
-                                            stats=group_stats,
-                                            prompt_len=prompt_len,
-                                            is_per_token=is_per_token)
+                    self.normalize_rewards(samples=group_samples,
+                                           stats=group_stats,
+                                           prompt_len=prompt_len,
+                                           is_per_token=is_per_token)
                     rollout_samples.extend(group_samples)
 
                 return rollout_samples
@@ -470,7 +471,7 @@ class VLLMRolloutEngine:
             # For a single sample, we don't normalize (i.e. advantage is 0 if we subtract mean)
             # but usually for n=1 we keep the raw reward.
             mean_scores = 0.0
-            std_scores  = 1.0 - self.eps_reward_norm
+            std_scores  = 1.0
 
         if is_per_token:
             raise ValueError("per token rewards are not supported yet as normalization is done assuming per response rewards")
@@ -479,18 +480,18 @@ class VLLMRolloutEngine:
         for i, sample in enumerate(samples):
             # sample['reward']: [T] where prompt tokens would get 0
             # sample['reward'][-1]: means the last token reward
-            zscore = torch.zeros_like(sample['rewards'], dtype=torch.float)
-            zscore[-1] = (sample['rewards'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
-            sample["zscores"] = zscore
+            zscore = torch.zeros_like(sample['token_rewards'], dtype=torch.float)
+            zscore[-1] = (sample['token_rewards'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
+            sample["token_zscores"] = zscore
             if self.reward_broadcast:
-                sample["zscores"][prompt_len:] = zscore[-1]
+                sample["token_zscores"][prompt_len:] = zscore[-1]
 
             # prediction-aligned zscores
             # zscore[prompt_len:] corresponds to response tokens 0..N-1
-            pred_zscores = torch.zeros_like(sample['rewards'], dtype=torch.float)
+            pred_zscores = torch.zeros_like(sample['token_zscores'], dtype=torch.float)
             pred_start = prompt_len - 1
-            pred_end   = len(sample['rewards']) - 1
-            pred_zscores[pred_start:pred_end] = sample["zscores"][prompt_len:]
+            pred_end   = len(sample['token_zscores']) - 1
+            pred_zscores[pred_start:pred_end] = sample["token_zscores"][prompt_len:]
             sample["pred_zscores"] = pred_zscores
 
 if __name__ == "__main__":
@@ -499,8 +500,10 @@ if __name__ == "__main__":
     ray.init(local_mode=True)
     tokenizer = AutoTokenizer.from_pretrained('google/gemma-3-1b-it')
 
-    def default_reward_func(prompt_ids, response_ids, finish_reason):
+    def default_reward_func(prompt, response):
         is_per_token = False
+        response_ids = response.token_ids
+        finish_reason = getattr(response, "finish_reason", None)
         r = torch.zeros((len(response_ids),), dtype=torch.float32)
 
         if len(response_ids) == 0:
@@ -528,7 +531,9 @@ if __name__ == "__main__":
                                     eos_id=tokenizer.eos_token_id,
                                     reward_broadcast=True,
                                     eps_reward_norm=1e-8,
-                                    gpu_memory_utilization=0.5)
+                                    gpu_memory_utilization=0.5,
+                                    engine_id=0,
+                                    model_dtype='bfloat16')
 
     dummy_data = ["Hello, how are you?",
                   "Summer is the best season!",
@@ -543,5 +548,8 @@ if __name__ == "__main__":
                                         return_tensors=None,
                                         )
         samples_ids.append({"prompt_token_ids": prompt_ids})
-    output = vllm.generate.remote(samples_ids, 1, 0)
+    output_ref = vllm.generate.remote(samples_ids, 1, 0)
+    output = ray.get(output_ref)
     print(output)
+    print('Done')
+    ray.shutdown()

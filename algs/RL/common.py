@@ -14,8 +14,8 @@ class COMMON:
             Helper to load a single model from HuggingFace.
         '''
         assert dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-        assert self.attn_impl=='' or self.attn_impl in ['eager', 'flash_attention_2'], \
-            "attn_impl must be one of 'eager', 'flash_attention_2' or empty string"
+        assert self.attn_impl is None or self.attn_impl == '' or self.attn_impl in ['eager', 'flash_attention_2'], \
+            "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
 
         config = AutoConfig.from_pretrained(model_path)
         model  = AutoModelForCausalLM.from_pretrained(
@@ -47,23 +47,27 @@ class COMMON:
         models = self.load_model()
 
         # Unpack models flexibly
-        policy_model = models[0]
-        ref_model = models[1] if len(models) > 1 and models[1] is not None else None
-        value_model = models[2] if len(models) > 2 and models[2] is not None else None
+        policy_model = models["policy_model"]
+        ref_model    = models["ref_model"] if "ref_model" in models and models["ref_model"] is not None else None
+        value_model  = models["value_model"] if "value_model" in models and models["value_model"] is not None else None
 
         # Log model paths
         if value_model is not None:
-            # PPO case
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Models loaded: {self.pi_model_path} {self.vf_model_path} {self.ref_model_path}")
+            # PPO has separate value model
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Models loaded: policy={self.model_path}, value={self.value_model_path}, ref={self.ref_model_path}")
 
         else:
-            # SGRPO/CISPO case
+            # SGRPO/CISPO has policy only
             print(f"[Alg:{self.alg_name}][Rank {rank}] Model loaded: {self.model_path}")
 
         # Enable gradient checkpointing on the HF model before DS wrapping
         if self.gradient_checkpointing:
             policy_model.gradient_checkpointing_enable()
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Gradient checkpointing enabled")
+            if value_model is not None:
+                value_model.gradient_checkpointing_enable()
+
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gradient checkpointing enabled"
+                  f"{' (policy + value)' if value_model is not None else ''}")
 
         # Initialize policy engine
         self.policy_engine, self.policy_optimizer , _, _ = deepspeed.initialize(
@@ -84,12 +88,15 @@ class COMMON:
                                                     )
             print(f"[Alg:{self.alg_name}][Rank {rank}] Reference model initialized with DeepSpeed")
 
-        # Initialize value model if provided (PPO only)
+        # Initialize value model
         if value_model is not None:
+            # Use separate DS config for value model if available (different lr, weight decay, grad clip)
+            value_ds_config = self.deepspeed_value_config
+            value_ds_dict = value_ds_config.model_dump() if value_ds_config is not None else ds_config_dict
             self.value_engine, self.value_optimizer, _, _ = deepspeed.initialize(
                                                     model=value_model,
                                                     model_parameters=value_model.parameters(),
-                                                    config=ds_config_dict
+                                                    config=value_ds_dict
                                                     )
             print(f"[Alg:{self.alg_name}][Rank {rank}] Value model initialized with DeepSpeed")
 
@@ -122,7 +129,8 @@ class COMMON:
         # cross_entropy return -logprobs but we need logprobs
         # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
         # target_ids is [B, T-1] --> [B * (T-1)]
-        neg_logprobs = self.cross_entropy(logits.view(-1, vocab_size), target_ids.view(-1))
+        # Compute token logprobs in float32 to avoid bf16/fp16 quantization
+        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
         logprobs = -neg_logprobs.view(B, T_minus_1)
         # we can also do this, but it is less efficient I guess
         #   logprobs = logits.log_softmax(dim=-1)
@@ -130,17 +138,16 @@ class COMMON:
 
         entropies = None
         if self.ent_coeff > 0.0:
-            entropies = torch.distributions.Categorical(logits=logits).entropy()
+            entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
 
         return logprobs, entropies, target_ids
 
-    def ref_forward(self, input_ids, att_mask, target_ids, pos_ids):
+    def ref_forward(self, input_ids, att_mask, pos_ids):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
-            target_ids is [B, T-1]
             Returns:
-                logits is [B, T-1, vocab_size]
+                ref_logprobs is [B, T-1]
         '''
         # feed data to model
         with torch.no_grad():
@@ -157,10 +164,14 @@ class COMMON:
             logits = output.logits[:, :-1, :].contiguous()
             B, T_minus_1, vocab_size = logits.shape
 
+            # [B, T] -> [B, T-1]
+            target_ids = input_ids[:, 1:].contiguous()
+
             # cross_entropy return -logprobs but we need logprobs
             # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
             # target_ids is [B, T-1] --> [B * (T-1)]
-            neg_logprobs = self.cross_entropy(logits.view(-1, vocab_size), target_ids.view(-1))
+            # Match policy path: keep logprob computation in float32 for KL stability.
+            neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
             ref_logprobs = -neg_logprobs.view(B, T_minus_1)
 
         return ref_logprobs
@@ -172,9 +183,17 @@ class COMMON:
             kl = E[log pi/pi_ref] + pi_ref/pi - 1
         '''
         # [B, T-1]
+        # Perform KL math in float32 for numerical stability under bf16/fp16.
+        logprobs = logprobs.to(torch.float32)
+        ref_logprobs = ref_logprobs.to(torch.float32)
+
         log_ratio = logprobs - ref_logprobs
         # pi_ref/pi = exp(ref_logprobs - logprobs)
-        ratio_inv = torch.exp(ref_logprobs - logprobs)
+        exponent = ref_logprobs - logprobs
+        if exponent.max().item() > 10.0:
+            print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
+
+        ratio_inv = torch.exp(exponent)
         kl_dist = log_ratio + ratio_inv - 1
         return kl_dist
 
@@ -207,13 +226,9 @@ class COMMON:
                 if hasattr(self.policy_engine.module, 'config'):
                     self.policy_engine.module.config.save_pretrained(output_dir)
                     print(f"[Alg:{self.alg_name}][Rank {rank}] Policy config saved")
+
                 else:
-                    # fallback by trying to get config from the model itself
-                    if hasattr(self.policy_engine.module, 'module'):
-                        # wrapped model e.g., deepspeed wrapper
-                        if hasattr(self.policy_engine.module.module, 'config'):
-                            self.policy_engine.module.module.config.save_pretrained(output_dir)
-                            print(f"[Alg:{self.alg_name}][Rank {rank}] Policy config saved (fallback)")
+                    print(f"[Alg:{self.alg_name}][Rank {rank}] WARNING: Could not find model config to save for policy")
 
             # Make sure rank 0 finished writing policy config
             if torch.distributed.is_initialized():
@@ -236,13 +251,9 @@ class COMMON:
                     if hasattr(self.value_engine.module, 'config'):
                         self.value_engine.module.config.save_pretrained(value_output_dir)
                         print(f"[Alg:{self.alg_name}][Rank {rank}] Value config saved")
+
                     else:
-                        # fallback by trying to get config from the model itself
-                        if hasattr(self.value_engine.module, 'module'):
-                            # wrapped model e.g., deepspeed wrapper
-                            if hasattr(self.value_engine.module.module, 'config'):
-                                self.value_engine.module.module.config.save_pretrained(value_output_dir)
-                                print(f"[Alg:{self.alg_name}][Rank {rank}] Value config saved (fallback)")
+                        print(f"[Alg:{self.alg_name}][Rank {rank}] WARNING: Could not find model config to save for value")
 
                 # Make sure rank 0 finished writing value config
                 if torch.distributed.is_initialized():
@@ -260,9 +271,11 @@ class COMMON:
 
     def gather_state_dict(self):
         '''
-            Gather ZeRO-3 partitioned policy weights into a full state_dict on rank 0.
-            Must be called on ALL ranks, as each rank participates in the ZeRO-3 gather.
-            However, only rank 0 returns the actual state_dict and others return {}.
+            Gather policy weights into a full state_dict on rank 0.
+            Works for all ds stages (0/1/2/3):
+              - Stage 0/1/2: params are already full on each rank, so rank 0 copies directly.
+              - Stage 3: uses GatheredParameters to collect partitioned params before copying.
+            Only rank 0 returns the actual state_dict; others return {}.
             This is used for direct sync of weights with vllm rather than saving them on disk.
 
             Returns:
@@ -272,23 +285,32 @@ class COMMON:
         state_dict = {}
 
         # 1. Get all parameters
+        # Must be called on ALL ranks as zero-3 requires collective participation.
         params = []
         names = []
         for name, param in self.policy_engine.module.named_parameters():
             params.append(param)
             names.append(name)
 
-        # 2. Gather all parameters in a single collective call
-        # This is much faster than gathering them one by one
-        with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+        # 2. Check if we're using stage-3 where parameters are partitioned
+        is_zero3 = hasattr(params[0], 'ds_id') if params else False
+
+        if is_zero3:
+            # gather partitioned parameters in a single collective call
+            with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+                if rank == 0:
+                    for name, param in zip(names, params):
+                        # .data avoids autograd overhead.
+                        # .cpu().clone() ensures the tensor lives in CPU memory and is independent of the
+                        # ZeRO-3 partition buffer which gets freed after the context.
+                        state_dict[name] = param.data.cpu().clone()
+        else:
+            # Stages 0/1/2: params are already full, just copy on rank 0
             if rank == 0:
                 for name, param in zip(names, params):
-                    # .data avoids autograd overhead.
-                    # .cpu().clone() ensures the tensor lives in CPU memory and is independent of the
-                    # ZeRO-3 partition buffer which gets freed after the context.
                     state_dict[name] = param.data.cpu().clone()
 
         if rank == 0:
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict!")
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (zero3={is_zero3})!")
 
         return state_dict

@@ -3,11 +3,9 @@ import numpy as np
 from tqdm import tqdm
 from typing import Any
 import ray
-import deepspeed
 
-# Since the following functions are the same for all algorithms
-# we load them from common.py:
-# _load_single_model, init_training_engine,policy_forward,
+# load follwoings from common.py:
+# _load_single_model, init_training_engine, policy_forward,
 # ref_forward, compute_kl_distance, save_checkpoint
 from algs.RL.common import COMMON
 
@@ -80,7 +78,7 @@ class SGRPO(COMMON):
         else:
             ref_model = None
 
-        return model, ref_model
+        return {"policy_model": model, "ref_model": ref_model}
 
     def compute_policy_loss(self,
                             logprobs: torch.Tensor,
@@ -107,11 +105,14 @@ class SGRPO(COMMON):
         # 1. make sure advantages are detached and
         # convert to float32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
-        mask = (mask.to(device=device) > 0.5).to(dtype=dtype)
+        mask_bool = (mask.to(device=device) > 0.5)
+        mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
         # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
-        logratio = (logprobs - old_logprobs).to(torch.float32)
+        raw_logratio = (logprobs - old_logprobs).to(torch.float32)
+        # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
+        logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
         ratio   = torch.exp(logratio)
 
         # 3. compute loss: -(min(ratio * adv, clip_adv)) * mask
@@ -125,6 +126,8 @@ class SGRPO(COMMON):
 
         if ref_logprobs is not None and self.kl_coeff > 0.0:
             kl_dist = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=ref_logprobs)
+            # avoid calculating kl for padded tokens.
+            kl_dist = torch.where(mask_bool, kl_dist, torch.zeros_like(kl_dist))
             kl_ref  = (kl_dist * mask).sum() / denom
 
         loss_total = loss_pi - self.ent_coeff * loss_ent + self.kl_coeff * kl_ref
@@ -146,10 +149,10 @@ class SGRPO(COMMON):
             # save the metrics for debugging
             metrics = {
                 'clipfrac': clipfrac.item(),
-                'kl_old': approx_kl.item(),
-                'loss_ent': loss_ent.item(),
-                'loss_pi': loss_pi.item(),
-                'loss_total': loss_total.item(),
+                'approx_kl': approx_kl.item(),
+                'ent_loss': loss_ent.item(),
+                'pi_loss': loss_pi.item(),
+                'pi_loss_total': loss_total.item(),
                 'kl_ref': kl_ref.item(),
             }
 
@@ -192,6 +195,7 @@ class SGRPO(COMMON):
             # of the shard. Otherwise, we respect ga_pi.
             if self.update_only_after_full_replay:
                 is_boundary = is_last
+
             else:
                 is_boundary = (((step + 1) % ga_pi) == 0) or is_last
 
@@ -203,7 +207,6 @@ class SGRPO(COMMON):
             # this is a simple baseline for policy gradients (PPO in this code) as it reflects relative quality
             # among that prompt’s samples.
             advs      = micro_batch['zscore'][:, :-1].to(device, non_blocking=True)
-            #done      = micro_batch['done'][:, :-1].to(device, non_blocking=True)
             mask      = micro_batch['mask'][:, :-1].to(device, non_blocking=True)
             old_logprobs = micro_batch['old_logprobs'][:, :-1].to(device, non_blocking=True)
 
@@ -223,7 +226,6 @@ class SGRPO(COMMON):
             if self.kl_coeff > 0.0 and self.ref_model_engine is not None:
                 ref_logprobs = self.ref_forward(input_ids=input_ids,
                                                 att_mask=att_mask,
-                                                target_ids=target_ids,
                                                 pos_ids=pos_ids,
                                                 )
 
@@ -239,9 +241,9 @@ class SGRPO(COMMON):
             all_metrics.append(pi_metrics)
             if engine_id == 0:
                 progress_bar.set_postfix({
-                    "loss": f"{pi_loss.item():.4f}",
-                    "clip": f"{pi_metrics['clipfrac']:.3f}",
-                    "kl_old": f"{pi_metrics['kl_old']:.4f}",
+                    "pi_loss": f"{pi_loss.item():.4f}",
+                    "clipfrac": f"{pi_metrics['clipfrac']:.3f}",
+                    "approx_kl": f"{pi_metrics['approx_kl']:.4f}",
                     "kl_ref": f"{pi_metrics['kl_ref']:.4f}"
                 })
 

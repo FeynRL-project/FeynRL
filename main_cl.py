@@ -14,7 +14,7 @@ import time
 
 # imports local methods, classes, etc.
 import configs.load as cfg# all config arguments
-from data_feeds.paired import PairedFeed
+from data_feeds.preference import PreferenceFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm
 from misc.logging import setup_logging, setup_viz
@@ -22,7 +22,7 @@ from misc.logging import setup_logging, setup_viz
 
 Algorithm_Registry = {
     # supported algorithms
-    'sft': ('algs.SFT.sft', 'SFT'),
+    'dpo': ('algs.DPO.dpo', 'DPO'),
 }
 
 def set_random_seeds(seed):
@@ -65,7 +65,7 @@ def init_rank_world_size():
 
     return rank, world_size, local_rank
 
-def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_impl, rank):
+def load_models_and_tokenizer(model_name, model_dtype, ref_model_name,trust_remote_code, attn_impl, rank):
     '''
         Load models and tokenizer.
     '''
@@ -82,10 +82,19 @@ def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_i
                                                 trust_remote_code=trust_remote_code,
                                                 config=model_config,
                                                 attn_implementation=None if attn_impl == '' else attn_impl)
+    # 2. load reference model
+    if ref_model_name is None:
+        ref_model_name = model_name
 
-    # 2. Tokenizer initialization
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=trust_remote_code)
+    ref_model_config = AutoConfig.from_pretrained(ref_model_name)
+    ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
+                                                        dtype=model_dtype,
+                                                        trust_remote_code=trust_remote_code,
+                                                        config=ref_model_config,
+                                                        attn_implementation=None if attn_impl == '' else attn_impl)
+
+    # 3. Tokenizer initialization
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
 
     # if pad token is not present, we use eos token as pad token
     # log warning if pad token is not present.
@@ -101,15 +110,16 @@ def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_i
             # fallback to eos token id
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    return model, tokenizer
+    return model, ref_model, tokenizer
 
-def create_training_engine(deepspeed_config, model):
+def create_training_engine(deepspeed_config, deepspeed_ref_config, model, ref_model):
     '''
         This function is responsible for setting up distributed training engine.
         For now, it only supports deepspeed.
     '''
     # Convert pydantic model to python Dict for DeepSpeed
     ds_config_dict = deepspeed_config.model_dump()
+    ds_ref_config_dict = deepspeed_ref_config.model_dump()
 
     # check to avoid re-initializing distributed backend
     if not torch.distributed.is_initialized():
@@ -117,12 +127,15 @@ def create_training_engine(deepspeed_config, model):
         deepspeed.init_distributed()
 
     # 2. Initialize model engine
-    model_engine, optimizer, _, _ = deepspeed.initialize(
-                                                        model=model,
-                                                        model_parameters=model.parameters(),
-                                                        config=ds_config_dict
+    model_engine, optimizer, _, _ = deepspeed.initialize(model=model,
+                                                         model_parameters=model.parameters(),
+                                                         config=ds_config_dict
                                                         )
-    return model_engine, optimizer
+
+    ref_model.eval()
+    ref_model_engine, _, _, _ = deepspeed.initialize(model=ref_model, config=ds_ref_config_dict)
+
+    return model_engine, ref_model_engine, optimizer
 
 def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     '''
@@ -147,7 +160,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                                   world_size=world_size,
                                                   seed=params.run.seed,
                                                   local_batch_size=batch_size,
-                                                  dataset_cls=PairedFeed,
+                                                  dataset_cls=PreferenceFeed,
                                                   steps_per_epoch=steps_per_epoch,
                                                   shuffle_within_batch=True,
                                                   dynamic_ratio_every_step=params.train.dynamic_ratio_every_step)
@@ -196,7 +209,7 @@ if __name__ == "__main__":
     ########
     # 2. Load config and other misc. setup
     ########
-    config = cfg.load_and_verify(method="sl",
+    config = cfg.load_and_verify(method="cl",
                                  input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
                                  world_size=world_size,
@@ -211,8 +224,9 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+    model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
                                                  model_dtype=config.model.dtype,
+                                                 ref_model_name=config.model.ref_model,
                                                  trust_remote_code=config.model.trust_remote_code,
                                                  attn_impl=config.model.attn_implementation,
                                                  rank=rank)
@@ -224,7 +238,10 @@ if __name__ == "__main__":
         logger.info("Gradient checkpointing enabled")
         model.gradient_checkpointing_enable()
 
-    model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed, model=model)
+    model_engine, ref_model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed,
+                                                                       deepspeed_ref_config=config.deepspeed_ref,
+                                                                       model=model,
+                                                                       ref_model=ref_model)
 
     ########
     # 6. Build env or data loader
@@ -248,8 +265,10 @@ if __name__ == "__main__":
     ########
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
     alg = alg_class(model_engine=model_engine,
+                    ref_model_engine=ref_model_engine,
                     optimizer=optimizer,
-                    normalize_loss=config.train.normalize_loss)
+                    normalize_loss=config.train.normalize_loss,
+                    beta=config.train.cl_beta)
 
     ########
     # 8. Training and evaluation loop
@@ -323,10 +342,17 @@ if __name__ == "__main__":
 
             # logging
             if rank == 0:
-                progress_bar.set_postfix(loss=metric['loss'])
+                progress_bar.set_postfix({'loss': metric['loss'],
+                                           'chosen_rewards': metric['chosen_rewards'],
+                                           'rejected_rewards': metric['rejected_rewards'],
+                                           'reward_accuracies': metric['reward_accuracies'],
+                                           })
                 if mlflow_run and model_engine.is_gradient_accumulation_boundary():
                     mlflow.log_metrics({
                         "train/loss": metric['loss'],
+                        "train/chosen_rewards": metric['chosen_rewards'],
+                        "train/rejected_rewards": metric['rejected_rewards'],
+                        "train/reward_accuracies": metric['reward_accuracies'],
                     }, step=global_step)
 
         # Sync before validation to ensure consistent state
@@ -343,28 +369,27 @@ if __name__ == "__main__":
         ########
         # 8.2 Validation loop
         ########
-        # to be safe and caculate loss average across batches and across GPUs correctly, we use
-        # the following method: sum total loss and total tokens, then divide.
+        # DPO eval_step returns per-batch metrics (loss, chosen_rewards, rejected_rewards, reward_accuracies).
+        # We accumulate and average across batches and GPUs.
         local_loss_sum   = torch.tensor(0.0, device=model_engine.device)
-        local_token_count = torch.tensor(0.0, device=model_engine.device)
+        local_batch_count = torch.tensor(0.0, device=model_engine.device)
 
         for data in val_dataloader:
             val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
             val_metric = alg.eval_step(val_batch)
-            local_loss_sum += float(val_metric['loss_sum'])
-            local_token_count += float(val_metric['num_tokens'])
+            local_loss_sum += val_metric['loss']
+            local_batch_count += 1.0
 
         # Aggregate across all ranks.
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(local_loss_sum, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(local_token_count, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(local_batch_count, op=torch.distributed.ReduceOp.SUM)
 
         # Avoid division by zero
-        if local_token_count.item() == 0:
+        if local_batch_count.item() == 0:
             global_avg_loss = 0.0
-
         else:
-            global_avg_loss = (local_loss_sum / local_token_count).item()
+            global_avg_loss = (local_loss_sum / local_batch_count).item()
 
         if rank == 0:
             print(f"Epoch {epoch+1}, Validation Loss: {global_avg_loss}")

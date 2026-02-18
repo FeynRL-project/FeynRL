@@ -25,10 +25,9 @@ def extract_solution(solution_str):
     '''
        This extracts solution from the answer.
     '''
-    solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
+    solution = re.search(r"####\s*(-?[0-9.,]+)", solution_str)
     assert solution is not None
-    final_solution = solution.group(0)
-    final_solution = final_solution.split("#### ")[1].replace(",", "")
+    final_solution = solution.group(1).replace(",", "").replace("$", "").replace("\n", "")
     return final_solution
 
 def make_map_fn(split, params):

@@ -3,7 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 import os
 from datasets import load_dataset
 
-class PairedFeed(Dataset):
+class PreferenceFeed(Dataset):
     '''
         This is a general dataset to handle prompt and answer pairs.
         The data should be in a parquet format and system prompt is optional.
@@ -28,7 +28,8 @@ class PairedFeed(Dataset):
         assert tokenizer.eos_token_id is not None, "tokenizer must have an eos token"
 
         self.prompt_key = prompt_key
-        self.answer_key = answer_key
+        self.chosen_key = answer_key
+        self.rejected_key = "rejected_" + self.chosen_key
         self.max_seq_len = max_seq_len
         self.tokenizer = tokenizer
         self.data_path = data_path
@@ -86,6 +87,7 @@ class PairedFeed(Dataset):
                                  ...
                                  ],
                       "answer": "this is an answer",
+                      "rejected_answer": "this is a rejected answer",
             }
           Loss is computed on all assistant responses including the final answer.
         '''
@@ -96,27 +98,31 @@ class PairedFeed(Dataset):
         if self.prompt_key not in current_sample:
             raise KeyError(f"Missing key '{self.prompt_key}' in sample {current_sample}: keys={list(current_sample.keys())}")
 
-        if self.answer_key not in current_sample:
-            raise KeyError(f"Missing key '{self.answer_key}' in sample {current_sample}: keys={list(current_sample.keys())}")
+        if self.chosen_key not in current_sample:
+            raise KeyError(f"Missing key '{self.chosen_key}' in sample {current_sample}: keys={list(current_sample.keys())}")
+
+        if self.rejected_key not in current_sample:
+            raise KeyError(f"Missing key '{self.rejected_key}' in sample {current_sample}: keys={list(current_sample.keys())}")
+
 
         message = current_sample[self.prompt_key]
-        answer  = current_sample[self.answer_key]
+        chosen_answer  = current_sample[self.chosen_key]
+        rejected_answer = current_sample[self.rejected_key]
 
         # message cannot be empty
         if not message or (isinstance(message, list) and len(message) == 0):
             raise ValueError(f"Sample {idx}:{current_sample}: Prompt/message cannot be empty")
 
         # answer cannot be empty
-        if not answer or (isinstance(answer, str) and answer.strip() == ""):
+        if not chosen_answer or (isinstance(chosen_answer, str) and chosen_answer.strip() == ""):
             raise ValueError(f"Sample {current_sample}: Answer cannot be empty or whitespace-only")
 
-        if len(message) == 1 or (len(message) == 2 and message[0]['role'] == 'system' and message[1]['role'] == 'user'):
-            return self._get_single_turn(idx, message, answer)
+        if not rejected_answer or (isinstance(rejected_answer, str) and rejected_answer.strip() == ""):
+            raise ValueError(f"Sample {current_sample}: Answer cannot be empty or whitespace-only")
 
-        else:
-            return self._get_multi_turns(idx, message, answer)
+        return self._get_sample(idx, message, chosen_answer, rejected_answer)
 
-    def _get_single_turn(self, idx, message, answer):
+    def _get_sample(self, idx, message, chosen_answer, rejected_answer):
         '''
            Handles a single turn of the conversation.
         '''
@@ -137,16 +143,65 @@ class PairedFeed(Dataset):
                              f"prompt must be at most {self.max_seq_len} tokens (got {prompt_len})")
 
         # 3. Tokenize answer + add EOS
-        answer_ids, answer_attn_mask = self._process_answer(answer)
+        chosen_answer_ids, chosen_answer_attn_mask = self._process_answer(chosen_answer)
+        rejected_answer_ids, rejected_answer_attn_mask = self._process_answer(rejected_answer)
 
         # 4. Build sequence
-        seq_ids = torch.cat((prompt_ids, answer_ids), dim=-1).to(dtype=torch.long)
-        seq_attn_mask = torch.cat((prompt_attn_mask, answer_attn_mask), dim=-1)
-        total_seq_len = len(seq_ids)
+        chosen_seq_ids = torch.cat((prompt_ids, chosen_answer_ids), dim=-1).to(dtype=torch.long)
+        chosen_seq_attn_mask = torch.cat((prompt_attn_mask, chosen_answer_attn_mask), dim=-1)
+        chosen_total_seq_len = len(chosen_seq_ids)
+        chosen_seq_ids, chosen_seq_attn_mask = self._check_seq(message=message,
+                                                              prompt_len=prompt_len,
+                                                              total_seq_len=chosen_total_seq_len,
+                                                              seq_ids=chosen_seq_ids,
+                                                              seq_attn_mask=chosen_seq_attn_mask)
 
+        rejected_seq_ids = torch.cat((prompt_ids, rejected_answer_ids), dim=-1).to(dtype=torch.long)
+        rejected_seq_attn_mask = torch.cat((prompt_attn_mask, rejected_answer_attn_mask), dim=-1)
+        rejected_total_seq_len = len(rejected_seq_ids)
+
+        rejected_seq_ids, rejected_seq_attn_mask = self._check_seq(message=message,
+                                                                  prompt_len=prompt_len,
+                                                                  total_seq_len=rejected_total_seq_len,
+                                                                  seq_ids=rejected_seq_ids,
+                                                                  seq_attn_mask=rejected_seq_attn_mask)
+
+        # Labels are created by shifting seq_ids by one position, so they'll have length T-1.
+        # Therefore, the loss mask must also be of shape [T-1].
+        # We don't need to worry about padding tokens as they are already handled by seq_attn_mask if any (pads are zero).
+        chosen_loss_mask = chosen_seq_attn_mask[1:].clone()
+        rejected_loss_mask = rejected_seq_attn_mask[1:].clone()
+
+        # Mask out prompt tokens.
+        # Since labels are shifted by one position, the prompt appears in indices
+        # [:len(prompt_ids) - 1] in the label sequence (not [:len(prompt_ids)]).
+        if prompt_len > 1:
+            chosen_loss_mask[:prompt_len - 1] = 0
+            rejected_loss_mask[:prompt_len - 1] = 0
+
+        # After masking, we should have at least 1 unmasked answer token
+        if chosen_loss_mask.sum().item() == 0 or rejected_loss_mask.sum().item() == 0:
+            raise ValueError(f"Sample {idx}:{message}: No training tokens left after masking "
+                         f"Prompt length: {len(prompt_ids)}, Chosen length: {len(chosen_answer_ids)}, "
+                         f"Rejected length: {len(rejected_answer_ids)}.")
+        
+        # [2, T]
+        all_input_ids = torch.stack([chosen_seq_ids, rejected_seq_ids], dim=0) # T
+        all_attn_mask = torch.stack([chosen_seq_attn_mask, rejected_seq_attn_mask], dim=0)
+        # [2, T-1]
+        all_loss_mask = torch.stack([chosen_loss_mask, rejected_loss_mask], dim=0) # [T-1
+
+        return {
+            "input_ids": all_input_ids, # [2, T]
+            "attn_mask": all_attn_mask, # [2, T]
+            "loss_mask": all_loss_mask, # [2, T-1]
+        }
+
+    def _check_seq(self, message, prompt_len, total_seq_len, seq_ids, seq_attn_mask):
+        
         # 5. Validate minimum sequence length
         if total_seq_len < 2:
-            raise ValueError(f"Sequence too short: prompt + answer must be at least 2 tokens (got {total_seq_len})")
+            raise ValueError(f"{message}: Sequence too short: prompt + answer must be at least 2 tokens (got {total_seq_len})")
 
         # 6. length check
         if total_seq_len > self.max_seq_len:
@@ -177,142 +232,7 @@ class PairedFeed(Dataset):
             padding_attn_mask = torch.zeros(size=(padding_len,), dtype=seq_attn_mask.dtype)
             seq_attn_mask = torch.cat((seq_attn_mask, padding_attn_mask), dim=-1)
 
-        # Labels are created by shifting seq_ids by one position, so they'll have length T-1.
-        # Therefore, the loss mask must also be of shape [T-1].
-        # We don't need to worry about padding tokens as they are already handled by seq_attn_mask if any (pads are zero).
-        loss_mask = seq_attn_mask[1:].clone()
-
-        # Mask out prompt tokens.
-        # Since labels are shifted by one position, the prompt appears in indices
-        # [:len(prompt_ids) - 1] in the label sequence (not [:len(prompt_ids)]).
-        if prompt_len > 1:
-            loss_mask[:prompt_len - 1] = 0
-
-        # After masking, we should have at least 1 unmasked answer token
-        if loss_mask.sum().item() == 0:
-            raise ValueError(f"Sample {idx}:{message}: No training tokens left after masking "
-                         f"Prompt length: {len(prompt_ids)}, Answer length: {len(answer_ids)}, "
-                         f"Total length: {total_seq_len}.")
-
-        return {
-            "input_ids": seq_ids, # T
-            "attn_mask": seq_attn_mask, # T
-            "loss_mask": loss_mask, # T-1
-        }
-
-    def _get_multi_turns(self, idx, message, answer):
-        '''
-            Handles multi-turn conversations
-        '''
-        # 1. Tokenize incrementally to track assistant response boundaries to handle loss masking
-        # We need to find where each assistant response starts/ends in the token sequence
-        assistant_ranges = []  # list of (start_idx, end_idx) for assistant content
-        current_len = 0
-
-        for i, turn in enumerate(message):
-            # Tokenize conversation up to and including this turn
-            conversation_so_far = message[:i + 1]
-            # When tokenize=True and return_tensors='pt', it returns shape [1, seq_len]
-            # [0]: [1, seq_len] -> [seq_len]
-            tokens_so_far = self.tokenizer.apply_chat_template(conversation=conversation_so_far,
-                                                               add_generation_prompt=False, # no generation prompt for intermediate turns
-                                                               tokenize=True,
-                                                               return_tensors='pt'
-                                                               )[0]
-            new_len = len(tokens_so_far)
-
-            if turn.get("role") == "assistant":
-                # This range corresponds to the assistant's response (including any formatting)
-                assistant_ranges.append((current_len, new_len))
-
-            current_len = new_len
-
-        # 2. Tokenize the full prompt with generation prompt for the final answer
-        prompt_ids = self.tokenizer.apply_chat_template(conversation=message,
-                                                        add_generation_prompt=True, # add generation prompt for final answer
-                                                        tokenize=True,
-                                                        return_tensors='pt'
-                                                        )[0]
-        prompt_attn_mask = torch.ones_like(prompt_ids)
-        prompt_len       = len(prompt_ids)
-
-        # 3. Validate prompt length
-        if prompt_len >= self.max_seq_len or prompt_len == 0:
-            raise ValueError(f"Prompt in sample {idx}:{message}: too long or empty: "
-                             f"prompt must be at most {self.max_seq_len} tokens (got {prompt_len})")
-
-        # 4. Tokenize answer + add EOS
-        answer_ids, answer_attn_mask = self._process_answer(answer)
-
-        # Add final answer range (starts at prompt_len, ends at prompt_len + answer_len)
-        assistant_ranges.append((prompt_len, prompt_len + len(answer_ids)))
-
-        seq_ids = torch.cat((prompt_ids, answer_ids), dim=-1).to(dtype=torch.long)
-        seq_attn_mask = torch.cat((prompt_attn_mask, answer_attn_mask), dim=-1)
-        total_seq_len = len(seq_ids)
-
-        # 5. Validate minimum sequence length
-        if total_seq_len < 2:
-            raise ValueError(f"Sequence too short: prompt + answer must be at least 2 tokens (got {total_seq_len})")
-
-        # 6. Length check - truncate if necessary
-        if total_seq_len > self.max_seq_len:
-            seq_ids = seq_ids[:self.max_seq_len]
-            seq_attn_mask = seq_attn_mask[:self.max_seq_len]
-            total_seq_len = len(seq_ids)
-
-            # Adjust assistant ranges for truncation
-            adjusted_ranges = []
-            for start, end in assistant_ranges:
-                if start < self.max_seq_len:
-                    adjusted_ranges.append((start, min(end, self.max_seq_len)))
-            assistant_ranges = adjusted_ranges
-
-            # Check we have at least some assistant tokens after truncation
-            total_assistant_tokens = sum(end - start for start, end in assistant_ranges)
-            if total_assistant_tokens < 1:
-                raise ValueError(f"Sample {idx}:{message}: After truncation, no assistant tokens remain.")
-
-        # 7. Pad if necessary
-        elif total_seq_len < self.max_seq_len:
-            padding_len = self.max_seq_len - total_seq_len
-
-            padding_tokens = torch.full((padding_len,), self.tokenizer.pad_token_id, dtype=seq_ids.dtype)
-            seq_ids = torch.cat((seq_ids, padding_tokens), dim=-1)
-
-            padding_attn_mask = torch.zeros(size=(padding_len,), dtype=seq_attn_mask.dtype)
-            seq_attn_mask = torch.cat((seq_attn_mask, padding_attn_mask), dim=-1)
-
-        # 8. Build loss mask for multi-turn
-        # Loss mask has shape [T-1] because labels are shifted by one position
-        loss_mask = torch.zeros(self.max_seq_len - 1, dtype=seq_attn_mask.dtype)
-
-        # For each assistant range, mark the corresponding positions in loss_mask
-        # Since labels are shifted, token at position i predicts token at position i+1
-        # So for assistant content at positions [start, end), we train on labels [start, end-1]
-        # which means loss_mask positions [start-1, end-2] should be 1...
-        # Actually: label[i] = token[i+1], so to train on token[j], we need loss_mask[j-1] = 1
-        for start, end in assistant_ranges:
-            # We want to predict tokens in range [start, end)
-            # In the shifted label sequence, these correspond to loss_mask indices [start-1, end-1)
-            loss_start = max(0, start - 1)
-            loss_end   = min(end - 1, self.max_seq_len - 1)
-            if loss_start < loss_end:
-                loss_mask[loss_start:loss_end] = 1
-
-        # Apply attention mask to loss mask (don't compute loss on padding)
-        loss_mask = loss_mask * seq_attn_mask[1:]
-
-        # After masking, we should have at least 1 unmasked token
-        if loss_mask.sum().item() == 0:
-            raise ValueError(f"Sample {idx}:{message}: No training tokens left after masking "
-                         f"Total length: {total_seq_len}.")
-
-        return {
-            "input_ids": seq_ids, # T
-            "attn_mask": seq_attn_mask, # T
-            "loss_mask": loss_mask, # T-1
-        }
+        return seq_ids, seq_attn_mask
 
     def __len__(self):
         return self.len_data
@@ -334,34 +254,40 @@ if __name__ == "__main__":
     random_prompts = [
                    {'prompt': [{"role": "system", "content": "You are a helpful assistant."},
                                {"role": "user", "content": "Hello, how are you?"}],
-                    'answer': "I'm good, thanks!"
+                    'answer': "I'm good, thanks!",
+                    'rejected_answer': "I'm bad, thanks!"
                    },
                    {'prompt': [{"role": "user", "content": "What is the meaning of life?"}],
-                    'answer': "The meaning of life is 2000002."
+                    'answer': "The meaning of life is 2000002.",
+                    'rejected_answer': "The meaning of life is 2000003."
                    },
                    {'prompt': [{"role": "user", "content": "What is the meaning of the universe?"}],
-                    'answer': "The meaning of the universe is galaxy plus 2."
+                    'answer': "The meaning of the universe is galaxy plus 2.",
+                    'rejected_answer': "The meaning of the universe is galaxy plus 3."
                    },
                    {'prompt': [{"role": "user", "content": "This is is a just rather long prompt that is going to be tokenized. This is a test to make sure the dataset works."}],
-                    'answer': "This is a test to make sure the dataset works."
+                    'answer': "This is a test to make sure the dataset works.",
+                    'rejected_answer': "This is a test to make sure the dataset works."
                    },
                     {'prompt': [{"role": "system", "content": "You are a concise assistant."},
                                 {"role": "user", "content": "Give me a weird two-word nickname."},
                                 {"role": "assistant", "content": "Neon Pickle."},
                                 {"role": "user", "content": "Now give a different one."}],
-                    'answer': "Velvet Comet."
+                    'answer': "Velvet Comet.",
+                    'rejected_answer': "Velvet Comet."
                     },
                     {'prompt': [{"role": "user", "content": "Random fact, but fake."},
                                 {"role": "assistant", "content": "Otters invented the first toast."},
                                 {"role": "user", "content": "Another fake fact."}],
-                    'answer': "Clouds are just shy mountains."
+                    'answer': "Clouds are just shy mountains.",
+                    'rejected_answer': "Clouds are just shy mountains."
                     }
 
                    ]
     df = pd.DataFrame(random_prompts)
     df.to_parquet("./promptonly.parquet", index=False)
 
-    dataset = PairedFeed(
+    dataset = PreferenceFeed(
                     prompt_key="prompt",
                     answer_key="answer",
                     tokenizer=tokenizer,
@@ -384,7 +310,7 @@ if __name__ == "__main__":
                                                   world_size=1,
                                                   seed=42,
                                                   local_batch_size=3,
-                                                  dataset_cls=PairedFeed,
+                                                  dataset_cls=PreferenceFeed,
                                                   steps_per_epoch=100,
                                                   shuffle_within_batch=True,
                                                   dynamic_ratio_every_step=False)

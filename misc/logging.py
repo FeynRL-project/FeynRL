@@ -62,6 +62,11 @@ def setup_viz(config, tracking_uri: str, rank: int):
         mlflow.log_params({
             "micro_batches_per_epoch": config.train.micro_batches_per_epoch,
         })
+    elif config.run.method == "cl":
+        mlflow.log_params({
+            "micro_batches_per_epoch": config.train.micro_batches_per_epoch,
+            "cl_beta": config.train.cl_beta,
+        })
     elif config.run.method == "rl":
         mlflow.log_params({
             "train_steps_per_epoch": config.train.train_steps_per_epoch,

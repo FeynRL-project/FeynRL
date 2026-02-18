@@ -22,7 +22,7 @@ from misc.logging import setup_logging, setup_viz
 
 Algorithm_Registry = {
     # supported algorithms
-    'dpo': ('algs.DPO.dpo', 'dpo'),
+    'dpo': ('algs.DPO.dpo', 'DPO'),
 }
 
 def set_random_seeds(seed):
@@ -209,7 +209,7 @@ if __name__ == "__main__":
     ########
     # 2. Load config and other misc. setup
     ########
-    config = cfg.load_and_verify(method="sl",
+    config = cfg.load_and_verify(method="cl",
                                  input_yaml=args.config_file,
                                  experiment_id=args.experiment_id,
                                  world_size=world_size,

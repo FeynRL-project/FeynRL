@@ -2,10 +2,7 @@ import torch
 import numpy as np
 
 class SFT:
-    def __init__(self,
-                model_engine,
-                optimizer,
-                normalize_loss=False):
+    def __init__(self, model_engine, optimizer, normalize_loss=False):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
@@ -16,7 +13,7 @@ class SFT:
 
     def compute_loss(self, logits, target_ids, loss_mask):
         '''
-         This function implements \sum_{i=1}^{N} log p(y_i|x_i)
+         This implements \sum_{i=1}^{N} log p(y_i|x_i)
          target_ids is target label [B, T -1]
          logits is model prediction [B, T -1, vocab_size]
         '''
@@ -44,7 +41,7 @@ class SFT:
         # Loss_accumulated \neq Loss_full_batch when sequence lengths vary.
         # to address that, we normalize by total sequence length (constant)
         # which is fixed across gpus, not valid tokens (variable) which is loss_mask.sum().
-        # This solves the gradient accumulation bug.
+        # This solves the gradient accumulation bug. https://unsloth.ai/blog/gradient
         if self.normalize_loss:
             total_possible_tokens = logits.shape[0]
             if total_possible_tokens == 0:
@@ -59,7 +56,6 @@ class SFT:
 
     def forward(self, batch):
         '''
-            This function implements a single forward pass for current batch:
             batch['input_ids/attn_mask'] are [B, T]
             batch['position_ids'] is [B, T] or None
             Returns:
@@ -88,8 +84,8 @@ class SFT:
         # label would be input_ids shifted by one (input_ids[:, 1:])
         # so the size is [B, T-1]
         target_ids = input_ids[:, 1:].contiguous()
-        # remember it is an auto-regressive model: we use token [t] to predict token [t+1],
-        # hence no need to predict last token's output (e.g., <eos>) and we remove it from logits.
+        # remember we use token t to predict token t+1, hence no need to predict last
+        # token's output (e.g., <eos>) and we remove it from logits.
         logits = every_token_logits[:, :-1, :].contiguous()
 
         # loss_mask is [B, T -1]
@@ -99,7 +95,7 @@ class SFT:
 
     def eval_step(self, micro_batch):
         '''
-           This function implements a single validation step per rank/gpu.
+           This implements a single validation step per rank/gpu.
         '''
         # we need to split data into micro batches
         self.model_engine.eval()
@@ -114,16 +110,14 @@ class SFT:
 
     def train_step(self, micro_batch):
         '''
-           This function implements a single training step per rank/gpu.
-           The batch size for each gpu/rank should be micro_batch_size_per_gpu. 
-           The DataLoader already yields micro-batches. 
+           This implements a single training step per rank/gpu
+           for given micro_batch_size_per_gpu.
         '''
         # make sure model is in training mode
         self.model_engine.train()
 
         # Don't need to zero_grad() here as ds handles gradient zeroing
         # internally after step() when gradient_accumulation_steps boundary is reached.
-
         # 1. forward pass per gpu/rank
         logits, target_ids, loss_mask = self.forward(micro_batch)
 

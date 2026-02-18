@@ -116,8 +116,7 @@ class PPO(COMMON):
             last_val: [B]
             return: rets, advs which would be both [B, T]
         '''
-        # 1. Device and shape setup
-        # Perform GAE math in float32 for numerical stability under bf16/fp16.
+        # 1. float32 for numerical stability under bf16/fp16.
         device = values.device
         B, T   = values.shape
         values = values.to(torch.float32)
@@ -126,21 +125,21 @@ class PPO(COMMON):
         last_adv = torch.zeros(B, dtype=torch.float32, device=device)
         rewards  = rewards.to(dtype=torch.float32, device=device)
 
-        # 2. Delay casting the mask to the same dtype for indexing and checks.
+        # 2. casting
         mask  = mask.to(device=device)
         done  = done.to(device=device)
         mask  = (mask > 0.5)
         done  = (done > 0.5)
 
-        # 3. Check for nan in rewards or values for valid tokens
+        # 3. Check for nan
         if not torch.isfinite(rewards[mask]).all() or not torch.isfinite(values[mask]).all():
             raise ValueError("rewards or values contain NaN on valid positions")
 
         if (done & (~mask)).any():
             raise ValueError("done flag set on padding positions")
 
-        # 4. reject holes in mask e.g., [1, 1, 0, 1, 1] --> non-contiguous valid regions.
-        # valid masks have one contiguous block of 1s (with optional leading/trailing 0s).
+        # 4. reject holes in mask e.g., [1, 1, 0, 1, 1].
+        # valid masks have one contiguous block of 1s with optional leading/trailing 0s.
         # A hole exists iff any 0 -> 1 rise occurs after a 1 -> 0 drop.
         drops = (mask[:, :-1] & ~mask[:, 1:])  # 1 -> 0 transitions
         rises = (~mask[:, :-1] & mask[:, 1:])  # 0 -> 1 transitions
@@ -166,7 +165,7 @@ class PPO(COMMON):
             next_val = torch.zeros(B, dtype=torch.float32, device=device)
 
         # 7. Using (tensor > 0.5) is safer than bool() if inputs are already floats
-        # especially in case of BF16/FP16 training.
+        # especially in case of bf16/fp16 training.
         mask  = mask.to(dtype=torch.float32, device=device)
         done  = done.to(dtype=torch.float32, device=device)
 
@@ -181,7 +180,7 @@ class PPO(COMMON):
             last_adv   = is_valid * (delta + (self.gamma * self.tau * last_adv * not_done))
             advs[:, t] = last_adv
 
-            # At valid positions use V(s_t); at padding keep next_val
+            # At valid positions use v(s_t) and at padding keep next_val
             # so the bootstrap survives through padding to the last valid token.
             next_val = torch.where(is_valid > 0.5, values[:, t], next_val)
 
@@ -333,8 +332,8 @@ class PPO(COMMON):
 
     def precompute_gae(self, micro_batches):
         '''
-            Precompute values and GAE advantages for all micro-batches before any updates.
-            Returns list of (returns, advs) tuples on CPU, one per micro-batch.
+            Precompute values and gae for all batches before any updates.
+            Returns list of (returns, advs) tuples on cpu, one per batch.
         '''
         device = self.value_engine.device
         self.value_engine.eval()

@@ -1,5 +1,5 @@
 import torch
-import numpy as np
+import torch.nn.functional as F
 
 class DPO:
     def __init__(self, model_engine,
@@ -21,73 +21,74 @@ class DPO:
 
     def compute_loss(self, logits, ref_logits, target_ids, loss_mask):
         '''
-         This implements length-normalized dpo loss
-         logits and ref_logits: [2B, T -1, vocab_size]
-         target_ids: [2B, T -1]
-         loss_mask: [2B, T -1]
+            This implements length-normalized dpo loss.
+            logits and ref_logits: [2B, T-1, vocab_size]
+            target_ids: [2B, T-1]
+            loss_mask: [2B, T-1]
         '''
-        # cross_entropy return -logprobs but we need logprobs
-        # logits is [2B, T-1, vocab_size] --> [2B * (T-1), vocab_size]
-        # target_ids: [2B, T -1] -> [2B * (T-1)]
-        # Compute token logprobs in float32 to avoid bf16/fp16 quantization
-        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
-        # [2B * (T-1)] -> [2B, T-1]
-        logprobs = -neg_logprobs.view(B, T_minus_1)
+        two_B, T_minus_1, vocab_size = logits.shape
+
+        # Compute per-token log-probs in float32 to avoid bf16/fp16 quantization
+        # cross_entropy returns -logprobs, so we take negative
+        # logits: [2B, T-1, vocab_size] -> [2B * (T-1), vocab_size]
+        # target_ids: [2B, T-1] -> [2B * (T-1)]
+        target_ids = target_ids.view(-1)
+        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids)
+        logprobs = -neg_logprobs.view(two_B, T_minus_1)
 
         neg_logprobs_ref = self.cross_entropy(ref_logits.to(torch.float32).view(-1, vocab_size), target_ids)
-        ref_logprobs = -neg_logprobs_ref.view(B, T_minus_1)
+        ref_logprobs = -neg_logprobs_ref.view(two_B, T_minus_1)
 
-        # [2B, T -1]
-        B, T = logprobs.shape
+        # Rows are interleaved: [chosen0, rejected0, chosen1, rejected1, ...] as
+        # torch.stack([chosen, rejected], dim=0) is used to stack them, so
+        # Even rows(0::2) = chosen, odd rows(1::2) = rejected
+        # [2B, T-1] -> [B, T-1]
+        chosen_logprobs   = logprobs[0::2]
+        rejected_logprobs = logprobs[1::2]
+        ref_chosen_logprobs   = ref_logprobs[0::2]
+        ref_rejected_logprobs = ref_logprobs[1::2]
+        # [2B, T-1] -> [B, T-1]
+        chosen_mask   = loss_mask[0::2].to(torch.float32)
+        rejected_mask = loss_mask[1::2].to(torch.float32)
 
-        # logprobs: [2B, T -1]
-        # chosen: logprobs[:B] -> [B, T -1]
-        # rejected: logprobs[B:] -> [B, T -1]
-        chosen_logprobs   = logprobs[:B]
-        rejected_logprobs = logprobs[B:]
-        # reference model logprobs
-        ref_chosen_logprobs   = ref_logprobs[:B]
-        ref_rejected_logprobs = ref_logprobs[B:]
+        # Per-token logratios where masked padding/prompt positions
+        # are zeroed out.
+        # all are [B, T-1]
+        chosen_token_logratios   = chosen_mask * (chosen_logprobs - ref_chosen_logprobs)
+        rejected_token_logratios = rejected_mask * (rejected_logprobs - ref_rejected_logprobs)
 
-        # [2B, T -1] --> [B, T -1]
-        chosen_loss_mask    = loss_mask[:B]
-        rejected_loss_mask  = loss_mask[B:]
+        # sum over the sequence length dimension to get length-normalized logratios per example
+        # [B, T-1] --> [B]
+        len_chosen   = chosen_mask.sum(dim=1).clamp(min=1.0)
+        len_rejected = rejected_mask.sum(dim=1).clamp(min=1.0)
 
-        # compute length-normalized dpo loss
-        len_chosen   = chosen_loss_mask.sum(dim=1, keepdim=True)
-        chosen_logratios   = chosen_loss_mask * (chosen_logprobs - ref_chosen_logprobs).to(torch.float32) / len_chosen
+        # chosen_token_logratios.sum(dim=1): [B, T-1] -> [B]
+        chosen_rewards   = chosen_token_logratios.sum(dim=1) / len_chosen
+        rejected_rewards = rejected_token_logratios.sum(dim=1) / len_rejected
 
-        len_rejected = rejected_loss_mask.sum(dim=1, keepdim=True)
-        rejected_logratios = rejected_loss_mask * (rejected_logprobs - ref_rejected_logprobs).to(torch.float32) / len_rejected
+        # dpo loss: -log sigmoid(beta * (chosen_reward - rejected_reward))
+        loss = -F.logsigmoid(self.beta * (chosen_rewards - rejected_rewards)).mean()
 
-        # loss = -E[log_sigmoid[(beta/len(c)) * log(p_c/pr_c) - (beta/len(r)) * log(p_r/pr_r)]
-        per_token_loss = -F.logsigmoid(self.beta * (chosen_logratios - rejected_logratios))
-        denom = (chosen_loss_mask + rejected_loss_mask).sum().clamp(min=1.0)
-        loss = per_token_loss.sum() / denom
-
-        metrics = {"loss":float(loss.item()),
-                   "chosen_rewards":float(chosen_logratios.mean().item()),
-                   "rejected_rewards":float(rejected_logratios.mean().item()),
-                   "reward_accuracies":float((chosen_logratios > rejected_logratios).float().mean().item())
+        metrics = {"loss": float(loss.item()),
+                   "chosen_rewards": float(chosen_rewards.mean().item()),
+                   "rejected_rewards": float(rejected_rewards.mean().item()),
+                   "reward_accuracies": float((chosen_rewards > rejected_rewards).float().mean().item()),
                   }
         return loss, metrics
 
     def forward(self, batch):
         '''
             batch[input_ids/attn_mask]: [B, 2, T]
-            batch['position_ids']: [B, 2, T] or None
-            Returns:
-                logits and ref_logits: [2B, T-1, vocab_size]
-                target_ids: [2B, T-1]
-                loss_mask: [2B, T-1]
+            batch[loss_mask]: [B, 2, T-1]
         '''
-        # inputs are [B, 2, T] as chosen and rejected are stacked.
+        # since torch.stack([chosen, rejected], dim=0) is used to stack them, data
+        # are interleaved as [chosen0, rejected0, chosen1, rejected1, ...]
         B, _, T = batch['input_ids'].shape
         # [B, 2, T] --> [2B, T]
         input_ids = batch['input_ids'].view(-1, T)
         att_mask  = batch['attn_mask'].view(-1, T)
-        # [B, 2, T -1] --> [2B, T]
-        loss_mask = batch['loss_mask'].view(-1, T)
+        # [B, 2, T-1] --> [2B, T-1]
+        loss_mask = batch['loss_mask'].view(-1, batch['loss_mask'].shape[-1])
 
         # if pos_ids is not provided, hf will add it automatically.
         pos_ids = batch.get('position_ids', None)
@@ -117,7 +118,6 @@ class DPO:
         # [2B, T, vocab_size] -> [2B, T-1, vocab_size]
         logits     = every_logits[:, :-1, :].contiguous()
         ref_logits = ref_every_logits[:, :-1, :].contiguous()
-        _, T, vocab_size = logits.shape
 
         # label would be input_ids shifted by one
         # [2B, T] --> [2B, T-1]
@@ -129,13 +129,13 @@ class DPO:
         '''
            This implements a single validation step per rank/gpu.
         '''
-        # we need to split data into micro batches
         self.model_engine.eval()
         with torch.no_grad():
-            logits, ref_logits, target_ids, loss_mask= self.forward(micro_batch)
-
-            # 3. compute loss pass
-            loss, metrics = self.compute_loss(logits=logits, ref_logits=ref_logits, target_ids=target_ids, loss_mask=loss_mask)
+            logits, ref_logits, target_ids, loss_mask = self.forward(micro_batch)
+            loss, metrics = self.compute_loss(logits=logits,
+                                              ref_logits=ref_logits,
+                                              target_ids=target_ids,
+                                              loss_mask=loss_mask)
 
         return metrics
 
@@ -149,16 +149,19 @@ class DPO:
 
         # 1. forward pass per gpu/rank
         # chosen and rejected data are stacked as [B, 2, T]
-        logits, ref_logits, target_ids, loss_mask= self.forward(micro_batch)
+        logits, ref_logits, target_ids, loss_mask = self.forward(micro_batch)
 
-        # 3. compute loss pass
-        loss, metrics = self.compute_loss(logits=logits, ref_logits=ref_logits, target_ids=target_ids, loss_mask=loss_mask)
+        # 2. compute loss
+        loss, metrics = self.compute_loss(logits=logits,
+                                          ref_logits=ref_logits,
+                                          target_ids=target_ids,
+                                          loss_mask=loss_mask)
 
-        # 4. backward step
+        # 3. backward step
         # deepspeed aggregates gradients and only updates weights when accumulation_steps is reached.
         self.model_engine.backward(loss)
 
-        # 5. optimizer step
+        # 4. optimizer step
         self.model_engine.step()
 
         return metrics

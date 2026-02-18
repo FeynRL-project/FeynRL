@@ -29,7 +29,7 @@ def parse_hh_conversation(text):
                 turns.append((current_role, "\n".join(buffer).strip()))
                 buffer = []
             current_role = "assistant"
-            buffer.append(line[len(" :"):].strip())
+            buffer.append(line[len("Assistant:"):].strip())
 
         else:
             buffer.append(line)

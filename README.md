@@ -13,6 +13,10 @@ LeanRL is built around three core principles:
 - **Modularity**: Clear separation between training engines, rollout generation, reward computation, and data handling, which makes it easy to swap components and experiment safely.
 - **Research first**: Designed to accelerate research by keeping the codebase simple, hackable, and performant.
 
+## Installation
+
+See [installation/README.md](installation/README.md) for detailed installation instructions.    
+
 ## Experiments
 
 To make things easier, we provide scripts and selected results on a few datasets across multiple algorithms. The `experiment` folder contains runnable scripts, and this page summarizes results from some of them.

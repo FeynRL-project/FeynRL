@@ -349,5 +349,9 @@ if __name__ == "__main__":
     with open(experiment_config_path, "w") as f:
         yaml.dump(config.model_dump(), f)
     logger.info(f"Experiment config saved to {experiment_config_path}")
-    
+
+    # Kill rollout actors to free gpu memory from vllm before ray.shutdown()
+    for engine in rollout_engines:
+        ray.kill(engine)
+
     ray.shutdown()

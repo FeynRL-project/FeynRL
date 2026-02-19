@@ -19,10 +19,11 @@ class DPO:
         # use cross entropy loss
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
 
-    def compute_loss(self, logits, ref_logits, target_ids, loss_mask):
+    def compute_loss(self, logits, ref_logprobs, target_ids, loss_mask):
         '''
             This implements length-normalized dpo loss.
-            logits and ref_logits: [2B, T-1, vocab_size]
+            logits: [2B, T-1, vocab_size]
+            ref_logprobs: [2B, T-1]  (already reduced from ref_logits in forward)
             target_ids: [2B, T-1]
             loss_mask: [2B, T-1]
         '''
@@ -36,12 +37,9 @@ class DPO:
         neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids)
         logprobs = -neg_logprobs.view(two_B, T_minus_1)
 
-        neg_logprobs_ref = self.cross_entropy(ref_logits.to(torch.float32).view(-1, vocab_size), target_ids)
-        ref_logprobs = -neg_logprobs_ref.view(two_B, T_minus_1)
-
         # Rows are interleaved: [chosen0, rejected0, chosen1, rejected1, ...] as
         # torch.stack([chosen, rejected], dim=0) is used to stack them, so
-        # Even rows(0::2) = chosen, odd rows(1::2) = rejected
+        # even rows(0::2) = chosen, odd rows(1::2) = rejected
         # [2B, T-1] -> [B, T-1]
         chosen_logprobs   = logprobs[0::2]
         rejected_logprobs = logprobs[1::2]
@@ -51,14 +49,13 @@ class DPO:
         chosen_mask   = loss_mask[0::2].to(torch.float32)
         rejected_mask = loss_mask[1::2].to(torch.float32)
 
-        # Per-token logratios where masked padding/prompt positions
-        # are zeroed out.
+        # Per-token logratios where masked padding/prompt positions are zeroed out.
         # all are [B, T-1]
         chosen_token_logratios   = chosen_mask * (chosen_logprobs - ref_chosen_logprobs)
         rejected_token_logratios = rejected_mask * (rejected_logprobs - ref_rejected_logprobs)
 
         # sum over the sequence length dimension to get length-normalized logratios per example
-        # [B, T-1] --> [B]
+        # [B, T-1] -> [B]
         len_chosen   = chosen_mask.sum(dim=1).clamp(min=1.0)
         len_rejected = rejected_mask.sum(dim=1).clamp(min=1.0)
 
@@ -84,16 +81,16 @@ class DPO:
         # since torch.stack([chosen, rejected], dim=0) is used to stack them, data
         # are interleaved as [chosen0, rejected0, chosen1, rejected1, ...]
         B, _, T = batch['input_ids'].shape
-        # [B, 2, T] --> [2B, T]
+        # [B, 2, T] -> [2B, T]
         input_ids = batch['input_ids'].view(-1, T)
         att_mask  = batch['attn_mask'].view(-1, T)
-        # [B, 2, T-1] --> [2B, T-1]
+        # [B, 2, T-1] -> [2B, T-1]
         loss_mask = batch['loss_mask'].view(-1, batch['loss_mask'].shape[-1])
 
         # if pos_ids is not provided, hf will add it automatically.
         pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
-            # [B, 2, T] --> [2B, T]
+            # [B, 2, T] -> [2B, T]
             pos_ids = pos_ids.view(-1, T).to(att_mask.device)
 
         # feed data to model
@@ -102,37 +99,41 @@ class DPO:
                                    position_ids=pos_ids,
                                    use_cache=False)
 
-        # feed data to ref model without gradient
+        # [2B, T, vocab_size] -> [2B, T-1, vocab_size]
+        # remember we use token t to predict token t+1, hence no need to predict last
+        # token's output (e.g., <eos>) and we remove it from logits.
+        logits = output.logits[:, :-1, :].contiguous()
+
+        # label would be input_ids shifted by one
+        # [2B, T] -> [2B, T-1]
+        target_ids = input_ids[:, 1:].contiguous()
+
+        # Compute ref logprobs inside no_grad and reduce to [2B, T-1] immediately.
+        # This frees the full [2B, T-1, vocab_size] ref_logits tensor.
         with torch.no_grad():
             ref_output = self.ref_model_engine(input_ids=input_ids,
                                                attention_mask=att_mask,
                                                position_ids=pos_ids,
                                                use_cache=False)
 
-        # [2B, T, vocab_size]
-        every_logits     = output.logits
-        ref_every_logits = ref_output.logits
+            ref_logits = ref_output.logits[:, :-1, :].contiguous()
+            two_B, T_minus_1, v = ref_logits.shape
+            # ref_logits: [2B, T-1, vocab_size] -> [2B * (T-1), vocab_size]
+            # target_ids: [2B, T-1] -> [2B * (T-1)]
+            neg_ref_logprobs = self.cross_entropy(ref_logits.to(torch.float32).view(-1, v),
+                                                  target_ids.view(-1))
+            ref_logprobs = -neg_ref_logprobs.view(two_B, T_minus_1)
 
-        # remember we use token t to predict token t+1, hence no need to predict last
-        # token's output (e.g., <eos>) and we remove it from logits.
-        # [2B, T, vocab_size] -> [2B, T-1, vocab_size]
-        logits     = every_logits[:, :-1, :].contiguous()
-        ref_logits = ref_every_logits[:, :-1, :].contiguous()
-
-        # label would be input_ids shifted by one
-        # [2B, T] --> [2B, T-1]
-        target_ids = input_ids[:, 1:].contiguous()
-
-        return logits, ref_logits, target_ids, loss_mask
+        return logits, ref_logprobs, target_ids, loss_mask
 
     def eval_step(self, micro_batch):
         '''
            This implements a single validation step per rank/gpu.
            Setting model to eval mode and torch.no_grad() context are done in main.
         '''
-        logits, ref_logits, target_ids, loss_mask = self.forward(micro_batch)
+        logits, ref_logprobs, target_ids, loss_mask = self.forward(micro_batch)
         loss, metrics = self.compute_loss(logits=logits,
-                                          ref_logits=ref_logits,
+                                          ref_logprobs=ref_logprobs,
                                           target_ids=target_ids,
                                           loss_mask=loss_mask)
 
@@ -148,11 +149,11 @@ class DPO:
 
         # 1. forward pass per gpu/rank
         # chosen and rejected data are stacked as [B, 2, T]
-        logits, ref_logits, target_ids, loss_mask = self.forward(micro_batch)
+        logits, ref_logprobs, target_ids, loss_mask = self.forward(micro_batch)
 
         # 2. compute loss
         loss, metrics = self.compute_loss(logits=logits,
-                                          ref_logits=ref_logits,
+                                          ref_logprobs=ref_logprobs,
                                           target_ids=target_ids,
                                           loss_mask=loss_mask)
 

@@ -110,6 +110,15 @@ class COMMON:
             # SGRPO/CISPO has policy only
             print(f"[Alg:{self.alg_name}][Rank {rank}] Model loaded: {self.model_path}")
 
+        # Enable gradient checkpointing on the HF model before DS wrapping
+        if self.gradient_checkpointing:
+            policy_model.gradient_checkpointing_enable()
+            if value_model is not None:
+                value_model.gradient_checkpointing_enable()
+
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gradient checkpointing enabled"
+                  f"{' (policy + value)' if value_model is not None else ''}")
+
         # Initialize policy engine
         # only pass trainable params so ds doesn't waste memory on frozen ones (e.g. LoRA)
         trainable_params = [p for p in policy_model.parameters() if p.requires_grad]
@@ -136,10 +145,9 @@ class COMMON:
             # Use separate DS config for value model if available (different lr, weight decay, grad clip)
             value_ds_config = self.deepspeed_value_config
             value_ds_dict = value_ds_config.model_dump() if value_ds_config is not None else ds_config_dict
-            trainable_value_params = [p for p in value_model.parameters() if p.requires_grad]
             self.value_engine, self.value_optimizer, _, _ = deepspeed.initialize(
                                                     model=value_model,
-                                                    model_parameters=trainable_value_params,
+                                                    model_parameters=value_model.parameters(),
                                                     config=value_ds_dict
                                                     )
             print(f"[Alg:{self.alg_name}][Rank {rank}] Value model initialized with DeepSpeed")
@@ -438,6 +446,10 @@ class COMMON:
     def gather_state_dict(self):
         '''
             Gather policy weights into a full state_dict on rank 0.
+            Works for all ds stages (0/1/2/3):
+              - Stage 0/1/2: params are already full on each rank, so rank 0 copies directly.
+              - Stage 3: uses GatheredParameters to collect partitioned params before copying.
+            Only rank 0 returns the actual state_dict; others return {}.
             This is used for direct sync of weights with vllm rather than saving them on disk.
             gather_params_for_save handles ZeRO-3 collective gathering and then
             merges PEFT names when active so vllm can load them.
@@ -447,20 +459,33 @@ class COMMON:
         '''
         rank = torch.distributed.get_rank()
 
-        # gather_params_for_save handles ZeRO-3 collective gathering and works
-        # for all DS stages. Must be called on ALL ranks.
-        state_dict = self.gather_params_for_save(self.policy_engine.module, rank)
+        # 1. Get all parameters
+        # Must be called on ALL ranks as zero-3 requires collective participation.
+        params = []
+        names = []
+        for name, param in self.policy_engine.module.named_parameters():
+            params.append(param)
+            names.append(name)
 
-        # When peft is active, named_parameters() returns peft-prefixed names. For example:
-        # base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight (frozen base)
-        # base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight (adapter)
-        # however, vllm expects original names like model.layers.0.self_attn.q_proj.weight.
-        # So load_weights() won't recognize any of these and the sync silently fails. To fix this,
-        # we merge LoRA weights into base model weights and remap to original HF names so vllm can load them.
-        if rank == 0 and self.peft_config.use_peft:
-            state_dict = self.merge_peft_state_dict(state_dict)
+        # 2. Check if we're using stage-3 where parameters are partitioned
+        is_zero3 = hasattr(params[0], 'ds_id') if params else False
+
+        if is_zero3:
+            # gather partitioned parameters in a single collective call
+            with deepspeed.zero.GatheredParameters(params, modifier_rank=0):
+                if rank == 0:
+                    for name, param in zip(names, params):
+                        # .data avoids autograd overhead.
+                        # .cpu().clone() ensures the tensor lives in CPU memory and is independent of the
+                        # ZeRO-3 partition buffer which gets freed after the context.
+                        state_dict[name] = param.data.cpu().clone()
+        else:
+            # Stages 0/1/2: params are already full, just copy on rank 0
+            if rank == 0:
+                for name, param in zip(names, params):
+                    state_dict[name] = param.data.cpu().clone()
 
         if rank == 0:
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (peft={self.peft_config.use_peft})!")
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (zero3={is_zero3})!")
 
         return state_dict

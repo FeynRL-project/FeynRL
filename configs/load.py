@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field, ConfigDict, ValidationError
 import yaml
 import sys
 import copy
-import os
 
 class Run(BaseModel):
     '''
@@ -14,8 +13,7 @@ class Run(BaseModel):
     experiment_id: str
     seed: int
     project_name: str
-    tracking_uri: str | None = "http://localhost:880/"
-    logger_type: str | None = "mlflow" # Options: mlflow, wandb
+    tracking_uri: str
     method: str = None
     logger_type : str = "mlflow" # mlflow or wandb
 
@@ -31,6 +29,8 @@ class Run(BaseModel):
     overlap_enabled: bool | None = None
     # Max training steps ahead of rollout policy version
     overlap_max_lag: int | None = None
+    # Update rollout weights every N training steps
+    overlap_weight_update_interval: int | None = None
 
     # Weight sync: "direct" pushes weights via gpu memory (no disk I/O),
     # "disk" uses save-to-disk + vllm reload.
@@ -164,8 +164,6 @@ class Peft(BaseModel):
     lora_rank: int | None = None
     lora_alpha: int | None = None
     lora_dropout: float | None = None
-    # if None, apply lora to all linear layers (peft default).
-    # otherwise, set explicitly to target specific modules, e.g. ["q_proj", "v_proj"].
     lora_target_modules: list[str] | None = None
 
 class DeepSpeed(BaseModel):
@@ -353,8 +351,6 @@ class Config(BaseModel):
                     optimizer_steps_per_epoch = self.train.train_steps_per_epoch
 
                 else:
-                    # rollout_samples_per_epoch is the number of prompts.
-                    # Multiply by n_samples to get total number of samples in the replay buffer.
                     # Note: estimated_replay_size may be slightly larger than actual if some
                     # responses have response_len==0 (filtered in replay_buffer.add_batch_seqs).
                     # This can cause the lr schedule to not fully reach cos_min_ratio.
@@ -575,35 +571,12 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if world_size is None:
                 raise ValueError("world_size must be specified for SL training")
 
-            if config.train.micro_batches_per_epoch is None or config.train.micro_batches_per_epoch < 1:
-                raise ValueError(f"micro_batches_per_epoch must be >= 1 for SL, got {config.train.micro_batches_per_epoch}")
-
-            if not config.data.val_files_path:
-                raise ValueError("data.val_files_path must be a non-empty list for SL training")
-
-            if config.train.micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
-                raise ValueError(f"micro_batches_per_epoch ({config.train.micro_batches_per_epoch}) must be divisible by gradient_accumulation_steps ({config.train.gradient_accumulation_steps})")
-
         elif method == "cl":
             if world_size is None:
                 raise ValueError("world_size must be specified for CL training")
-
-            if not config.model.ref_model:
-                raise ValueError("model.ref_model must be specified for CL/DPO training")
-
-            if config.train.micro_batches_per_epoch is None or config.train.micro_batches_per_epoch < 1:
-                raise ValueError(f"micro_batches_per_epoch must be >= 1 for CL, got {config.train.micro_batches_per_epoch}")
-
-            if not config.data.val_files_path:
-                raise ValueError("data.val_files_path must be a non-empty list for CL training")
-
-            if config.train.micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
-                raise ValueError(f"micro_batches_per_epoch ({config.train.micro_batches_per_epoch}) must be divisible by gradient_accumulation_steps ({config.train.gradient_accumulation_steps})")
-
             if config.train.alg_name == "dpo":
                 if config.train.cl_beta is None:
                     raise ValueError("cl_beta must be specified for dpo")
-
                 if config.train.cl_beta <= 0:
                     raise ValueError("cl_beta must be > 0 for dpo")
 
@@ -623,79 +596,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if config.train.alg_name == "ppo":
                 if config.train.tau is None or config.train.gamma is None or not config.model.value_model:
                     raise ValueError("tau and gamma and value_model must be specified for ppo")
-
-            weight_sync_method = config.run.weight_sync_method
-            if weight_sync_method is None:
-                raise ValueError("weight_sync_method must be specified for rl training")
-
-            if weight_sync_method not in ["direct", "disk"]:
-                raise ValueError("weight_sync_method must be 'direct' or 'disk'")
-
-            max_tokens = config.rollout.max_tokens
-            max_seq_len = config.data.max_seq_len
-            if max_tokens is None or max_seq_len is None:
-                raise ValueError("max_tokens and max_seq_len must be specified for rl training")
-
-            if max_tokens > max_seq_len:
-                raise ValueError("max_tokens must be < max_seq_len as max_seq_len equals to len(prompt + generation) and max_tokens equals to len(generation)")
-
-            # Training step count
-            if config.train.train_steps_per_epoch is None or config.train.train_steps_per_epoch < 1:
-                raise ValueError(f"train_steps_per_epoch must be >= 1 for RL, got {config.train.train_steps_per_epoch}")
-
-            # Rollout parameters
-            if config.rollout.n_samples is None or config.rollout.n_samples < 1:
-                raise ValueError(f"rollout.n_samples must be >= 1, got {config.rollout.n_samples}")
-
-            if config.rollout.rollout_samples_per_epoch is None or config.rollout.rollout_samples_per_epoch < 1:
-                raise ValueError(f"rollout.rollout_samples_per_epoch must be >= 1, got {config.rollout.rollout_samples_per_epoch}")
-
-            if config.rollout.rollout_batch_size_per_gpu is None or config.rollout.rollout_batch_size_per_gpu < 1:
-                raise ValueError(f"rollout.rollout_batch_size_per_gpu must be >= 1, got {config.rollout.rollout_batch_size_per_gpu}")
-
-            if config.rollout.gpu_memory_utilization is not None and not (0.0 < config.rollout.gpu_memory_utilization <= 1.0):
-                raise ValueError(f"rollout.gpu_memory_utilization must be in (0.0, 1.0], got {config.rollout.gpu_memory_utilization}")
-
-            if config.rollout.temperature is not None and config.rollout.temperature < 0:
-                raise ValueError(f"rollout.temperature must be >= 0, got {config.rollout.temperature}")
-
-            if config.model.ref_model is not None and (config.train.kl_coeff == 0 or config.train.kl_coeff is None):
-                raise ValueError(f"kl_coeff must be > 0 if model.ref is not None")
-
-            if config.model.ref_model is None and (config.train.kl_coeff > 0):
-                raise ValueError(f"model.ref must be not None if kl_coeff > 0")
-
-            # Reward function
-            if not config.reward or not config.reward.reward_func:
-                raise ValueError("reward.reward_func must be specified for RL training")
-
-            # TP must evenly divide rollout GPUs
-            tp = config.rollout.tensor_parallel_size
-            rg = config.run.rollout_gpus
-            if tp and rg and rg % tp != 0:
-                raise ValueError(f"rollout_gpus ({rg}) must be divisible by tensor_parallel_size ({tp}). "
-                                 f"Currently {rg} % {tp} = {rg % tp}.")
-
-            # Ray port
-            if config.run.ray_master_port is None:
-                raise ValueError("run.ray_master_port must be specified for RL training")
-
-
-            # Timeout settings
-            if config.run.init_timeout is None:
-                raise ValueError("run.init_timeout must be specified for RL training")
-
-            if config.run.rollout_timeout is None:
-                raise ValueError("run.rollout_timeout must be specified for RL training")
-
-            if config.run.train_step_timeout is None:
-                raise ValueError("run.train_step_timeout must be specified for RL training")
-
-            if config.run.save_timeout is None:
-                raise ValueError("run.save_timeout must be specified for RL training")
-
-            if config.run.sync_timeout is None:
-                raise ValueError("run.sync_timeout must be specified for RL training")
 
         if method != "eval":
             # Sync AFTER updating world_size

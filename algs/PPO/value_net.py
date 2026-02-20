@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
-from peft import PeftModel
 
 class ValueNetwork(nn.Module):
     '''
@@ -11,12 +10,6 @@ class ValueNetwork(nn.Module):
     '''
     def __init__(self, base_model):
         super().__init__()
-
-        # If base_model is a PeftModel, we need to unwrap it to get the basemodel.
-        # lora layers remain physically injected in the module tree so gradients still flow.
-        if isinstance(base_model, PeftModel):
-            base_model = base_model.get_base_model()
-
         self.config = base_model.config
 
         # Extract the transformer backbone without LM head.
@@ -75,19 +68,9 @@ class ValueNetwork(nn.Module):
     def gradient_checkpointing_enable(self):
         '''
             Enable gradient checkpointing for the backbone.
-            ValueNetwork is nn.Module, not a HF model, so it doesn't have
-            gradient_checkpointing_enable() method. We need to call it on the backbone.
         '''
         if hasattr(self.backbone, 'gradient_checkpointing_enable'):
             self.backbone.gradient_checkpointing_enable()
-
-    def enable_input_require_grads(self):
-        '''
-            Delegate to backbone so common.py _load_single_model can call this
-            on ValueNetwork the same way it does on HF models.
-        '''
-        if hasattr(self.backbone, 'enable_input_require_grads'):
-            self.backbone.enable_input_require_grads()
 
 if __name__ == "__main__":
     from transformers import AutoModelForCausalLM, AutoConfig

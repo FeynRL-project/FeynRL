@@ -4,6 +4,7 @@ import torch.distributed
 from transformers import AutoModelForCausalLM, AutoConfig
 import deepspeed
 from peft import get_peft_model, LoraConfig
+from safetensors.torch import save_file
 
 class COMMON:
     '''
@@ -251,12 +252,19 @@ class COMMON:
         try:
             # 1. Save policy model weights (gathered fp16/bf16)
             if self.peft_config.use_peft:
-                # All ranks must participate in GatheredParameters for ZeRO-3,
-                # but only rank 0 writes the adapter weights to disk.
-                peft_params = [p for p in self.policy_engine.module.parameters() if p.requires_grad]
-                with deepspeed.zero.GatheredParameters(peft_params, modifier_rank=0):
+                # Save full merged model (base + LoRA merged) so vllm can load it
+                # directly for disk-based refresh. Must gather ALL params (base + adapter)
+                # since ZeRO-3 partitions everything, not just trainable params.
+                all_params = list(self.policy_engine.module.parameters())
+                with deepspeed.zero.GatheredParameters(all_params, modifier_rank=0):
                     if rank == 0:
-                        self.policy_engine.module.save_pretrained(output_dir)
+                        raw_sd = {name: param.data.cpu().clone()
+                                  for name, param in self.policy_engine.module.named_parameters()}
+                        merged_sd = self._merge_peft_state_dict(raw_sd)
+                        os.makedirs(output_dir, exist_ok=True)
+                        save_file(merged_sd, os.path.join(output_dir, "model.safetensors"))
+                        print(f"[Alg:{self.alg_name}][Rank {rank}] Saved merged PEFT policy model")
+
             else:
                 self.policy_engine.save_16bit_model(output_dir)
 
@@ -319,6 +327,80 @@ class COMMON:
                 torch.distributed.barrier()
             raise
 
+    def _merge_peft_state_dict(self, raw_state_dict):
+        '''
+            Merge LoRA adapter weights into base model weights and remap to
+            original HuggingFace parameter names so vllm can load them.
+
+            PeftModel names follow the pattern:
+              base weight:  base_model.model.{hf_name}
+              lora_A:       base_model.model.{module_path}.lora_A.default.weight
+              lora_B:       base_model.model.{module_path}.lora_B.default.weight
+              scaling:      alpha / r
+
+            Merged weight = base_weight + (alpha / r) * lora_B @ lora_A
+        '''
+        peft_prefix = "base_model.model."
+        merged = {}
+
+        # 1. Collect LoRA A/B pairs keyed by their module path
+        lora_a = {}  # module_path -> tensor
+        lora_b = {}  # module_path -> tensor
+        base_weights = {}  # peft_name -> tensor (everything that isn't lora_A/B)
+
+        for name, tensor in raw_state_dict.items():
+            if ".lora_A." in name:
+                # e.g. base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight
+                module_path = name.split(".lora_A.")[0]
+                lora_a[module_path] = tensor
+
+            elif ".lora_B." in name:
+                module_path = name.split(".lora_B.")[0]
+                lora_b[module_path] = tensor
+
+            else:
+                base_weights[name] = tensor
+
+        # 2. Merge lora into base weights
+        scaling = self.peft_config.lora_alpha / self.peft_config.lora_rank
+
+        for module_path in lora_a:
+            if module_path not in lora_b:
+                print(f"[WARNING] _merge_peft_state_dict: found lora_A but no lora_B for {module_path}")
+                continue
+
+            A = lora_a[module_path]  # [r, D]
+            B = lora_b[module_path]  # [H, r]
+            delta = (B @ A) * scaling  # [H, D]
+
+            # Find the corresponding base weight
+            # Base weight is at: {module_path}.base_layer.weight (ZeRO-3 + PEFT)
+            # or {module_path}.weight (some PEFT versions)
+            base_key = module_path + ".base_layer.weight"
+            if base_key not in base_weights:
+                base_key = module_path + ".weight"
+
+            if base_key in base_weights:
+                base_weights[base_key] = base_weights[base_key] + delta.to(base_weights[base_key].dtype)
+
+            else:
+                print(f"[WARNING] _merge_peft_state_dict: no base weight found for {module_path}")
+
+        # 3. Remap names: strip peft_prefix and .base_layer suffix
+        for peft_name, tensor in base_weights.items():
+            # Strip "base_model.model." prefix
+            if peft_name.startswith(peft_prefix):
+                hf_name = peft_name[len(peft_prefix):]
+            else:
+                hf_name = peft_name
+
+            # Strip ".base_layer" inserted by PEFT for wrapped linear layers
+            hf_name = hf_name.replace(".base_layer.", ".")
+
+            merged[hf_name] = tensor
+
+        return merged
+
     def gather_state_dict(self):
         '''
             Gather policy weights into a full state_dict on rank 0.
@@ -327,6 +409,9 @@ class COMMON:
               - Stage 3: uses GatheredParameters to collect partitioned params before copying.
             Only rank 0 returns the actual state_dict; others return {}.
             This is used for direct sync of weights with vllm rather than saving them on disk.
+
+            When peft is active, merges adapter weights into base weights and remaps
+            to original HF names so vllm can load them.
 
             Returns:
                 dict: {param_name: cpu_tensor} on rank 0, empty dict on other ranks.
@@ -360,7 +445,17 @@ class COMMON:
                 for name, param in zip(names, params):
                     state_dict[name] = param.data.cpu().clone()
 
+        # 3. When peft is active, named_parameters() returns peft-prefixed names. For example:
+        # base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight (frozen base)
+        # base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight (adapter)
+        # however, vllm expects original names like model.layers.0.self_attn.q_proj.weight.
+        # So load_weights() won't recognize any of these and the sync silently fails. To fix this,
+        # we merge LoRA weights into base model weights and remap to original HF names so vllm can load them.
+
+        if rank == 0 and self.peft_config.use_peft:
+            state_dict = self._merge_peft_state_dict(state_dict)
+
         if rank == 0:
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (zero3={is_zero3})!")
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (zero3={is_zero3}, peft={self.peft_config.use_peft})!")
 
         return state_dict

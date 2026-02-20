@@ -12,4 +12,4 @@ $$
 \mathcal{L}_{\text{CISPO}}(\theta)= -\mathbb{E}\Big[\mathrm{sg}\big(\mathrm{clip}(r,1-\epsilon_l,1+\epsilon_h)\big)\ \log p_\theta(\cdot)\ A\Big].
 $$
 
-In this repo, CISPO is therefore “SGRPO with a different `compute_policy_loss(...)`”: the replay format, uniform replay sampling, masking, DeepSpeed micro-batching/accumulation, and optional entropy/KL terms are unchanged—only the clipping/weighting in the policy objective differs.  
+In this repo, CISPO is therefore “SGRPO with a different `compute_policy_loss(...)`”: the replay format, uniform replay sampling, masking, DeepSpeed micro, batching/accumulation, and optional entropy/KL terms are unchanged, only the clipping/weighting in the policy objective differs.  

@@ -72,7 +72,8 @@ pip install \
   vllm==0.15.1 \
   ray==2.53.0 \
   mlflow==3.8.1 \
-  wandb==0.25.0
+  wandb==0.25.0 \
+  peft==0.18.1
 ```
 
 **Verify critical imports:**

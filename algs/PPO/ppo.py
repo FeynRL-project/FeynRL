@@ -29,11 +29,13 @@ class PPO(COMMON):
                  gradient_checkpointing: bool,
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
+                 peft_config: Any = None,
                  # ppo specific
                  value_model_path: str = None,
                  tau: float = None,
                  gamma: float = None,
                  deepspeed_value_config: Any = None,
+
                  ):
         assert tau is not None and gamma is not None, 'tau and gamma must be provided for PPO'
         assert value_model_path is not None, 'value_model_path must be provided for PPO'
@@ -43,6 +45,7 @@ class PPO(COMMON):
         self.ref_model_path = ref_model_path
         self.attn_impl = attn_impl
         self.trust_remote_code = trust_remote_code
+        self.peft_config = peft_config
 
         # training related parameters
         self.deepspeed_config = deepspeed_config
@@ -85,17 +88,17 @@ class PPO(COMMON):
             Value model has a scalar value head.
         '''
         # Load policy model
-        policy_model = self._load_single_model(self.model_path, self.model_dtype)
+        policy_model = self._load_single_model(model_path=self.model_path, dtype=self.model_dtype, model_name="policy")
 
         # Load reference model if provided
         if self.ref_model_path and self.kl_coeff > 0.0:
-            ref_model = self._load_single_model(self.ref_model_path, self.model_dtype)
+            ref_model = self._load_single_model(model_path=self.ref_model_path, dtype=self.model_dtype, model_name="ref")
         else:
             ref_model = None
 
         # Load value model
         # we assume the value model has the same dtype as the policy model
-        base_value_model = self._load_single_model(self.value_model_path, self.model_dtype)
+        base_value_model = self._load_single_model(model_path=self.value_model_path, dtype=self.model_dtype, model_name="value")
         value_model = ValueNetwork(base_value_model)
 
         return {"policy_model": policy_model, "ref_model": ref_model, "value_model": value_model}

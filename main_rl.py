@@ -81,6 +81,9 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
                # gradient checkpointing
                'gradient_checkpointing':params.model.gradient_checkpointing,
+
+               # peft
+               'peft_config':params.peft,
     }
 
     # ppo arguments

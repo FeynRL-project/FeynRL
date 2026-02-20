@@ -26,6 +26,7 @@ class SGRPO(COMMON):
                  gradient_checkpointing: bool,
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
+                 peft_config: Any = None,
                  ):
 
         self.alg_name = self.__class__.__name__
@@ -35,6 +36,7 @@ class SGRPO(COMMON):
         self.attn_impl = attn_impl
         self.model_dtype = model_dtype
         self.trust_remote_code = trust_remote_code
+        self.peft_config = peft_config
 
         # training related parameters
         self.deepspeed_config = deepspeed_config
@@ -70,11 +72,11 @@ class SGRPO(COMMON):
             Load policy and reference models from huggingface.
         '''
         # Load policy model
-        model = self._load_single_model(self.model_path, self.model_dtype)
+        model = self._load_single_model(model_path=self.model_path, dtype=self.model_dtype, model_name="policy")
 
         # Load reference model if provided
         if self.ref_model_path and self.kl_coeff > 0.0:
-            ref_model = self._load_single_model(self.ref_model_path, self.model_dtype)
+            ref_model = self._load_single_model(model_path=self.ref_model_path, dtype=self.model_dtype, model_name="ref")
         else:
             ref_model = None
 

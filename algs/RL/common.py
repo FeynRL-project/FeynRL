@@ -3,13 +3,14 @@ import torch
 import torch.distributed
 from transformers import AutoModelForCausalLM, AutoConfig
 import deepspeed
+from peft import get_peft_model, LoraConfig
 
 class COMMON:
     '''
         This class provides common functions for policy gradient algorithms.
         Only contains methods that are 100% identical across all PG algorithms.
     '''
-    def _load_single_model(self, model_path: str, dtype: torch.dtype):
+    def _load_single_model(self, model_path: str, dtype: torch.dtype, model_name: str):
         '''
             Helper to load a single model from HuggingFace.
         '''
@@ -25,7 +26,49 @@ class COMMON:
                                 config=config,
                                 attn_implementation=None if self.attn_impl == '' else self.attn_impl
                             )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        # apply PEFT module if enabled
+        if model_name != "ref" and self.peft_config.use_peft:
+            model = self._apply_peft_module(model)
+            if rank == 0:
+                print(f"[Alg:{self.alg_name}][Rank {rank}] PEFT module applied for {model_name}")
+                model.print_trainable_parameters()
+
+        # Enable gradient checkpointing on the HF model before DS wrapping
+        if model_name != "ref" and self.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Gradient checkpointing enabled for {model_name}")
+
+            # With gradient checkpointing + peft/lora, pytorch may require that at least
+            # one input to each checkpointed block has requires_grad=True. When the base model
+            # is frozen which is the case in lora (i.e.,requires_grad=False), it causes backward to
+            # fail or skip grads. Hence, we need to force the inputs to require grad so lora params
+            # inside checkpointed blocks still receive gradients.
+            if self.peft_config.use_peft and self.peft_config.peft_type == "lora":
+                model.enable_input_require_grads()
+                if rank == 0:
+                    print(f"[Alg:{self.alg_name}][Rank {rank}] enable_input_require_grads() for {model_name}")
+
         return model
+
+    def _apply_peft_module(self, model):
+        '''
+            Apply PEFT module to the model if it is enabled.
+        '''
+        if self.peft_config.peft_type == 'lora':
+            lora_config = LoraConfig(r=self.peft_config.lora_rank,
+                                    lora_alpha=self.peft_config.lora_alpha,
+                                    lora_dropout=self.peft_config.lora_dropout,
+                                    target_modules=self.peft_config.lora_target_modules,
+                                    task_type=self.peft_config.task_type)
+
+            model_peft = get_peft_model(model, lora_config)
+            print("LoRA model loaded successfully")
+            return model_peft
+
+        else:
+            raise ValueError(f"Unsupported PEFT type: {self.peft_config.peft_type}")
 
     def init_training_engine(self):
         '''
@@ -60,19 +103,12 @@ class COMMON:
             # SGRPO/CISPO has policy only
             print(f"[Alg:{self.alg_name}][Rank {rank}] Model loaded: {self.model_path}")
 
-        # Enable gradient checkpointing on the HF model before DS wrapping
-        if self.gradient_checkpointing:
-            policy_model.gradient_checkpointing_enable()
-            if value_model is not None:
-                value_model.gradient_checkpointing_enable()
-
-            print(f"[Alg:{self.alg_name}][Rank {rank}] Gradient checkpointing enabled"
-                  f"{' (policy + value)' if value_model is not None else ''}")
-
         # Initialize policy engine
+        # only pass trainable params so ds doesn't waste memory on frozen ones (e.g. LoRA)
+        trainable_params = [p for p in policy_model.parameters() if p.requires_grad]
         self.policy_engine, self.policy_optimizer , _, _ = deepspeed.initialize(
                                                         model=policy_model,
-                                                        model_parameters=policy_model.parameters(),
+                                                        model_parameters=trainable_params,
                                                         config=ds_config_dict
                                                         )
         print(f"[Alg:{self.alg_name}][Rank {rank}] DeepSpeed engine initialized on device: {self.policy_engine.device}")
@@ -93,9 +129,10 @@ class COMMON:
             # Use separate DS config for value model if available (different lr, weight decay, grad clip)
             value_ds_config = self.deepspeed_value_config
             value_ds_dict = value_ds_config.model_dump() if value_ds_config is not None else ds_config_dict
+            trainable_value_params = [p for p in value_model.parameters() if p.requires_grad]
             self.value_engine, self.value_optimizer, _, _ = deepspeed.initialize(
                                                     model=value_model,
-                                                    model_parameters=value_model.parameters(),
+                                                    model_parameters=trainable_value_params,
                                                     config=value_ds_dict
                                                     )
             print(f"[Alg:{self.alg_name}][Rank {rank}] Value model initialized with DeepSpeed")
@@ -213,8 +250,15 @@ class COMMON:
 
         try:
             # 1. Save policy model weights (gathered fp16/bf16)
-            # os.makedirs(output_dir, exist_ok=True)
-            self.policy_engine.save_16bit_model(output_dir)
+            if self.peft_config.use_peft:
+                # All ranks must participate in GatheredParameters for ZeRO-3,
+                # but only rank 0 writes the adapter weights to disk.
+                peft_params = [p for p in self.policy_engine.module.parameters() if p.requires_grad]
+                with deepspeed.zero.GatheredParameters(peft_params, modifier_rank=0):
+                    if rank == 0:
+                        self.policy_engine.module.save_pretrained(output_dir)
+            else:
+                self.policy_engine.save_16bit_model(output_dir)
 
             # Barrier to ensure all ranks finished writing before rank 0 saves config
             # Without this, rank 0 might save config before other ranks write their shards
@@ -240,7 +284,13 @@ class COMMON:
                 if value_output_dir is None:
                     value_output_dir = output_dir.rstrip('/') + "_value"
                 
-                self.value_engine.save_16bit_model(value_output_dir)
+                if self.peft_config.use_peft:
+                    peft_value_params = [p for p in self.value_engine.module.parameters() if p.requires_grad]
+                    with deepspeed.zero.GatheredParameters(peft_value_params, modifier_rank=0):
+                        if rank == 0:
+                            self.value_engine.module.save_pretrained(value_output_dir)
+                else:
+                    self.value_engine.save_16bit_model(value_output_dir)
 
                 # Barrier to ensure all ranks finished writing before rank 0 saves config
                 if torch.distributed.is_initialized():

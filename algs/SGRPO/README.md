@@ -19,4 +19,57 @@ This flag does **not** change sampling as we still sample uniformly from replay.
 * If `False`, we step according to DeepSpeed gradient-accumulation boundaries (typical micro-batch accumulation).
 * If `True`, we accumulate gradients over the entire replay shard and apply **one optimizer step at the end** (often with a scaling to keep gradient magnitude comparable).
 
- ![SGRPO algorithm](./alg_sgrpo.png)
+
+**Input:** initial policy parameters $\theta_0$, replay shards $\mathcal{B}$ (`micro_batches`)
+
+**Hyperparams:** clip range $(1-\epsilon_\ell,\ 1+\epsilon_h)$, entropy weight $\beta_{\mathrm{ent}}$, KL weight $\beta_{\mathrm{kl}}$
+
+**Replay fields:** `mask`, `old_logprobs`, group-normalized advantages `zscore`
+
+*Training samples are uniformly drawn from replay; no prompt-group batching at training time.*
+
+For each training step:
+
+1. For each micro-batch $\mathcal{B}$:
+
+   - Forward policy: $(\log \pi_{\theta},\, H_{\theta}) \leftarrow \pi_{\theta}(\mathcal{B})$
+   - PPO ratio: $\rho \leftarrow \exp(\log \pi_{\theta} - \texttt{old\\_logprobs})$
+
+   - Clipped policy loss (masked mean, using `zscore`):
+
+$$
+\mathcal{L}_{\pi}
+\leftarrow
+-\mathrm{Mean}_{\texttt{mask}}\Big(
+\min\big(
+\rho\,\texttt{zscore},\
+\mathrm{clip}(\rho,1-\epsilon_\ell,1+\epsilon_h)\,\texttt{zscore}
+\big)
+\Big)
+$$
+
+   - (Optional) entropy term:
+
+$$
+\mathcal{L}_{\mathrm{ent}} \leftarrow \mathrm{Mean}_{\texttt{mask}}(H_{\theta})
+$$
+
+   - (Optional) KL penalty (vs. a reference policy $\pi_{\mathrm{ref}}$):
+
+$$
+\mathcal{L}_{\mathrm{kl}} \leftarrow \mathrm{Mean}_{\texttt{mask}}\big(\mathrm{KL}(\pi_{\theta}\,\|\,\pi_{\mathrm{ref}})\big)
+$$
+
+   - Total loss:
+
+$$
+\mathcal{L}
+\leftarrow
+\mathcal{L}_{\pi}
+-\beta_{\mathrm{ent}}\mathcal{L}_{\mathrm{ent}}
++\beta_{\mathrm{kl}}\mathcal{L}_{\mathrm{kl}}
+$$
+
+   - DeepSpeed backward/step (grad accumulation; optionally one step at shard end)
+
+**Return:** $\theta$

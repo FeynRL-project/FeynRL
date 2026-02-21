@@ -148,6 +148,8 @@ class Peft(BaseModel):
     lora_rank: int | None = None
     lora_alpha: int | None = None
     lora_dropout: float | None = None
+    # if None, apply lora to all linear layers (peft default).
+    # otherwise, set explicitly to target specific modules, e.g. ["q_proj", "v_proj"].
     lora_target_modules: list[str] | None = None
 
 class DeepSpeed(BaseModel):

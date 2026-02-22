@@ -47,9 +47,10 @@ class COMMON:
             # fail or skip grads. Hence, we need to force the inputs to require grad so lora params
             # inside checkpointed blocks still receive gradients.
             if self.peft_config.use_peft and self.peft_config.peft_type == "lora":
-                model.enable_input_require_grads()
-                if rank == 0:
-                    print(f"[Alg:{self.alg_name}][Rank {rank}] enable_input_require_grads() for {model_name}")
+                if hasattr(model, 'enable_input_require_grads'):
+                    model.enable_input_require_grads()
+                    if rank == 0:
+                        print(f"[Alg:{self.alg_name}][Rank {rank}] enable_input_require_grads() for {model_name}")
 
         return model
 

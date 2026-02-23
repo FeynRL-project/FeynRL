@@ -65,16 +65,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_source", default="openai/gsm8k")
     parser.add_argument("--local_dir", required=True)
     parser.add_argument("--run_id", default="123245")
-    parser.add_argument("--system_prompt", default="You are a precise math assistant. \
-    Solve the problem to obtain the correct final numeric answer. \
-    You may reason step by step, but do not include reasoning after the final answer. \
-    On a new line, output the final answer in exactly the following format: \
-    #### <answer> \
-    Rules: \
-    - The final answer line must appear exactly once and at the very end. \
-    - Do not include any text, symbols, or spaces after the answer. \
-    - Use plain numbers only (digits, optional leading '-', optional decimal point)."
-    )
+    parser.add_argument("--system_prompt", default="You are a helpful assistant. Think step-by-step and output the final answer after '####'.")
     parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Ratio of training data to use for validation")
     parser.add_argument("--seed", type=int, default=123345)

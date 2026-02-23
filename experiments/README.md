@@ -110,14 +110,14 @@ On **Node A**:
 ray start --head --port=26789
 ```
 
-Ray will print the **IP address** of the head node (example: `10.1.242.134`) and connection instructions.
+Ray will print the **IP address** of the head node (example: `100.9.128.5`) and connection instructions.
 
 ### 2) Join worker nodes
 
 On **Node B**:
 
 ```bash
-ray start --address=10.1.242.134:26789
+ray start --address=100.9.128.5:26789
 ```
 
 If successful, Ray will report that the node joined the cluster.

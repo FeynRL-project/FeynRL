@@ -30,9 +30,9 @@ run:
   # Leave null for single-node or when NCCL auto-detection works.
   # Find InfiniBand HCA device name
   # ibstat | grep "CA '"
-  #  Find which network interface carries 10.1.242.x traffic
-  # ip addr | grep 10.1.242
-  # e.g., inet 10.1.242.134/24 ... eth0
+  #  Find which network interface carries 100.9.128.x traffic
+  # ip addr | grep 100.9.128
+  # e.g., inet 100.9.128.134/24 ... eth0
   nccl_socket_ifname: null
   nccl_ib_hca: null
 

@@ -1,4 +1,5 @@
 import os
+import atexit
 import logging
 from misc.trackers import get_tracker
 
@@ -12,6 +13,8 @@ def setup_logging(rank: int, log_level: str = "INFO", exp_name: str = "") -> log
     logger = logging.getLogger(exp_name)
     logger.setLevel(level)
     logger.handlers = []  # Clear existing handlers
+    # Prevent logs from bubbling up to root logger where Ray/DeepSpeed might double-print them
+    logger.propagate = False
 
     # Format with timestamp and rank
     formatter = logging.Formatter(
@@ -33,4 +36,8 @@ def setup_tracker(config, rank: int):
         Setup experiment tracking using ExperimentTracker interface
         so we can switch between different tracking backends easily.
     '''
-    return get_tracker(config, rank)
+    tracker = get_tracker(config, rank)
+    if tracker is not None:
+        # Best-effort cleanup on exceptions/early exits. finish() is idempotent.
+        atexit.register(tracker.finish)
+    return tracker

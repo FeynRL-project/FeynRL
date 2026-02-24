@@ -168,7 +168,7 @@ class SGRPO(COMMON):
         '''
         assert self.policy_engine is not None, "DeepSpeed engine not initialized"
         assert isinstance(micro_batches, list) and len(micro_batches) > 0, \
-            "micro_batches must be a non-empty list which should be equal across "
+            "micro_batches must be a non-empty list which should be equal across " \
             "ranks via prepare_training_batches padding"
 
         device = self.policy_engine.device

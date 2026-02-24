@@ -79,7 +79,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_source", default="allenai/Dolci-RL-Zero-Math-7B")
     parser.add_argument("--local_dir", required=True)
     parser.add_argument("--run_id", default="dolci_v1")
-    parser.add_argument("--system_prompt", default="You are a helpful assistant. Think step-by-step and output the final answer after '####'.")
+    parser.add_argument("--system_prompt", default="You are a helpful assistant. Provide brief reasoning and output the final answer in the format '#### <answer>'.")
     parser.add_argument("--num_proc", type=int, default=4)
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Ratio of training data to use for validation")
     parser.add_argument("--test_ratio", type=float, default=0.1, help="Ratio of training data to use for test")

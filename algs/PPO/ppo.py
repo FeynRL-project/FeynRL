@@ -369,7 +369,7 @@ class PPO(COMMON):
         assert self.policy_engine is not None, "DeepSpeed policy_engine not initialized"
         assert self.value_engine  is not None, "DeepSpeed value_engine not initialized"
         assert isinstance(micro_batches, list) and len(micro_batches) > 0, \
-            "micro_batches must be a non-empty list which should be equal across "
+            "micro_batches must be a non-empty list which should be equal across " \
             "ranks via prepare_training_batches padding"
 
         # 1. Pre-compute values and GAE before any updates.

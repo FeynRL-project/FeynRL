@@ -566,7 +566,7 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
     # save locally
     with open(f"{experiment_id}_{config.run.method}_config.yaml", "w") as f:
-        yaml.dump(config._raw_yaml_config, f)
+        yaml.dump(config.model_dump(), f)
 
     return config
 

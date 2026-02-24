@@ -724,19 +724,18 @@ if __name__ == "__main__":
                     f"avg_kl_ref={epoch_avg.get('kl_ref', 0.0):.4f}, "
                     f"avg_kl_old={epoch_avg.get('kl_old', 0.0):.6f}")
 
-        # Log epoch metrics to experiment tracker
+        # Log epoch-level metrics to experiment tracker
         if tracker:
-            epoch_tracker_metrics = {f"epoch/{k}": v for k, v in epoch_avg.items()}
-            epoch_tracker_metrics.update({
-                "epoch/avg_reward": rollout_stats['avg_reward'],
-                "epoch/total_reward": rollout_stats['total_reward'],
-                "epoch/avg_response_len": rollout_stats['avg_response_len'],
-                "epoch/total_samples": rollout_stats['total_samples_generated'],
-                "epoch/rollout_time_sec": rollout_stats['rollout_time'],
-                "epoch/tokens_per_sec": rollout_stats['tokens_per_sec'],
-                "epoch/train_time_sec": train_time,
-            })
-            tracker.log_metrics(epoch_tracker_metrics, step=epoch + 1)
+            tracker.log_metrics({
+                **{f"epoch/{k}": v for k, v in epoch_avg.items()},
+                "rollout/avg_reward": rollout_stats['avg_reward'],
+                "rollout/total_reward": rollout_stats['total_reward'],
+                "rollout/avg_response_len": rollout_stats['avg_response_len'],
+                "rollout/total_samples": rollout_stats['total_samples_generated'],
+                "rollout/rollout_time_sec": rollout_stats['rollout_time'],
+                "rollout/tokens_per_sec": rollout_stats['tokens_per_sec'],
+                "rollout/train_time_sec": train_time,
+            }, step=global_step)
 
         ################
         # 5. Refresh rollout policy via direct weight sync

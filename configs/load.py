@@ -552,6 +552,11 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             print(config.model_dump_json(indent=4))
             print(46*"=")
 
+            # save locally
+            os.makedirs(config.run.checkpoint_dir, exist_ok=True)
+            with open(f"{config.run.checkpoint_dir}/{experiment_id}_{config.run.method}_config.yaml", "w") as f:
+                yaml.dump(config.model_dump(), f)
+
     except ValidationError as e:
         print("Configuration Error:")
         print(e)
@@ -565,10 +570,7 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         print(f"Error parsing YAML file: {e}")
         sys.exit(1)
 
-    # save locally
-    os.makedirs(config.run.checkpoint_dir, exist_ok=True)
-    with open(f"{config.run.checkpoint_dir}/{experiment_id}_{config.run.method}_config.yaml", "w") as f:
-        yaml.dump(config.model_dump(), f)
+
 
     return config
 

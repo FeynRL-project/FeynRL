@@ -39,6 +39,47 @@ def parse_hh_conversation(text):
 
     return turns
 
+
+# ============================================================
+# Turn Alternation Enforcement
+# ============================================================
+
+def enforce_strict_alternation(turns):
+    """
+    Ensure turns strictly alternate between user and assistant.
+    If consecutive turns have the same role, merge their content.
+
+    Example:
+        user, user, assistant  ->  user(merged), assistant
+    """
+
+    if not turns:
+        return turns
+
+    merged = []
+    prev_role, prev_content = turns[0]
+
+    flag = 0
+
+    for role, content in turns[1:]:
+        if role == prev_role:
+
+            flag = 1
+            # Merge consecutive same-role turns
+            prev_content = prev_content.rstrip() + "\n\n" + content.lstrip()
+        else:
+            merged.append((prev_role, prev_content))
+            prev_role, prev_content = role, content
+
+    merged.append((prev_role, prev_content))
+
+    return merged
+
+
+# ============================================================
+# First-Divergence Splitting
+# ============================================================
+
 def split_at_first_divergence(chosen_turns, rejected_turns):
     '''
         Split two turn sequences at the first differing turn.
@@ -119,16 +160,26 @@ def make_map_fn(split, args):
             rejected_turns,
         )
 
-        # Must have non-empty continuation
-        if len(chosen_cont) == 0 or len(rejected_cont) == 0:
+        # Enforce strict alternation
+        prompt_turns = enforce_strict_alternation(prompt_turns)
+        chosen_cont = enforce_strict_alternation(chosen_cont) 
+        rejected_cont = enforce_strict_alternation(rejected_cont) 
+
+        # Convert continuation turns to text
+        chosen_text = render_continuation_text(chosen_cont)
+        rejected_text = render_continuation_text(rejected_cont)
+
+        # Must have non-empty prompt and continuations
+        if not prompt_turns or not chosen_text.strip() or not rejected_text.strip():
             return None
 
-        data = { "prompt": build_prompt_messages(prompt_turns, args.system_prompt),
-                 "answer": render_continuation_text(chosen_cont),
-                 "rejected_answer": render_continuation_text(rejected_cont),
-                 "split": split,
-                 "index": idx,
-                }
+        data = {
+            "prompt": build_prompt_messages(prompt_turns, args.system_prompt),
+            "answer": chosen_text,
+            "rejected_answer": rejected_text,
+            "split": split,
+            "index": idx,
+        }
 
         return data
 
@@ -136,7 +187,12 @@ def make_map_fn(split, args):
 
 def create_file_name(args, split):
     fpart = "wsp" if args.system_prompt else "ns"
-    return f"hh_preference_multiturn_{args.run_id}_{fpart}_{split}.parquet"
+    return f"hh_rlhf_dpo_{args.run_id}_{fpart}_{split}.parquet"
+
+
+# ============================================================
+# Main
+# ============================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -193,25 +249,32 @@ if __name__ == "__main__":
     val_dataset.to_parquet(val_file)
     test_dataset.to_parquet(test_file)
 
-    sample = train_dataset[0]
-    print(sample)
+    # --------------------------------------------------------
+    # Sanity Check Print
+    # --------------------------------------------------------
+    for isample in range(5):
 
-    print("\n" + "=" * 80)
-    print("Sample Example")
-    print("=" * 80)
-    print("\nPrompt:\n")
-    for m in sample["prompt"]:
-        print(f"{m['role']}: {m['content']}\n")
+        print(100 * "=")
+        print(100 * "=")
 
-    print("=" * 80)
-    print("Chosen Continuation:\n")
-    print(sample["answer"])
-    print("=" * 80)
-    print("Rejected Continuation:\n")
-    print(sample["rejected_answer"])
-    print("=" * 80)
+        sample = train_dataset[isample]
+        print(sample)
 
-    print(f"\nTrain: {len(train_dataset)}")
-    print(f"Val:   {len(val_dataset)}")
-    print(f"Test:  {len(test_dataset)}")
-    print("Done.")
+        print("\n" + "=" * 80)
+        print("Sample Example")
+        print("=" * 80)
+        for m in sample["prompt"]:
+            print(f"{m['role']}: {m['content']}\n")
+
+        print("=" * 80)
+        print("Chosen Continuation:\n")
+        print(sample["answer"])
+        print("=" * 80)
+        print("Rejected Continuation:\n")
+        print(sample["rejected_answer"])
+        print("=" * 80)
+
+        print(f"\nTrain: {len(train_dataset)}")
+        print(f"Val:   {len(val_dataset)}")
+        print(f"Test:  {len(test_dataset)}")
+        print("Done.")

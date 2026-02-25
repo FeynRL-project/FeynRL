@@ -102,6 +102,8 @@ reward:
 
 rollout:
   temperature: 1.0
+  # max number of tokens to generate per output sequence
+  # note max_seq_len in data is the max total sequence length (prompt + response)
   max_tokens: 512
   n_samples: 8
   top_p: 1.0

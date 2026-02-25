@@ -534,6 +534,12 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.train.tau is None or config.train.gamma is None or not config.model.value_model:
                     raise ValueError("tau and gamma and value_model must be specified for ppo")
 
+            weight_sync_method = config.run.weight_sync_method
+            if weight_sync_method is None:
+                raise ValueError("weight_sync_method must be specified for rl training")
+            if weight_sync_method not in ["direct", "disk"]:
+                raise ValueError("weight_sync_method must be 'direct' or 'disk'")
+
         if method != "eval":
             # Sync AFTER updating world_size
             config.sync_deepspeed_config(world_size)

@@ -39,26 +39,19 @@ def parse_hh_conversation(text):
 
     return turns
 
-
-# ============================================================
-# Turn Alternation Enforcement
-# ============================================================
-
 def enforce_strict_alternation(turns):
-    """
-    Ensure turns strictly alternate between user and assistant.
-    If consecutive turns have the same role, merge their content.
+    '''
+        Ensure turns strictly alternate between user and assistant.
+        If consecutive turns have the same role, merge their content.
 
-    Example:
-        user, user, assistant  ->  user(merged), assistant
-    """
-
+        Example:
+            user, user, assistant  ->  user(merged), assistant
+    '''
     if not turns:
         return turns
 
     merged = []
     prev_role, prev_content = turns[0]
-
     flag = 0
 
     for role, content in turns[1:]:
@@ -72,18 +65,11 @@ def enforce_strict_alternation(turns):
             prev_role, prev_content = role, content
 
     merged.append((prev_role, prev_content))
-
     return merged
-
-
-# ============================================================
-# First-Divergence Splitting
-# ============================================================
 
 def split_at_first_divergence(chosen_turns, rejected_turns):
     '''
         Split two turn sequences at the first differing turn.
-
         Returns:
             prompt_turns
             chosen_continuation_turns
@@ -190,10 +176,6 @@ def create_file_name(args, split):
     return f"hh_rlhf_dpo_{args.run_id}_{fpart}_{split}.parquet"
 
 
-# ============================================================
-# Main
-# ============================================================
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_source", default="Anthropic/hh-rlhf")
@@ -249,9 +231,7 @@ if __name__ == "__main__":
     val_dataset.to_parquet(val_file)
     test_dataset.to_parquet(test_file)
 
-    # --------------------------------------------------------
     # Sanity Check Print
-    # --------------------------------------------------------
     for isample in range(5):
 
         print(100 * "=")

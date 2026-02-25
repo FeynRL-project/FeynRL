@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, ConfigDict, ValidationError
 import yaml
 import sys
 import copy
+import os
 
 class Run(BaseModel):
     '''
@@ -565,7 +566,8 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         sys.exit(1)
 
     # save locally
-    with open(f"{experiment_id}_{config.run.method}_config.yaml", "w") as f:
+    os.makedirs(config.run.checkpoint_dir, exist_ok=True)
+    with open(f"{config.run.checkpoint_dir}/{experiment_id}_{config.run.method}_config.yaml", "w") as f:
         yaml.dump(config.model_dump(), f)
 
     return config

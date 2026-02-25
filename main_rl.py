@@ -381,9 +381,9 @@ def run_training_step(engines, shard_refs):
 
     # Dynamically aggregate all metric keys across engines.
     # This works for both sgrpo (policy-only) and ppo (policy + value metrics).
-    # metrics_list: clipfrac, approx_kl, ent_loss, pi_loss, pi_loss_total, kl_ref
+    # metrics_list: clipfrac, approx_kl, loss_ent, loss_pi, loss_total, kl_ref
     # if value network, add: v_loss
-    # pi_loss_total includes: pi_loss + ent_coef * ent_loss
+    # loss_total includes: loss_pi + ent_coef * loss_ent
 
     all_keys = set()
     for m in metrics_list:

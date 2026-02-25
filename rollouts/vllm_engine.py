@@ -188,6 +188,10 @@ class VLLMRolloutEngine:
         with open(shm_path, 'wb') as f:
             pickle.dump(state_dict, f)
 
+        # Free the CPU state_dict now that it's persisted to /dev/shm.
+        # The TP workers will read from the file, so we don't need this copy.
+        del state_dict
+
         self.log(f"Updating weights directly to version {version}")
 
         try:

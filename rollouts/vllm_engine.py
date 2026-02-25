@@ -169,14 +169,33 @@ class VLLMRolloutEngine:
             self.log(f"Model already at version {version}, skipping weight update")
             return True
 
+        # Why /dev/shm?
+        # vllm collective_rpc serializes args with msgspec, which cannot encode
+        # strings (or bytes) larger than 4GB (2**32-1). For large models the pickled
+        # state_dict easily exceeds that. Instead of sending weight data through
+        # msgspec, we pickle to /dev/shm, a ram-backed tmpfs which has no real disk I/O,
+        # just a memcpy into kernel page cache, and pass only the ~50-byte file
+        # path through collective_rpc. Each TP worker then reads the file
+        # independently. This works across multi-node setups because:
+        #   1. Ray delivers state_dict to this actor on its node via object store
+        #   2. This actor writes to /dev/shm on its node
+        #   3. collective_rpc fans out to TP workers on the same node
+        #   4. Workers read from the same local /dev/shm
+        # Each rollout engine on a different node writes its own file (PID in name).
+        # collective_rpc is synchronous, so the file is guaranteed to exist until
+        # all workers finish, and the finally block cleans it up afterward.
+        shm_path = f"/dev/shm/feynrl_weights_{os.getpid()}_v{version}.pkl"
+        with open(shm_path, 'wb') as f:
+            pickle.dump(state_dict, f)
+
         self.log(f"Updating weights directly to version {version}")
 
-        # Pickle the state_dict and encode as latin-1 string to pass through vllm's
-        # msgspec-based RPC safely. vllm's RPC mangles bytes/ndarray/tensor types,
-        # but passes strings through reliably. Latin-1 is a lossless 1:1 byte↔char
-        # mapping, and CPython stores latin-1 strings at 1 byte/char internally.
-        serialized_state = pickle.dumps(state_dict).decode('latin-1')
-        self.vllm_engine.collective_rpc("update_weights", args=(serialized_state,))
+        try:
+            self.vllm_engine.collective_rpc("update_weights", args=(shm_path,))
+
+        finally:
+            os.remove(shm_path)
+
         self.loaded_version = version
         self.log(f"Weights updated to version {version}")
         return True

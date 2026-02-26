@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/rasoolfa/FeynRL"><img src="https://img.shields.io/badge/GitHub-FeynRL-181717?style=flat-square&logo=github" alt="GitHub"></a>&nbsp;
   <a href="https://rasoolfa.github.io"><img src="https://img.shields.io/badge/Blog-FeynRL-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Blog"></a>&nbsp;
-  <a href=""><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>&nbsp;
+  <a href="https://github.com/rasoolfa/FeynRL"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>&nbsp;
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square" alt="License"></a>
 </p>
 

@@ -654,6 +654,12 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if config.rollout.temperature is not None and config.rollout.temperature < 0:
                 raise ValueError(f"rollout.temperature must be >= 0, got {config.rollout.temperature}")
 
+            if config.model.ref_model is not None and (config.train.kl_coeff == 0 or config.train.kl_coeff is None):
+                raise ValueError(f"kl_coeff must be > 0 if model.ref is not None")
+
+            if config.model.ref_model is None and (config.train.kl_coeff > 0):
+                raise ValueError(f"model.ref must be not None if kl_coeff > 0")
+
             # Reward function
             if not config.reward or not config.reward.reward_func:
                 raise ValueError("reward.reward_func must be specified for RL training")

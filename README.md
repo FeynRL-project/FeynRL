@@ -1,7 +1,7 @@
 <h1 align="center">FeynRL</h1>
 
 <p align="center">
-  Lightweight, modular, and scalable post-training for large models.
+  Lightweight, modular, and scalable framework for post-training and fine-tuning large models.
 </p>
 
 <p align="center">

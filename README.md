@@ -1,17 +1,50 @@
-# FeynRL
+<h1 align="center">FeynRL</h1>
 
-There are several great open source frameworks for training and post training large models for supervised learning and reinforcement learning (RL), but many have become hard to work with in practice. They are often complex, have a steep learning curve, and require you to understand many tightly coupled components before you can safely modify anything. Adapting them to a new research idea or a new setup can be slow, error prone, and frustrating. That complexity also makes reproducibility harder than it should be. When a framework has many moving parts and evolves quickly, experiments can become difficult to track, debug, and reliably reproduce, which is the opposite of what you want when iterating on new ideas.
+<p align="center">
+  Lightweight, modular, and scalable post-training for large models.
+</p>
 
-FeynRL (pronounced like “FineRL”) aims to fill this gap. It is a lightweight, modular, production grade framework for post-training/finetuning LLMs, VLMs, and VLAs, without sacrificing much readability, scalability, or flexibility. The guiding principle is a clear separation of concerns. Algorithm code stays algorithmic, and systems code stays systems. There is no free lunch though, and some distributed training and system codes inevitably surface inside algorithm implementations for example. FeynRL keeps these interfaces explicit and clean, so each component’s role remains easy to understand, test, and debug.
+<p align="center">
+  <a href="https://github.com/rasoolfa/FeynRL"><img src="https://img.shields.io/badge/GitHub-FeynRL-181717?style=flat-square&logo=github" alt="GitHub"></a>&nbsp;
+  <a href="https://rasoolfa.github.io"><img src="https://img.shields.io/badge/Blog-FeynRL-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Blog"></a>&nbsp;
+  <a href=""><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>&nbsp;
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square" alt="License"></a>
+</p>
 
-This is the first release, and obviously it comes with its own set of issues. As we add features and capabilities, the goal is to keep FeynRL simple, efficient, and predictable, rather than letting complexity creep in. We are open sourcing it to give the community a framework that is easy to use and reason about, and to build it together with the people who will stress test it, extend it, and make it better.
-## Overview
+---
+
+**FeynRL** (pronounced “FineRL”) is a lightweight, modular framework for **post-training and fine-tuning** large models (supervised fine-tuning and RL). It is designed for researchers and engineers who need a **robust, scalable distributed training stack** without sacrificing readability, hackability, or reproducibility.
+
+### 🎯 Why We Built This
+
+There are several excellent open-source frameworks for training and post-training large models (supervised fine-tuning and RL), but many are hard to work with in practice. They’ve grown complex, have steep learning curves, and often require understanding tightly coupled components before you can safely change anything. Adapting them to a new research idea or a new setup can be slow, error-prone, and frustrating. That complexity also hurts reproducibility: when a framework has many moving parts and evolves quickly, experiments become harder to track, debug, and reliably reproduce.
+
+FeynRL is built to fill this gap: a **lightweight, modular, scalable** framework for post-training and fine-tuning large models—without sacrificing readability, flexibility, or performance. The core design principle is **separation of concerns**: algorithm code stays algorithmic, and systems code stays systems. In distributed training, some systems details inevitably surface, but FeynRL aims to keep those interfaces as explicit and clean as possible so components remain easy to understand, test, and debug.
+
+This is the first public release, so expect rough edges. As we add features and capabilities, our goal is to keep FeynRL **simple, efficient, and predictable**, rather than letting complexity creep in. We’re open-sourcing it to provide a framework that’s easy to reason about, and to build it alongside the community that will stress-test it, extend it, and improve it.
+
+## 🧭 Overview
 
 FeynRL is built around three core principles:
 
-- **Efficiency**: Optimized for training models with billions of parameters, using DeepSpeed for distributed training, vLLM for fast inference, and Ray for orchestration at scale.
-- **Modularity**: Clear separation between training engines, rollout generation, reward computation, and data handling, which makes it easy to swap components and experiment safely.
-- **Algorithm-first**: Designed to accelerate research by keeping the codebase simple, hackable, and performant and keep the focus on the algorithms.
+- ⚡ **Efficiency**: Designed for training models with billions of parameters, using DeepSpeed for distributed training, vLLM for fast inference, and Ray for orchestration at scale.
+- 🧩 **Modularity**: Clear separation between training engines, rollout generation, and data handling, so it’s easy to swap components and experiment safely.
+- 🧠 **Algorithm-first**: Designed to accelerate research with a simple, hackable codebase that keeps the focus on the algorithms.
+
+### ✅ What’s Included
+
+- 🧪 **Training paradigms**: RL (PPO, SGRPO, CISPO), preference-based learning (DPO), and supervised fine-tuning (SFT)
+- 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
+- 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
+- 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes
+- 🔁 **Training↔rollout scheduling**: Sync alternates rollout generation and training (each waits for the other). Async overlaps generation and training for higher utilization, at the cost of potentially more off-policy samples.
+- 🔄 **Weight sync**: Periodic weight transfer from training to rollout workers (in-memory when supported, with disk fallback)
+- 🧷 **Parameter-efficient fine-tuning**: LoRA supports
+- 📈 **Experiment tracking**: MLflow and Weights & Biases (pluggable tracker interface)
+- 🧺 **Mixed-dataset sampling**: Configurable per-dataset ratios (dynamic or fixed-ratio scheduling)
+- 🏅 **Evaluation**: Standalone eval pipeline with vLLM rollout engines
+
+FeynRL supports multiple post-training paradigms, including RL methods such as PPO, SGRPO, and CISPO; preference-based learning such as DPO; and supervised fine-tuning (SFT). It runs at scale with multi-GPU and multi-node training via DeepSpeed (ZeRO Stage 1/2/3), and uses vLLM-powered rollout engines for fast inference and evaluation. Ray orchestrates training and rollout workers across nodes, with periodic weight synchronization from training to rollout workers via in-memory transfer when supported (and a disk-based fallback). To improve overall throughput, FeynRL can run in **synchronous** mode (generate rollouts, then train) or **asynchronous** mode (overlap generation and training), trading off utilization against how off-policy the collected samples may be. It also supports LoRA fine-tuning, pluggable experiment tracking (MLflow or Weights & Biases), configurable mixed-dataset sampling, and a standalone evaluation pipeline.
 
 ## How to Use FeynRL
 

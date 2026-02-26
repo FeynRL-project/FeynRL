@@ -37,14 +37,25 @@ When the differences are intentional, we document them and name variants explici
 
 That is wonderful. Please open a GitHub issue with steps to reproduce, expected behavior, and actual behavior. If you can include logs, config files, or a minimal script, it will help a lot. Pull requests are also welcome, and we will review them as quickly as possible.
 
-## We have a new work where we propose a method that can improve results significantly. Would you be open to adding our method to the repo?
+## We have a new work where we propose a method (RL or non-RL) that can improve results significantly. Would you be open to adding our method to the repo?
 
-Absolutely. We're open to contributions that improve the repo. Please open a GitHub issue and include enough context (paper link, a short summary, expected gains, and how to reproduce) so others can follow along and review it. Also, please make sure your code is clean and closely follows the repo structure. If you prefer to discuss privately first, you can email Rasool.
+Absolutely. We're open to contributions that improve the repo. Please submit a PR and include enough context (paper link, a short summary, expected gains, and how to reproduce) so others can follow along and review it. Also, please make sure your code is clean and closely follows the repo structure. If you prefer to discuss privately first, you can [email Rasool](https://rasoolfa.github.io/).
+
+## What hardware do I need to run FeynRL?
+
+We have tested FeynRL on NVIDIA A100 and H100 GPUs. That said, any GPU with CUDA support should work as long as you can install the required packages (PyTorch, DeepSpeed, vLLM, etc.). The main constraint is GPU memory: larger models need more VRAM, and you can use DeepSpeed ZeRO Stage 3 with CPU offloading to reduce the per-GPU memory footprint.
 
 ## We have a new rollout engine that can significantly improve rollout throughput. Would you be open to adding our rollout engine to the repo?
 
-Of course. Please open a PR, or if you prefer to discuss it first, you can email Rasool.
+Of course. Please submit a PR, or if you prefer to discuss it first, you can [email Rasool](https://rasoolfa.github.io/).
 
 ## I have a few research ideas and want guidance. Can you help?
 
-We can try. If you are comfortable sharing your idea publicly, open a GitHub issue and include enough context for others to follow along. If you prefer to discuss privately, you can email Rasool. Contact details are available on [Rasool's website](https://rasoolfa.github.io/).
+We can try. If you are comfortable sharing your idea publicly, open a GitHub issue and include enough context for others to follow along. If you prefer to discuss privately, you can [email Rasool](https://rasoolfa.github.io/).
+## I think there are issues in the code and I have ideas to help improve it. What should I do?
+
+We're happy to hear that—this is exactly why we open-sourced the project. Please submit a GitHub issue describing what you found and any suggestions you have. Pull requests are also very welcome.
+
+## I have a question that's not covered here. Where can I ask?
+
+Please open a GitHub issue with your question.

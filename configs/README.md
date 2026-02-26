@@ -1,6 +1,6 @@
 # Configuration Files Guide
 
-This directory contains the configuration files for training and evaluating models with LeanRL. All experiments are configured via YAML files that are parsed and validated using Pydantic schemas defined in `configs/load.py`.
+This directory contains the configuration files for training and evaluating models with FeynRL. All experiments are configured via YAML files that are parsed and validated using Pydantic schemas defined in `configs/load.py`.
 
 ## Core Principle
 **No default values are set within the workspace.** Every parameter required for an experiment must be explicitly defined in the configuration file. The configuration files provided here serve as complete templates for each experiment type.

@@ -354,6 +354,8 @@ class Config(BaseModel):
                     optimizer_steps_per_epoch = self.train.train_steps_per_epoch
 
                 else:
+                    # rollout_samples_per_epoch is the number of prompts.
+                    # Multiply by n_samples to get total number of samples in the replay buffer.
                     # Note: estimated_replay_size may be slightly larger than actual if some
                     # responses have response_len==0 (filtered in replay_buffer.add_batch_seqs).
                     # This can cause the lr schedule to not fully reach cos_min_ratio.

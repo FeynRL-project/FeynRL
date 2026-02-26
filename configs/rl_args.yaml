@@ -121,7 +121,8 @@ rollout:
   tensor_parallel_size: 1
   # Batch size for the prompt dataloader during rollout generation.
   rollout_batch_size_per_gpu: 2
-  # Total number of samples to generate per epoch.
+  # Number of prompts to process per epoch.
+  # Total samples in replay buffer = rollout_samples_per_epoch * n_samples.
   rollout_samples_per_epoch: 100
 
 model:

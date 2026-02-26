@@ -259,11 +259,12 @@ def collect_rollouts(dataloader,
     total_response_len = 0
     total_tokens = 0
 
+    # rollout_samples_per_epoch is the number of PROMPTS, not total completions.
     # example: rollout_gpus=2, rollout_batch_size_per_gpu=12, n_samples=3, rollout_samples_per_epoch = 25
     # local_batch_size = num_rollout_engines * rollout_batch_size_per_gpu = 2 * 12 = 24
     # Batches needed = ceil(25 / 24) = 2 batches
-    # Total Prompts = 2 * 24 = 48 prompts
-    # Total Samples in Buffer = 48 prompts * n_samples (e.g., 3) = 144 samples
+    # Total Prompts = 2 * 24 = 48 prompts (rounded up to batch boundary)
+    # Total completions in replay buffer = 48 prompts * 3 n_samples = 144
 
     batch_size = dataloader.batch_sampler.local_batch_size
     num_batches_per_epoch = len(dataloader)
@@ -629,7 +630,7 @@ if __name__ == "__main__":
     logger.info(f"Rollout dataloader with {len(rollout_dataloader)} batches/machine, "
                 f"n_samples={config.rollout.n_samples} per prompt")
 
-    # replay buffer size would be rollout_samples_per_epoch * n_samples per prompt
+    # replay buffer size = rollout_samples_per_epoch (prompts) * n_samples (completions per prompt)
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
                                  )

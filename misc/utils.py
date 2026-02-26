@@ -2,7 +2,7 @@ import torch
 import os
 import importlib
 import ray
-from ray.exceptions import GetTimeoutError, RayActorError
+from ray.exceptions import GetTimeoutError, RayActorError, RayTaskError
 
 def safe_string_to_torch_dtype(dtype_in):
     '''
@@ -131,3 +131,8 @@ def ray_get_with_timeout(refs, timeout, description, logger):
     except RayActorError as e:
         logger.error(f"[ActorDied] {description} failed: actor died: {e}")
         raise RuntimeError(f"{description} failed because a Ray actor died: {e}")
+
+    # Debug remote execution failures exactly as if they had occurred locally.
+    except RayTaskError as e:
+        logger.error(f"[TaskError] {description} failed: {e}")
+        raise RuntimeError(f"{description} failed with a remote exception: {e}")

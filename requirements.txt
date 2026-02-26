@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch
+torchvision
+pydantic==2.12.5
+pyyaml==6.0.3
+huggingface_hub==0.36.0
+transformers==4.57.6
+deepspeed==0.18.6
+datasets==4.5.0
+vllm==0.15.1
+ray==2.53.0
+mlflow==3.8.1
+wandb==0.25.0
+peft==0.18.1

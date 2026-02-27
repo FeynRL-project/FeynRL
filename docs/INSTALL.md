@@ -82,3 +82,24 @@ pip install flash-attn==2.8.3 --no-build-isolation --config-settings="--jobs=8" 
 ```bash
 python -c "import flash_attn; print(flash_attn.__version__)"
 ```
+
+---
+
+## Troubleshooting
+
+### FlashAttention Installation Fails
+Building `flash-attn` from source is resource-intensive and can fail due to:
+- **OOM during compilation**: Try reducing the number of parallel jobs: `--config-settings="--jobs=4"`.
+- **CUDA/PyTorch Mismatch**: Ensure `nvcc --version`, `torch.version.cuda`, and your driver version are all compatible with each other.
+
+### Ray Initialization Mismatch
+In some environments, Ray may fail to initialize with the default settings.
+- **Port Conflicts**: If the default Ray port is taken, specify a different one using `ray start --head --port <NEW_PORT>`.
+- **Shared Memory**: On Docker/Kubernetes, ensure `/dev/shm` is large enough (at least 30% of total RAM).
+
+### DeepSpeed / NCCL Timeouts
+If training hangs at initialization:
+- **Set Network Interfaces**: Explicitly set the NCCL interface if you have multiple NICs (e.g., `export NCCL_SOCKET_IFNAME=eth0`).
+- **Increase Timeouts**: Some larger models may require more time to initialize. Check the `run.init_timeout` setting in your config.
+
+For more detailed scaling and system-level troubleshooting, see the **[FAQ](../docs/FAQ.md)**.

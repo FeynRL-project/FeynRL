@@ -1,5 +1,13 @@
 #!/bin/bash
 
+source /path/to/loc/murdock/anaconda3/etc/profile.d/conda.sh
+conda activate /path/to/loc/murdock/anaconda3/envs/feynrl-env
+export CUDA_HOME=/path/to/loc/murdock/anaconda3/envs/feynrl-env
+export PATH=$CUDA_HOME/bin:$PATH
+PYTHON="/path/to/loc/murdock/anaconda3/envs/feynrl-env/bin/python"
+TORCHRUN="/path/to/loc/murdock/anaconda3/envs/feynrl-env/bin/torchrun"
+
+
 # Configuration
 TEST_CONFIG_DIR="./unit_tests/configs"
 LOG_DIR="./logs/unit_tests/results"

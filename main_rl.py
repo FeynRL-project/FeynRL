@@ -40,7 +40,7 @@ def set_random_seeds(seed):
 
 def setup_ray(ray_address):
     '''
-       Initialize ray cluster and setup master address.
+       Initialize the Ray cluster and retrieve the driver node's IP address.
     '''
     if ray_address:
         ray.init(address=ray_address, ignore_reinit_error=True)
@@ -49,6 +49,8 @@ def setup_ray(ray_address):
         ray.init(ignore_reinit_error=True)
 
     try:
+        # The IP is used as master_addr for deepspeed/pytorch distributed rendezvous.
+        # rank 0 listens on this address and all other ranks connect to it to form the process group.
         master_addr = ray.util.get_node_ip_address()
     except Exception:
         # Fallback to localhost if we cannot get the IP (e.g. single node without network)
@@ -309,7 +311,7 @@ def collect_rollouts(dataloader,
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
-    if len(replay_buffer) <= 1:
+    if len(replay_buffer) == 0:
         raise ValueError("Replay buffer is empty")
 
     rollout_time = time.time() - rollout_start_time
@@ -329,6 +331,85 @@ def collect_rollouts(dataloader,
             "total_reward": total_reward_sum,
             "avg_response_len": avg_response_len,
             "rollout_time": rollout_time,
+            "tokens_per_sec": tps}
+
+def collect_rollouts_async(dataloader, rollout_engines, epoch, policy_version):
+    '''
+        Non-blocking rollout collection: iterates the dataloader and schedules
+        all rollout generation, then returns control immediately without waiting for results.
+    '''
+    num_rollout_engines = len(rollout_engines)
+    all_futures = []
+
+    for rollout_batch in dataloader:
+        rollout_shards = shard_batch_for_engines(rollout_batch, num_rollout_engines)
+        if not rollout_shards:
+            continue
+
+        batch_futures = []
+        for i, shard in enumerate(rollout_shards):
+            batch_futures.append(rollout_engines[i].generate.remote(prompts=shard,
+                                                                    current_iter=epoch,
+                                                                    policy_version=policy_version))
+        all_futures.append(batch_futures)
+
+    return all_futures
+
+def finalize_rollouts(all_futures, replay_buffer, logger, rollout_timeout, start_time=None):
+    '''
+        Blocking call to gather all previously scheduled rollouts from
+        collect_rollouts_async and add them to the replay buffer.
+    '''
+    # wall_start_time: when the async rollout was first scheduled (includes training overlap time)
+    # finalize_start_time: when we actually started waiting for results (generation-only time)
+    wall_start_time = start_time if start_time is not None else time.time()
+    finalize_start_time = time.time()
+
+    total_samples_generated = 0
+    total_reward_sum = 0.0
+    total_response_len = 0
+    total_tokens = 0
+
+    for batch_futures in all_futures:
+        rollout_lists = ray_get_with_timeout(refs=batch_futures,
+                                             timeout=rollout_timeout,
+                                             description="finalize prefetched rollouts",
+                                             logger=logger)
+
+        rollout_merged = []
+        for rl in rollout_lists:
+            rollout_merged.extend(rl)
+            for sample in rl:
+                total_samples_generated += 1
+                total_reward_sum += sample['pred_rewards'].sum().item()
+                total_response_len += sample['response_len']
+                total_tokens += len(sample['prompt_ids']) + len(sample['response_ids'])
+
+        replay_buffer.add_batch_seqs(rollout_merged)
+
+    if len(replay_buffer) == 0:
+        raise ValueError("Replay buffer is empty after finalize_rollouts")
+
+    # wall_time: total time since scheduling (includes overlapped training time)
+    # finalize_time: time spent in this function waiting/processing (generation-only perspective)
+    wall_time = time.time() - wall_start_time
+    finalize_time = time.time() - finalize_start_time
+
+    if total_samples_generated == 0:
+        avg_reward = 0.0
+        avg_response_len = 0.0
+    else:
+        avg_reward = total_reward_sum / total_samples_generated
+        avg_response_len = total_response_len / total_samples_generated
+
+    tps = total_tokens / max(1e-6, wall_time)
+
+    return {"total_samples_generated": total_samples_generated,
+            "avg_reward": avg_reward,
+            "total_reward": total_reward_sum,
+            "avg_response_len": avg_response_len,
+            "rollout_time": wall_time,
+            "finalize_wait_time": finalize_time,
             "tokens_per_sec": tps}
 
 def prepare_training_batches(replay_buffer, batch_size: int, num_engines: int) -> list:
@@ -425,10 +506,6 @@ def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir,
                          description=f"checkpoint save (epoch {epoch+1})",
                          logger=logger)
 
-    # Flush filesystem buffers to ensure checkpoint is fully written
-    if rank == 0:
-        os.sync()
-
     logger.info(f"[Epoch {epoch+1}] Checkpoint saved: {model_path}")
     return model_path
 
@@ -512,7 +589,7 @@ def refresh_rollout_engine(rollout_engines, updated_policy_path, version, logger
 if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config-file", type=str, default="./config/dummy.yaml", help="config file")
+    parser.add_argument("--config-file", type=str, default="./config/rl_args.yaml", help="config file")
     parser.add_argument("--experiment_id", type=str, default="run_1", help="experiment id")
     parser.add_argument("--log-level", type=str, default="INFO", help="logging level")
     args = parser.parse_args()
@@ -591,7 +668,7 @@ if __name__ == "__main__":
     logger.info("All training engines ready!")
 
     ########
-    # 5. load tokenizer
+    # 4. load tokenizer
     ########
     logger.info(f"Loading tokenizer from {config.model.name}")
     tokenizer = load_tokenizer(model_name=config.model.name,
@@ -600,7 +677,7 @@ if __name__ == "__main__":
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
 
     ########
-    # 6. initialize inference engine
+    # 5. initialize inference engine
     ########
     logger.info("Setting up inference/rollout engines...")
     reward_func_name = config.reward.reward_func if config.reward.reward_func else None
@@ -619,7 +696,7 @@ if __name__ == "__main__":
     logger.info(f"Created {num_rollout_engines} rollout engines with TP={config.rollout.tensor_parallel_size}")
 
     ########
-    # 6. Load the rollout dataloader
+    # 6. load the rollout dataloader
     ########
     logger.info(f"Loading rollout dataloader from {config.data.train_files_path}")
     rollout_dataloader = create_rollout_dataloader(params=config,
@@ -638,19 +715,22 @@ if __name__ == "__main__":
     ########
     # 7. Training and evaluation loop
     ########
-    policy_version = 0
     global_step = 0
     number_of_epochs  = config.train.total_number_of_epochs
     steps_per_epoch = config.train.train_steps_per_epoch
 
     # Weight sync settings
-    weight_sync_method = config.run.weight_sync_method or "direct"
+    weight_sync_method = config.run.weight_sync_method
     checkpoint_save_interval = config.run.checkpoint_save_interval if config.run.checkpoint_save_interval is not None else 1
 
     # Timeout settings (seconds) for ray.get() calls
     rollout_timeout = config.run.rollout_timeout
     train_step_timeout = config.run.train_step_timeout
     save_timeout = config.run.save_timeout
+    # when overlap is enabled, sync_timeout must be large enough to cover the remaining in-flight rollout generation time PLUS the
+    # actual weight transfer time. This is because push_weights_to_rollout dispatches update_weights_direct to rollout actors that may 
+    # still be running generate tasks. Ray actors are single-threaded, so the update queues behind generation. 
+    # Set sync_timeout >= rollout_timeout + expected weight transfer time to avoid spurious timeouts.
     sync_timeout = config.run.sync_timeout
 
     # Overlap mode settings
@@ -670,45 +750,115 @@ if __name__ == "__main__":
 
     logger.info("=" * 50)
     entire_training_start_time = time.time()
+
+    policy_version = 0
+    # rollout_policy_version tracks which policy version the rollout engines
+    # currently have loaded. When overlap is enabled, we allow the rollout
+    # engine to lag behind the training policy by up to overlap_max_lag versions.
+    pending_rollout_futures = None
+    pending_rollout_buffer = None
+    # version used to generate the prefetched data
+    prefetch_start_time = None
+    prefetch_policy_version = None
+    rollout_policy_version = 0
+
     for epoch in range(number_of_epochs):
         epoch_start_time = time.time()
-        logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Starting rollout generation...")
-
-        # Set epoch on sampler to reshuffle data
-        rollout_dataloader.batch_sampler.set_epoch(epoch)
+        is_last_epoch = (epoch == number_of_epochs - 1)
 
         ################
-        # 1. Collect rollouts
+        # 1. Collect rollouts and finalize prefetch (if overlap is enabled)
         ################
-        # data is collected in parallel across all rollout engines and saved to replay buffer
-        rollout_stats = collect_rollouts(dataloader=rollout_dataloader,
-                                         rollout_engines=rollout_engines,
-                                         epoch=epoch,
-                                         policy_version=policy_version,
-                                         replay_buffer=replay_buffer,
-                                         n_samples=config.rollout.n_samples,
-                                         logger=logger,
-                                         rollout_timeout=rollout_timeout)
+        if overlap_enabled and pending_rollout_futures is not None:
+            # Finalize prefetched rollouts scheduled in the previous epoch.
+            # This blocks until all in-flight generation completes.
+            data_policy_version = prefetch_policy_version
+            logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Finalizing prefetched rollouts "
+                        f"(generated with policy v{data_policy_version})...")
+            rollout_stats = finalize_rollouts(all_futures=pending_rollout_futures,
+                                              replay_buffer=pending_rollout_buffer,
+                                              logger=logger,
+                                              rollout_timeout=rollout_timeout,
+                                              start_time=prefetch_start_time)
+            replay_buffer = pending_rollout_buffer
+            pending_rollout_futures = None
+            pending_rollout_buffer = None
+            prefetch_start_time = None
+            prefetch_policy_version = None
 
-        logger.info(f"[Epoch {epoch+1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
+        else:
+            # First epoch or overlap disabled, we generate synchronously
+            # and it is considered on-policy (lag = 0)
+            data_policy_version = policy_version
+            logger.info(f"[Epoch {epoch+1}/{number_of_epochs}] Starting rollout generation...")
+            rollout_dataloader.batch_sampler.set_epoch(epoch)
+            rollout_stats = collect_rollouts(dataloader=rollout_dataloader,
+                                             rollout_engines=rollout_engines,
+                                             epoch=epoch,
+                                             policy_version=policy_version,
+                                             replay_buffer=replay_buffer,
+                                             n_samples=config.rollout.n_samples,
+                                             logger=logger,
+                                             rollout_timeout=rollout_timeout)
+
+        finalize_wait = rollout_stats.get('finalize_wait_time', None)
+        time_str = f"time={rollout_stats['rollout_time']:.2f}s"
+        if finalize_wait is not None:
+            time_str += f" (finalize_wait={finalize_wait:.2f}s)"
+
+        logger.info(f"[Epoch {epoch + 1}] Rollout complete: {rollout_stats['total_samples_generated']} samples, "
                     f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
                     f"avg_response_len={rollout_stats['avg_response_len']:.1f}, "
-                    f"time={rollout_stats['rollout_time']:.2f}s, tps={rollout_stats['tokens_per_sec']:.2f}")
+                    f"{time_str}, tps={rollout_stats['tokens_per_sec']:.2f}")
 
         # Log rollout metrics immediately so they appear in WandB/MLflow
         # before training starts (avoids visual lag in dashboards)
         if tracker:
-            tracker.log_metrics({
+            rollout_log = {
                 "rollout/avg_reward": rollout_stats['avg_reward'],
                 "rollout/total_reward": rollout_stats['total_reward'],
                 "rollout/avg_response_len": rollout_stats['avg_response_len'],
                 "rollout/total_samples": rollout_stats['total_samples_generated'],
                 "rollout/rollout_time_sec": rollout_stats['rollout_time'],
                 "rollout/tokens_per_sec": rollout_stats['tokens_per_sec'],
-            }, step=global_step)
+            }
+            if 'finalize_wait_time' in rollout_stats:
+                rollout_log["rollout/finalize_wait_sec"] = rollout_stats['finalize_wait_time']
+            if overlap_enabled:
+                rollout_log["rollout/policy_lag"] = policy_version - data_policy_version
+            tracker.log_metrics(rollout_log, step=global_step)
 
         ################
-        # 2. Prepare training batches
+        # 2. Schedule next rollout BEFORE training which would be the maximum overlap
+        ################
+        # When overlap is enabled, we try to schedule the next epoch's rollout
+        # NOW so it runs concurrently with training on different GPUs.
+        # The constraint is staleness: the prefetched data will be trained on
+        # next epoch when policy_version = current + 1. The lag at that point is: (policy_version + 1) - rollout_policy_version
+        # If this lag <= overlap_max_lag, we can schedule now and before training.
+        # Otherwise, we must wait for training + weight sync to reduce the lag, and schedule AFTER sync with less overlap.
+        prefetch_scheduled = False
+        if overlap_enabled and not is_last_epoch:
+            future_lag = (policy_version + 1) - rollout_policy_version
+            if future_lag <= overlap_max_lag:
+                logger.info(f"[Epoch {epoch + 1}] Scheduling async prefetch for epoch {epoch + 2} "
+                            f"(rollout policy v{rollout_policy_version}, "
+                            f"future lag={future_lag}/{overlap_max_lag})")
+                # create a new buffer for pending_rollout_buffer
+                pending_rollout_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
+                                                      max_seq_len=config.data.max_seq_len)
+
+                rollout_dataloader.batch_sampler.set_epoch(epoch + 1)
+                prefetch_start_time = time.time()
+                prefetch_policy_version = rollout_policy_version
+                pending_rollout_futures = collect_rollouts_async(dataloader=rollout_dataloader,
+                                                                rollout_engines=rollout_engines,
+                                                                epoch=epoch + 1,
+                                                                policy_version=rollout_policy_version)
+                prefetch_scheduled = True
+
+        ################
+        # 3. Prepare training batches
         ################
         logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")
         train_start_time = time.time()
@@ -731,9 +881,11 @@ if __name__ == "__main__":
         # Avoids re-serializing the same data on every step (batches are
         # reused unchanged across all steps_per_epoch iterations).
         shard_refs = shard_and_put(train_batches_padded, num_engines=len(training_engine))
+
         ################
-        # 3. Training loop
+        # 4. Training loop
         ################
+        # training loop runs concurrently with prefetched rollout if scheduled
         epoch_metrics = {}
         for step in range(steps_per_epoch):
             train_metrics = run_training_step(training_engine, shard_refs,
@@ -758,8 +910,9 @@ if __name__ == "__main__":
         policy_version += 1
         if config.train.alg_name.lower() in Algorithm_Registry.keys():
             replay_buffer.reset()
+
         ################
-        # 4. Log epoch summary
+        # 5. Log epoch summary
         ################
         train_time = time.time() - train_start_time
         epoch_time = time.time() - epoch_start_time
@@ -777,35 +930,61 @@ if __name__ == "__main__":
             }, step=global_step)
 
         ################
-        # 5. Refresh rollout policy via direct weight sync
+        # 6. Sync weights to rollout engines
         ################
+        # When overlap is disabled, we always sync.
+        # When overlap is enabled, only sync when the lag reaches overlap_max_lag.
+        # This lets us skip syncs and keep rollout engines busy generating.
+        # Note: if a prefetch is in-flight on the rollout actors, the sync's
+        # update_weights_direct call queues behind the generation as ray actors
+        # execute sequentially, so there is no interference.
         sync_attempted = False
         sync_success = False
-        is_last_epoch = (epoch == number_of_epochs - 1)
-        if weight_sync_method == "direct" and not is_last_epoch:
+        lag = policy_version - rollout_policy_version
+        need_sync = (not overlap_enabled) or (lag >= overlap_max_lag)
+
+        if weight_sync_method == "direct" and not is_last_epoch and need_sync:
             sync_attempted = True
-            logger.info(f"[Epoch {epoch+1}] Syncing weights directly to rollout engines (version {policy_version})...")
-            sync_success = sync_weights_direct(training_engines=training_engine,
-                                               rollout_engines=rollout_engines,
-                                               version=policy_version,
-                                               logger=logger,
-                                               sync_timeout=sync_timeout)
+            logger.info(f"[Epoch {epoch+1}] Syncing weights directly to rollout engines "
+                        f"(v{rollout_policy_version} -> v{policy_version}, lag={lag})...")
+            try:
+                sync_success = sync_weights_direct(training_engines=training_engine,
+                                                   rollout_engines=rollout_engines,
+                                                   version=policy_version,
+                                                   logger=logger,
+                                                   sync_timeout=sync_timeout)
+            except Exception as e:
+                logger.warning(f"[Epoch {epoch+1}] Direct sync raised {e}, falling back to disk")
+                sync_success = False
+
             if sync_success:
+                rollout_policy_version = policy_version
                 logger.info(f"[Epoch {epoch+1}] Direct sync successful")
 
-            else:
-                logger.warning(f"[Epoch {epoch+1}] Direct sync failed, falling back to disk-based refresh")
+        elif not need_sync and not is_last_epoch:
+            logger.info(f"[Epoch {epoch+1}] Skipping weight sync (lag={lag}, max_lag={overlap_max_lag})")
+
+        # Log overlap-specific metrics after sync decision is made
+        if tracker and overlap_enabled:
+            tracker.log_metrics({
+                "overlap/policy_version": policy_version,
+                "overlap/rollout_policy_version": rollout_policy_version,
+                "overlap/policy_lag": policy_version - rollout_policy_version,
+                "overlap/prefetch_before_training": 1 if prefetch_scheduled else 0,
+                "overlap/sync_skipped": 0 if need_sync else 1,
+            }, step=global_step)
+
         ################
-        # 5. save checkpoint
+        # 7. Save checkpoint
         ################
         should_save_disk = (checkpoint_save_interval > 0 and
                            ((epoch + 1) % checkpoint_save_interval == 0 or is_last_epoch))
 
         # save to disk when:
-        # 1. using disk-based sync is true.
+        # 1. using disk-based sync and sync is needed.
         # 2. direct sync was attempted but failed.
         # 3. periodic/final checkpoint save.
-        need_disk_for_rollout = (weight_sync_method == "disk") or (sync_attempted and not sync_success)
+        need_disk_for_rollout = (weight_sync_method == "disk" and need_sync) or (sync_attempted and not sync_success)
         if need_disk_for_rollout or should_save_disk or is_last_epoch:
             model_path = save_checkpoint(epoch=epoch,
                                          version=policy_version,
@@ -817,8 +996,9 @@ if __name__ == "__main__":
                                          logger=logger,
                                          save_timeout=save_timeout)
             logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
+
         ################
-        # 6. Refresh rollout policy via disk-based fallback
+        # 8. Disk-based rollout refresh
         ################
         if need_disk_for_rollout and not is_last_epoch:
             logger.info(f"[Epoch {epoch+1}] Refreshing rollout engines with new policy (version {policy_version})...")
@@ -827,7 +1007,28 @@ if __name__ == "__main__":
                                    version=policy_version,
                                    logger=logger,
                                    sync_timeout=sync_timeout)
+            rollout_policy_version = policy_version
             logger.info(f"[Epoch {epoch+1}] Rollout engines refreshed")
+
+        ################
+        # 9. Schedule prefetch after sync if not scheduled before training
+        ################
+        # If we couldn't schedule before training as lag would have exceeded max_lag,
+        # we schedule now after weights have been synced.
+        # This still provides some overlap: the rollout runs concurrently
+        # with checkpoint save and the next epoch's finalize wait.
+        if overlap_enabled and not is_last_epoch and not prefetch_scheduled:
+            logger.info(f"[Epoch {epoch + 1}] Scheduling async prefetch for epoch {epoch + 2} "
+                        f"(rollout policy v{rollout_policy_version}, post-sync)")
+            pending_rollout_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
+                                                  max_seq_len=config.data.max_seq_len)
+            rollout_dataloader.batch_sampler.set_epoch(epoch + 1)
+            prefetch_start_time = time.time()
+            prefetch_policy_version = rollout_policy_version
+            pending_rollout_futures = collect_rollouts_async(dataloader=rollout_dataloader,
+                                                            rollout_engines=rollout_engines,
+                                                            epoch=epoch + 1,
+                                                            policy_version=rollout_policy_version)
 
         logger.info(f"[Epoch {epoch+1}] Complete! Total epoch time: {epoch_time:.2f}s")
         logger.info("=" * 50)

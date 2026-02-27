@@ -22,7 +22,7 @@ These parameters are consistent across all experiment types and are used for exp
 | :----------------------- | :------ | :--------------------------------------------------- | :-------------------------------------------------- | :----------------------------- |
 | `experiment_id`          | `run`   | Unique string identifier for the experiment run      | String                                              | `"rl_exp_01"`, `"sft_v2"`      |
 | `seed`                   | `run`   | Random seed                                          | Integer ≥ 0                                         | `42`, `1337`                   |
-| `project_name`           | `run`   | Name of the project in the experiment tracker        | String                                              | `"LeanRL"`, `"Research-Alpha"` |
+| `project_name`           | `run`   | Name of the project in the experiment tracker        | String                                              | `"FeynRL"`, `"Research-Alpha"` |
 | `logger_type`            | `run`   | Type of experiment tracker to use                    | Allowed values: `"mlflow"`, `"wandb"`               | `"mlflow"`                     |
 | `tracking_uri`           | `run`   | URI/URL for the tracking server                      | String (valid URL)                                  | `"http://mlflow-server:8080/"` |
 | `checkpoint_dir`         | `run`   | Local directory for saving model checkpoints         | Absolute path                                       | `"/path/to/ckps"`              |

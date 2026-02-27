@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 from algs.RL.common import COMMON
 
 def test_save_checkpoint_logic(tmp_path):
+
+    # Create a dummy object
     dummy_self = SimpleNamespace()
     dummy_self.alg_name = "test"
     dummy_self.policy_engine = MagicMock()
@@ -23,6 +25,8 @@ def test_save_checkpoint_logic(tmp_path):
         dummy_self.policy_engine.save_16bit_model.assert_called_once_with(output_dir)
 
 def test_save_checkpoint_peft(tmp_path):
+
+    # Create a dummy object
     dummy_self = SimpleNamespace()
     dummy_self.alg_name = "test"
     dummy_self.policy_engine = MagicMock()

@@ -36,6 +36,11 @@ class COMMON:
                 print(f"[Alg:{self.alg_name}][Rank {rank}] PEFT module applied for {model_name}")
                 model.print_trainable_parameters()
 
+            # Catch misconfigured lora_target_modules early, if no params are trainable,
+            # ds init will fail late or silently train nothing.
+            num_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+            assert num_trainable > 0, "PEFT produced zero trainable parameters. Check peft.lora_target_modules"
+
         # Enable gradient checkpointing on the HF model before DS wrapping
         if model_name != "ref" and self.gradient_checkpointing:
             model.gradient_checkpointing_enable()

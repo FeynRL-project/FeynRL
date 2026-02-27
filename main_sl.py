@@ -251,6 +251,11 @@ if __name__ == "__main__":
         if rank == 0:
             model.print_trainable_parameters()
 
+        # Catch misconfigured lora_target_modules early, if no params are trainable,
+        # ds init will fail late or silently train nothing.
+        num_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        assert num_trainable > 0, "PEFT produced zero trainable parameters. Check peft.lora_target_modules"
+
     ########
     # 5. Setup trainiing and inference engines
     ########

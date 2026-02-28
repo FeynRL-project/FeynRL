@@ -20,19 +20,6 @@ def create_prompt(question, system_prompt):
 
     return message     
 
-def extract_solution(solution_str):
-    '''
-       This extracts solution from the answer.
-       In gsm8k, answers end with #### <answer>.
-       If we construct our answers this way or if the dataset has them, 
-       this function will work.
-    '''
-    solution = re.search(r"####\s*(-?[0-9.,]+)", solution_str)
-    if solution is None:
-        return None
-    final_solution = solution.group(1).replace(",", "").replace("$", "").replace("\n", "")
-    return final_solution
-
 def make_map_fn(split, params):
     '''
        This function reads data and returns a dictionary in the framework's format.
@@ -94,11 +81,13 @@ if __name__ == "__main__":
     full_dataset = dataset["train"]
     
     # Split into train, val, and test
+    # Test split first, then val from the remainder.
     test_split = full_dataset.train_test_split(test_size=args.test_ratio, seed=args.seed)
     test_dataset = test_split["test"]
     remaining_dataset = test_split["train"]
     
-    val_split = remaining_dataset.train_test_split(test_size=args.val_ratio, seed=args.seed)
+    adjusted_val_ratio = args.val_ratio / (1.0 - args.test_ratio)
+    val_split = remaining_dataset.train_test_split(test_size=adjusted_val_ratio, seed=args.seed)
     train_dataset = val_split["train"]
     val_dataset = val_split["test"]
 

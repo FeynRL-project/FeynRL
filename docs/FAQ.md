@@ -59,3 +59,31 @@ We're happy to hear that—this is exactly why we open-sourced the project. Plea
 ## I have a question that's not covered here. Where can I ask?
 
 Please open a GitHub issue with your question.
+
+## How do I troubleshoot multi-node scaling issues?
+
+Multi-node training with Ray and DeepSpeed can be complex. If your run hangs:
+1. **Check GPU Allocation**: Ensure `training_gpus + rollout_gpus` does not exceed your cluster's total GPUs.
+2. **Verify Network Connectivity**: Ensure all nodes can communicate over the specified ports. Use `NCCL_DEBUG=INFO` to surface network-level errors.
+3. **Ray Status**: Check `ray status` to see if any actors have failed or are pending resources.
+4. **Shared Filesystem**: For multi-node runs, ensure your `checkpoint_dir` is on a shared filesystem so all nodes can access saved models.
+
+## Should I use `direct` or `disk` weight synchronization?
+
+- **`direct` (Default)**: Pushes weights directly via GPU memory. It's much faster as it avoids disk I/O, but it's more sensitive to network stability and Ray object store limits.
+- **`disk`**: Saves weights to disk and has vLLM reload them. It's slower but more robust, especially on clusters with high network latency or when troubleshooting sync issues.
+
+## How can I add a custom reward function?
+
+1. Create a new reward function in a Python file under the `rewards/` directory.
+2. The function should take the relevant inputs (usually the prompt and response) and return a scalar or a batch of rewards.
+3. Update your `rl_args.yaml` config to set `reward.reward_func` to the name of your new function.
+
+## I'm getting OOM errors in the rollout engine (vLLM). What should I do?
+
+vLLM is memory-intensive. If you encounter OOM:
+1. **Reduce `gpu_memory_utilization`**: Lower this value in `rollout` config (e.g., from 0.9 to 0.7) to leave more headroom for KV cache.
+2. **Increase `tensor_parallel_size`**: Distribute the model across more GPUs to reduce per-GPU memory usage.
+3. **Decrease `rollout_batch_size_per_gpu`**: Smaller batches use less memory during generation.
+4. **Check `max_seq_len`**: Ensure it's not unnecessarily large for your specific task.
+

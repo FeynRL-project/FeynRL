@@ -23,15 +23,13 @@ FeynRL is built to fill this gap: a **lightweight, modular, scalable** framework
 
 This is the first public release, so expect rough edges. As we add features and capabilities, our goal is to keep FeynRL **simple, efficient, and predictable**, rather than letting complexity creep in. We’re open-sourcing it to provide a framework that’s easy to reason about, and to build it alongside the community that will stress-test it, extend it, and improve it.
 
-## 🧭 Overview
+## 🏗️ Overview
 
 FeynRL is built around three core principles:
 
 - ⚡ **Efficiency**: Designed for training models with billions of parameters, using DeepSpeed for distributed training, vLLM for fast inference, and Ray for orchestration at scale.
 - 🧩 **Modularity**: Clear separation between training engines, rollout generation, and data handling, so it’s easy to swap components and experiment safely.
 - 🧠 **Algorithm-first**: Designed to accelerate research with a simple, hackable codebase that keeps the focus on the algorithms.
-
-### 🏗️ Architecture
 
 For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTURE.md)**.
 
@@ -60,8 +58,6 @@ Learn how to launch jobs and run experiments.
 ⚙️ **[Configuration Reference](configs/README.md)**
 Full parameter guide for RL, SFT, DPO, and evaluation configs.
 
-📖 **[Architecture Details](docs/ARCHITECTURE.md)**
-Deep dive into the system components and data flow.
 
 ## Contributing
 

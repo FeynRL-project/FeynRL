@@ -1,6 +1,12 @@
 # Supervised Fine-Tuning (SFT)
 
-The algorithm box summarizes what happens inside 'train\_step' during Supervised Fine-Tuning (SFT) with teacher forcing: for each training iteration we sample a minibatch, compute the (masked) token-level negative log-likelihood over the supervised tokens (typically the response, excluding prompt/padding), and apply one optimizer update (e.g., AdamW). In the actual training code, we run SFT with  DeepSpeed, so a minibatch in the pseudocode corresponds to an effective batch formed by splitting data into micro-batches and using gradient accumulation (and, depending on the configuration, ZeRO partitioning). We keep the algorithm box intentionally simplified for readability as the underlying implementation performs the same objective and update, just executed across micro-batches and distributed workers before producing a single logical parameter update.
+The algorithm box summarizes what happens inside `train_step` during Supervised Fine-Tuning (SFT) with teacher forcing: for each training iteration we sample a minibatch, compute the (masked) token-level negative log-likelihood over the supervised tokens (typically the response, excluding prompt/padding), and apply one optimizer update (e.g., AdamW). In the actual training code, we run SFT with DeepSpeed, so a minibatch in the pseudocode corresponds to an effective batch formed by splitting data into micro-batches and using gradient accumulation (and, depending on the configuration, ZeRO partitioning). We keep the algorithm box intentionally simplified for readability as the underlying implementation performs the same objective and update, just executed across micro-batches and distributed workers before producing a single logical parameter update.
+
+#### Implementation details
+
+- **Loss normalization** (`normalize_loss` config flag):
+  - When `normalize_loss=True`, the loss is `sum(masked_per_token_loss) / total_possible_tokens` where `total_possible_tokens = B * (T-1)` — the total sequence length including padding. This is a constant across GPUs, which avoids the [gradient accumulation bug](https://unsloth.ai/blog/gradient) that arises when sequence lengths vary across micro-batches (normalizing by `loss_mask.sum()` would give different effective learning rates to different micro-batches).
+  - When `normalize_loss=False`, the loss is the raw sum of masked per-token losses.
 
 **Input:** initial parameters $\theta_0$, dataset $\mathcal{D}$, batch size $B$, steps $T$
 

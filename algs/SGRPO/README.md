@@ -19,6 +19,18 @@ This flag does **not** change sampling as we still sample uniformly from replay.
 * If `False`, we step according to DeepSpeed gradient-accumulation boundaries (typical micro-batch accumulation).
 * If `True`, we accumulate gradients over the entire replay shard and apply **one optimizer step at the end** (often with a scaling to keep gradient magnitude comparable).
 
+#### Implementation details
+
+- **Micro-batch shuffling**: At each training step, the list of micro-batches is randomly shuffled before iteration. This ensures that across multiple `train_steps_per_epoch` calls, the gradient-accumulation boundary falls on different micro-batches, avoiding systematic bias from always having the same micro-batches grouped together in the same accumulation window.
+
+- **Loss scaling for GA remainder**: When the number of micro-batches is not divisible by `gradient_accumulation_steps`, the last GA bucket has fewer micro-batches. DeepSpeed still divides by `gradient_accumulation_steps`, so the code scales the loss in the final bucket by `ga_steps / remainder` to produce the correct mean gradient. When `update_only_after_full_replay=True`, the loss is instead scaled by `ga_steps / num_micro` for all micro-batches.
+
+- **KL divergence form**: The KL penalty uses the variance-reduced estimator: $\text{KL} = \log(\pi/\pi_{\text{ref}}) + \pi_{\text{ref}}/\pi - 1$. Computation is performed in float32 for numerical stability under bf16/fp16.
+
+- **Masking**: Padded and prompt positions are zeroed out in both the loss and all metrics. The denominator for mean computation is `mask.sum()` (clamped to ≥ 1).
+
+- **Tracked metrics** (averaged across micro-batches): such as `clipfrac` (fraction of masked tokens where ratio falls outside the clip range), `approx_kl` (variance-reduced approximate KL between current and old policy), `ent_loss`, `pi_loss`, `pi_loss_total`, `kl_ref`, etc.
+
 
 **Input:** initial policy parameters $\theta_0$, replay shards $\mathcal{B}$ (`micro_batches`)
 

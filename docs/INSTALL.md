@@ -102,4 +102,4 @@ If training hangs at initialization:
 - **Set Network Interfaces**: Explicitly set the NCCL interface if you have multiple NICs (e.g., `export NCCL_SOCKET_IFNAME=eth0`).
 - **Increase Timeouts**: Some larger models may require more time to initialize. Check the `run.init_timeout` setting in your config.
 
-For more detailed scaling and system-level troubleshooting, see the **[FAQ](../docs/FAQ.md)**.
+For more detailed scaling and system-level troubleshooting, see the **[TROUBLESHOOTING](../docs/TROUBLESHOOTING.md)**.

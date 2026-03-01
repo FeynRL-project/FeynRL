@@ -1,4 +1,4 @@
-# Troubleshooting Guide
+# Troubleshooting and Debugging Guide
 
 This guide covers common issues encountered while running FeynRL, including multi-node scaling, memory management, and training stability.
 
@@ -74,17 +74,92 @@ vLLM is memory-intensive. If you encounter OOM:
 
 ## Training & Algorithmic Issues
 
-### Unexpected zero rewards in RL
+### No reward signal or reward is always 0
 **Possible causes:**
-- **Default/Failure Reward**: The reward function returns 0 for all samples (e.g., the model never produces EOS, so the default reward assigns 0).
-- **Truncation**: Responses are truncated at `rollout.max_tokens` before the model can produce a correct answer, and the terminal reward is lost.
-- **Clipping**: `data.max_seq_len` is too small, so prompt + response gets clipped during training.
+- **Default/Failure Reward**: The reward function returns 0 for all samples, e.g., the model never produces the expected format (like `#### <number>` for GSM8K), so `extract_solution` returns `None` and the reward is a zero tensor.
+- **Truncation at generation**: Responses are truncated at `rollout.max_tokens` before the model can produce a complete answer, cutting off the terminal reward.
+- **Truncation at replay buffer**: The replay buffer silently drops sequences where `prompt_len + response_len > data.max_seq_len`. If most sequences exceed this limit, the buffer may be nearly empty or contain only short (possibly degenerate) responses. Look for `[ReplayBuffer] ... sequences truncated` messages in the logs.
+- **Zero-length responses**: Sequences with `response_len == 0` are silently dropped by the replay buffer.
 
 **How to diagnose:**
-1. **Inspect Samples**: Look at raw rollout samples to see what the model generates — check `response_len` and whether EOS is present.
+1. **Inspect Samples**: Look at raw rollout samples to see what the model generates and check if they are reasonable.
 2. **Check Length Limits**:
    - `max_tokens` = max generation length (response only)
    - `max_seq_len` = max total length (prompt + response)
-   - `max_tokens` must be ≤ `max_seq_len`
+   - `max_tokens` must be strictly less than `max_seq_len`
 3. **Increase Room**: Try increasing `max_tokens` to give the model more room to produce a complete answer.
-4. **Reward Logic**: Verify your reward function handles edge cases (empty responses, truncated responses) correctly.
+4. **Reward Logic**: Verify your reward function handles edge cases (empty responses, truncated responses, unexpected format) correctly.
+
+---
+
+### Loss is NaN or Inf
+**Possible causes:**
+- **Extreme importance ratios**: When the policy diverges significantly from the old policy (e.g., after too many gradient steps on the same replay data), `exp(logprobs - old_logprobs)` can overflow to `inf`. The clipping mechanism bounds the ratio in the loss, but the raw ratio may still cause issues in metrics or when padding is not properly masked.
+- **KL divergence overflow**: If the policy and reference model diverge significantly, `exp(ref_logprobs - logprobs)` in the KL computation can overflow. The code logs a `[WARNING] compute_kl_distance: extreme divergence detected` message when the max exponent exceeds 10.0.
+- **Learning rate too high**: A high learning rate combined with large batch sizes can cause gradient explosions.
+- **Mixed-precision issues**: bf16/fp16 training can cause underflow/overflow in log-probability computations. The code promotes certain operations to float32 for stability, but custom reward functions or model architectures may introduce their own precision issues.
+
+**How to diagnose:**
+1. **Check logs** for `extreme divergence detected` warnings, these indicate the policy and reference model are diverging.
+2. **Monitor `approx_kl`**: A rapidly increasing `approx_kl` metric indicates the policy is changing too fast.
+3. **Reduce learning rate** or increase `clip_low`/`clip_high` to constrain updates.
+4. **Check `gradient_clipping`**: Ensure `clip_grad_norm` is set (e.g., 1.0) to prevent gradient explosions.
+
+---
+
+### High `clipfrac` or policy collapse
+**Possible causes:**
+- **Stale replay data**: The replay buffer contains old-policy rollouts that are too far from the current policy, causing most importance ratios to be clipped.
+- **Learning rate too high**: Large policy updates cause the ratio `π/π_old` to frequently exceed the clip range `[1 - clip_low, 1 + clip_high]`.
+- **Too many `train_steps_per_epoch`**: Multiple passes over the same replay buffer compound policy shift.
+
+**How to diagnose:**
+1. **Watch `clipfrac`**: If it consistently large values, the policy is updating too aggressively relative to the replay data.
+2. **Watch `approx_kl`**: This measures the KL divergence between the current policy and the old policy used to collect the replay data. Large values suggest drift.
+3. **Reduce `train_steps_per_epoch`** or **reduce `lr`** to slow down policy updates.
+4. **Enable KL penalty** (`kl_coeff > 0` with a reference model) to regularize the policy.
+
+---
+
+### Replay buffer dropping too many samples
+The replay buffer logs `[ReplayBuffer] X/Y sequences truncated` when sequences exceed `max_seq_len`. It also silently drops sequences with `response_len == 0`.
+
+**How to diagnose:**
+1. **Check logs** for truncation messages. If a large fraction of samples is being dropped, either increase `data.max_seq_len` or decrease `rollout.max_tokens`.
+2. **Length constraint**: `max_tokens` (response only) must be strictly less than `max_seq_len` (prompt + response). The config loader enforces this.
+3. **Prompt length**: If your prompts are long, you may need a larger `max_seq_len` to accommodate both the prompt and a meaningful response.
+
+---
+
+### PPO: `rewards or values contain NaN on valid positions`
+This error is raised by `compute_advantages` (GAE computation) in PPO.
+
+**Possible causes:**
+- **Value model divergence**: The value model produced NaN predictions, often due to learning rate being too high or numerical instability.
+- **Reward function returning NaN**: The reward function produced non-finite values.
+
+**How to diagnose:**
+1. **Check `v_loss`**: If the value loss is growing rapidly, reduce `lr` (value model inherits `lr` if `value_lr` is null).
+2. **Verify reward function**: Ensure your reward function always returns finite values.
+
+### PPO: `mask has non-contiguous valid regions (holes)`
+This error is raised by `compute_advantages` when the mask has gaps like `[1,1,0,1,1]`.
+
+**Possible causes:**
+- **Data corruption**: The rollout produced inconsistent mask/done/reward tensors.
+- **Custom reward function**: A per-token reward function that inadvertently sets some mid-sequence mask values to 0.
+
+**How to diagnose:**
+1. **Check rollout data**: Inspect the raw rollout output to verify mask, done, and reward tensors are consistent.
+
+---
+
+### DPO: `reward_accuracies` stuck near 0.5
+**Possible causes:**
+- **Beta too low**: With a small `cl_beta`, the DPO loss signal is weak and the model cannot easily separate chosen from rejected.
+- **Chosen/rejected too similar**: If the chosen and rejected completions are nearly identical, the policy-vs-reference log-ratio difference is negligible.
+- **Reference model already strong**: If `ref_model` is the same as the initial policy and the preference pairs are subtle, the length-normalized rewards for chosen and rejected will be close.
+
+**How to diagnose:**
+1. **Monitor `chosen_rewards` and `rejected_rewards`**: If both are close to zero and barely separating, increase `cl_beta`.
+2. **Check data quality**: Verify that chosen responses are meaningfully better than rejected ones in your training data.

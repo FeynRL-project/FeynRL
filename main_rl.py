@@ -944,8 +944,16 @@ if __name__ == "__main__":
 
         if weight_sync_method == "direct" and not is_last_epoch and need_sync:
             sync_attempted = True
+
+            if overlap_enabled:
+                lag_str=f"lag={lag}"
+
+            else:
+                lag_str=""
+
             logger.info(f"[Epoch {epoch+1}] Syncing weights directly to rollout engines "
-                        f"(v{rollout_policy_version} -> v{policy_version}, lag={lag})...")
+                        f"(v{rollout_policy_version} -> v{policy_version}, {lag_str})...")
+
             try:
                 sync_success = sync_weights_direct(training_engines=training_engine,
                                                    rollout_engines=rollout_engines,

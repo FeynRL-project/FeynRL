@@ -10,13 +10,14 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 import ray
 import time
+import mlflow
 from tqdm import tqdm
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
 from data_feeds.prompts import PromptsFeed
 from rollouts.vllm_engine import VLLMRolloutEngine
-from misc.logging import setup_logging, setup_tracker
+from misc.logging import setup_logging
 from rollouts.replay_buffer import ReplayBuffer
 
 def set_random_seeds(seed):
@@ -42,8 +43,7 @@ def setup_ray(ray_address):
         master_addr = ray.util.get_node_ip_address()
 
     except Exception:
-        # Fallback to localhost if we cannot get the IP (e.g. single node without network)
-        print("Warning: Could not get master address, using localhost. This is fine for single-node but will fail for multi-node.")
+        print("Warning: Could not get master address, using localhost")
         master_addr = "127.0.0.1"
 
     return master_addr
@@ -127,6 +127,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "eps_reward_norm":params.reward.eps_reward_norm,
+
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
@@ -134,33 +135,15 @@ def create_rollout_engines(params, reward_fnc, eos_id):
     engines = []
     for i in range(num_engines):
         kwargs['engine_id'] = i
-        engines.append(VLLMRolloutEngine.options(num_gpus=tp,
-                                                 runtime_env={"env_vars": {"PYTHONPATH": os.getcwd()}}
-                                                ).remote(**kwargs))
+        engines.append(VLLMRolloutEngine.options(num_gpus=tp).remote(**kwargs))
 
     return engines
-
-def shard_batch_for_engines(rollout_batch, num_rollout_engines):
-    '''
-        Shard a batch of prompts across rollout engines.
-    '''
-    if not rollout_batch:
-        return []
-
-    # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
-    # and rollout_batch is a list of dictionaries.
-    # it is not necessary to have equal number of samples per engine, though they can't be empty.
-    shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
-    rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
-    rollout_shards = [shard for shard in rollout_shards if len(shard) > 0]
-    return rollout_shards
 
 def collect_rollouts(dataloader,
                      rollout_engines,
                      epoch,
                      policy_version,
                      replay_buffer,
-                     n_samples,
                      logger):
 
     '''
@@ -176,27 +159,24 @@ def collect_rollouts(dataloader,
     total_prompt_mean_rewards = []
     prompt_response_texts = []
 
-    # example: rollout_gpus=2, rollout_batch_size_per_gpu=12, n_samples=3, rollout_samples_per_epoch = 25
-    # local_batch_size = num_rollout_engines * rollout_batch_size_per_gpu = 2 * 12 = 24
-    # Batches needed = ceil(25 / 24) = 2 batches
-    # Total Prompts = 2 * 24 = 48 prompts
-    # Total Samples in Buffer = 48 prompts * n_samples (e.g., 3) = 144 samples
+    # Note dataLoader's batch_size is already num_rollout_engines * rollout_batch_size,
+    batch_size   = dataloader.batch_size
+    dataset_size = len(dataloader.dataset)
+    num_steps_to_generate_all = (dataset_size + batch_size - 1) // batch_size
 
-    batch_size = dataloader.batch_size
-    num_batches_per_epoch = len(dataloader)
-    total_prompts = num_batches_per_epoch * batch_size
-    prompts_per_engine = batch_size // num_rollout_engines
+    logger.info(f"[Rollout] Dataset: {dataset_size}, Batch: {batch_size} "
+                f"({num_rollout_engines} engines × {batch_size // num_rollout_engines} per engine), "
+                f"Steps to generate all samples: {num_steps_to_generate_all}")
 
-    logger.info(f"[Rollout] {total_prompts} prompts ({num_batches_per_epoch} batches x {batch_size} prompts/batch), "
-                f"{num_rollout_engines} engines ({prompts_per_engine} prompts/engine/batch), "
-                f"{n_samples} samples/prompt, "
-                f"~{total_prompts * n_samples} expected samples in replay buffer")
-
-    for rollout_batch in dataloader:
+    tqdm_dataloader = tqdm(dataloader, total=num_steps_to_generate_all)
+    for rollout_batch in tqdm_dataloader:
         # 1. split data across rollout engines
-        rollout_shards = shard_batch_for_engines(rollout_batch, num_rollout_engines)
-        if not rollout_shards:
-            continue
+        # recall: num_rollout_engines  = max(1, int(rollout_gpus) // tensor_parallel_size)
+        # and rollout_batch is a list of dictionaries.
+        shard_size = (len(rollout_batch) + num_rollout_engines - 1) // num_rollout_engines
+        # it is not necessary to have equal number of samples per engine, though they can't be empty.
+        rollout_shards = [rollout_batch[i * shard_size:(i + 1) * shard_size] for i in range(num_rollout_engines)]
+        rollout_shards = [shard for shard in rollout_shards if len(shard) > 0]
 
         # 2. schedule rollout generation
         rollout_samples = []
@@ -205,8 +185,7 @@ def collect_rollouts(dataloader,
                                                                       current_iter=epoch,
                                                                       policy_version=policy_version))
 
-        # 3. gather rollouts. This is a blocking call means all engines must
-        # finish generating rollouts before we can proceed.
+        # 3. gather rollouts
         rollout_lists = ray.get(rollout_samples)
 
         # 4. merge rollouts across all engines and collect stats
@@ -220,9 +199,8 @@ def collect_rollouts(dataloader,
             
             for sample in rl:
                 total_samples_generated += 1
-                total_reward_sum += sample['pred_rewards'].sum().item()
+                total_reward_sum += sample['rewards'].sum().item()
                 total_response_len += sample['response_len']
-                total_tokens += len(sample['prompt_ids']) + len(sample['response_ids'])
 
                 prompt_response_texts.append(sample['response_text'])
 
@@ -298,8 +276,6 @@ if __name__ == "__main__":
 
     checkpoint_dir = config.run.checkpoint_dir
 
-    # setup remote experiment tracker
-    tracker = setup_tracker(config=config, rank=rank)
     logger.info(f"Config loaded. experiment_id: {config.run.experiment_id}")
 
     # number of gpus for rollout generation which is used by vllm
@@ -355,19 +331,18 @@ if __name__ == "__main__":
     logger.info("Replay buffer initialized")
 
     rollout_stats = collect_rollouts(dataloader=rollout_dataloader,
-                                     rollout_engines=rollout_engines,
-                                     epoch=0,
-                                     policy_version=0,
-                                     replay_buffer=replay_buffer,
-                                     n_samples=config.rollout.n_samples,
-                                     logger=logger)
-
+                                         rollout_engines=rollout_engines,
+                                         epoch=0,
+                                         policy_version=0,
+                                         replay_buffer=replay_buffer,
+                                         logger=logger)
 
     logger.info(f"Rollout complete: {rollout_stats["stats"]['total_samples_generated']} samples, "
                 f"avg_reward={rollout_stats["stats"]['avg_reward']:.4f}, avg_response_len={rollout_stats["stats"]['avg_response_len']:.1f}, "
                 f"time={rollout_stats["stats"]['rollout_time']:.2f}s")
 
     logger.info("Evaluation completed successfully!")
+
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     # save rollout stats
@@ -383,15 +358,7 @@ if __name__ == "__main__":
     # save experiment config
     experiment_config_path = os.path.join(checkpoint_dir, "experiment_config.yaml")
     with open(experiment_config_path, "w") as f:
-        yaml.dump(config.model_dump(), f)
+        yaml.dump(config, f)
     logger.info(f"Experiment config saved to {experiment_config_path}")
-
-    # End experiment tracker run
-    if tracker:
-        tracker.finish()
-
-    # Kill rollout actors to free gpu memory from vllm before ray.shutdown()
-    for engine in rollout_engines:
-        ray.kill(engine)
-
+    
     ray.shutdown()

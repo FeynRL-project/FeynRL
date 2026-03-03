@@ -169,36 +169,15 @@ class VLLMRolloutEngine:
             self.log(f"Model already at version {version}, skipping weight update")
             return True
 
-        # vllm collective_rpc serializes args with msgspec, which cannot encode
-        # strings or bytes larger than 4GB. For large models the pickled
-        # state_dict easily exceeds that. Instead of sending weight data through
-        # msgspec, we pickle to /dev/shm, a ram-backed tmpfs which has no real disk I/O,
-        # just a memcpy into kernel page cache, and pass only the ~50-byte file
-        # path through collective_rpc. Each TP worker then reads the file
-        # independently. This works across multi-node setups because:
-        #   1. Ray delivers state_dict to this actor on its node via object store
-        #   2. This actor writes to /dev/shm on its node
-        #   3. collective_rpc fans out to TP workers on the same node
-        #   4. Workers read from the same local /dev/shm
-        # Each rollout engine on a different node writes its own file (PID in name).
-        # collective_rpc is synchronous, so the file is guaranteed to exist until
-        # all workers finish, and the finally block cleans it up afterward.
-        shm_path = f"/dev/shm/feynrl_weights_{os.getpid()}_v{version}.pkl"
-        with open(shm_path, 'wb') as f:
-            pickle.dump(state_dict, f)
-
-        # Free the CPU state_dict now that it's persisted to /dev/shm.
-        # The TP workers will read from the file, so we don't need this copy.
-        del state_dict
-
         self.log(f"Updating weights directly to version {version}")
 
-        try:
-            self.vllm_engine.collective_rpc("update_weights", args=(shm_path,))
-
-        finally:
-            os.remove(shm_path)
-
+        # pickle the state_dict and encode to latin-1 string to pass through vllm rpc safely.
+        # This avoids vllm trying to interpret list of ints or other structures.
+        # This doesn't work so that is why I use pickle.dumps
+        # weights = [(name, tensor) for name, tensor in state_dict.items()]
+        # self.vllm_engine.collective_rpc("update_weights", args=(weights,))
+        serialized_state = pickle.dumps(state_dict).decode('latin-1')
+        self.vllm_engine.collective_rpc("update_weights", args=(serialized_state,))
         self.loaded_version = version
         self.log(f"Weights updated to version {version}")
         return True
@@ -232,7 +211,7 @@ class VLLMRolloutEngine:
                 )
 
         return SamplingParams(
-            seed=self.seed + self.engine_id * 1000,
+            seed=self.seed,
             n=self.n_samples,
 
             temperature=self.temperature,
@@ -535,7 +514,7 @@ class VLLMRolloutEngine:
             # For a single sample, we don't normalize (i.e. advantage is 0 if we subtract mean)
             # but usually for n=1 we keep the raw reward.
             mean_scores = 0.0
-            std_scores  = 1.0
+            std_scores  = 1.0 - self.eps_reward_norm
 
         if is_per_token:
             raise ValueError("per token rewards are not supported yet as normalization is done assuming per response rewards")
@@ -544,18 +523,18 @@ class VLLMRolloutEngine:
         for i, sample in enumerate(samples):
             # sample['reward']: [T] where prompt tokens would get 0
             # sample['reward'][-1]: means the last token reward
-            zscore = torch.zeros_like(sample['token_rewards'], dtype=torch.float)
-            zscore[-1] = (sample['token_rewards'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
-            sample["token_zscores"] = zscore
+            zscore = torch.zeros_like(sample['rewards'], dtype=torch.float)
+            zscore[-1] = (sample['rewards'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
+            sample["zscores"] = zscore
             if self.reward_broadcast:
-                sample["token_zscores"][prompt_len:] = zscore[-1]
+                sample["zscores"][prompt_len:] = zscore[-1]
 
             # prediction-aligned zscores
             # zscore[prompt_len:] corresponds to response tokens 0..N-1
-            pred_zscores = torch.zeros_like(sample['token_zscores'], dtype=torch.float)
+            pred_zscores = torch.zeros_like(sample['rewards'], dtype=torch.float)
             pred_start = prompt_len - 1
-            pred_end   = len(sample['token_zscores']) - 1
-            pred_zscores[pred_start:pred_end] = sample["token_zscores"][prompt_len:]
+            pred_end   = len(sample['rewards']) - 1
+            pred_zscores[pred_start:pred_end] = sample["zscores"][prompt_len:]
             sample["pred_zscores"] = pred_zscores
 
 if __name__ == "__main__":
@@ -564,10 +543,8 @@ if __name__ == "__main__":
     ray.init(local_mode=True)
     tokenizer = AutoTokenizer.from_pretrained('google/gemma-3-1b-it')
 
-    def default_reward_func(prompt, response):
+    def default_reward_func(prompt_ids, response_ids, finish_reason):
         is_per_token = False
-        response_ids = response.token_ids
-        finish_reason = getattr(response, "finish_reason", None)
         r = torch.zeros((len(response_ids),), dtype=torch.float32)
 
         if len(response_ids) == 0:
@@ -595,9 +572,7 @@ if __name__ == "__main__":
                                     eos_id=tokenizer.eos_token_id,
                                     reward_broadcast=True,
                                     eps_reward_norm=1e-8,
-                                    gpu_memory_utilization=0.5,
-                                    engine_id=0,
-                                    model_dtype='bfloat16')
+                                    gpu_memory_utilization=0.5)
 
     dummy_data = ["Hello, how are you?",
                   "Summer is the best season!",
@@ -612,8 +587,5 @@ if __name__ == "__main__":
                                         return_tensors=None,
                                         )
         samples_ids.append({"prompt_token_ids": prompt_ids})
-    output_ref = vllm.generate.remote(samples_ids, 1, 0)
-    output = ray.get(output_ref)
+    output = vllm.generate.remote(samples_ids, 1, 0)
     print(output)
-    print('Done')
-    ray.shutdown()

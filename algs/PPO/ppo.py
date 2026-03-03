@@ -222,7 +222,7 @@ class PPO(COMMON):
         # normalize advs to have mean=0 and var=1
         if mask_bool.any():
             valid_adv = adv[mask_bool]
-            adv = (adv - valid_adv.mean()) / (valid_adv.std(unbiased=False) + 1e-8)
+            adv = (adv - valid_adv.mean()) / (valid_adv.std() + 1e-8)
 
         mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)

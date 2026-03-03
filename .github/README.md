@@ -7,6 +7,7 @@ This repository uses GitHub Actions for pull-request quality gates.
 - `Lint`: `make lint`
 - `Unit Tests (py3.10)`
 - `Unit Tests (py3.11)`
+- `Integration Tests`
 
 If any of these checks fail, the PR should be blocked from merge using branch protection.
 
@@ -41,6 +42,7 @@ In `Settings -> Branches -> Add branch protection rule` for `main`:
    - `Lint`
    - `Unit Tests (py3.10)`
    - `Unit Tests (py3.11)`
+   - `Integration Tests`
 4. Enable `Require branches to be up to date before merging`.
 5. (Recommended) Enable `Require approvals` with at least 1 reviewer.
 

@@ -20,7 +20,6 @@ If any of these checks fail, the PR should be blocked from merge using branch pr
 ## Security and maintenance automation
 
 - Weekly dependency audit workflow: `.github/workflows/security.yml`
-- Weekly dependency update PRs via Dependabot: `.github/dependabot.yml`
 
 ## Local commands (match CI)
 
@@ -50,7 +49,6 @@ In `Settings -> Branches -> Add branch protection rule` for `main`:
 
 - `.github/workflows/ci.yml`
 - `.github/workflows/security.yml`
-- `.github/dependabot.yml`
 - `.github/CODEOWNERS`
 - `.github/pull_request_template.md`
 - `.github/pre-commit-config.yaml`

@@ -335,7 +335,12 @@ class VLLMRolloutEngine:
                 rollout_samples = []
                 batch_num_prompts = 0
                 batch_num_passes = 0.0
+                batch_num_passes_at_1 = 0.0
+                batch_num_passes_caret_k = 0.0
+                batch_pass_rate_sum = 0.0
                 batch_prompt_reward_sum = 0.0
+                batch_best_of_k_reward_sum = 0.0
+                batch_reward_std_sum = 0.0
                 for prompt_data, data in zip(prompts, generated_outputs):
                     group_samples = []
                     group_stats   = {'rewards': [], 'lengths': []}
@@ -450,24 +455,44 @@ class VLLMRolloutEngine:
 
                     k = len(group_stats['rewards'])
                     pass_at_k = float(any(r > 0 for r in group_stats['rewards'])) if k > 0 else 0.0
+                    pass_at_1 = float(group_stats['rewards'][0] > 0) if k > 0 else 0.0
+                    pass_caret_k = float(all(r > 0 for r in group_stats['rewards'])) if k > 0 else 0.0
+                    pass_rate = float(sum(r > 0 for r in group_stats['rewards']) / k) if k > 0 else 0.0
                     group_mean_reward = float(sum(group_stats['rewards']) / k) if k > 0 else 0.0
+                    best_of_k_reward = float(max(group_stats['rewards'])) if k > 0 else 0.0
+                    reward_std_per_prompt = float(np.std(group_stats['rewards'])) if k > 0 else 0.0
 
                     batch_num_prompts += 1
                     batch_num_passes += pass_at_k
+                    batch_num_passes_at_1 += pass_at_1
+                    batch_num_passes_caret_k += pass_caret_k
+                    batch_pass_rate_sum += pass_rate
                     batch_prompt_reward_sum += group_mean_reward
+                    batch_best_of_k_reward_sum += best_of_k_reward
+                    batch_reward_std_sum += reward_std_per_prompt
 
                     for s in group_samples:
                         s["pass_at_k"] = pass_at_k
+                        s["pass_at_1"] = pass_at_1
+                        s["pass_caret_k"] = pass_caret_k
+                        s["pass_rate"] = pass_rate
                         s["k"] = k
                         s["group_mean_reward"] = group_mean_reward
+                        s["best_of_k_reward"] = best_of_k_reward
+                        s["reward_std_per_prompt"] = reward_std_per_prompt
 
                     rollout_samples.extend(group_samples)
 
                 if batch_num_prompts > 0:
                     self.log(
                         f"Batch metrics: prompts={batch_num_prompts}, "
+                        f"avg_pass@1={batch_num_passes_at_1 / batch_num_prompts:.4f}, "
                         f"avg_pass@k={batch_num_passes / batch_num_prompts:.4f}, "
-                        f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}"
+                        f"avg_pass^k={batch_num_passes_caret_k / batch_num_prompts:.4f}, "
+                        f"avg_pass_rate={batch_pass_rate_sum / batch_num_prompts:.4f}, "
+                        f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
+                        f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
+                        f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}"
                     )
 
                 return rollout_samples

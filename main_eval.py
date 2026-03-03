@@ -173,8 +173,13 @@ def collect_rollouts(dataloader,
     total_response_len = 0
     total_tokens = 0
     total_prompts = 0.0
+    total_pass_at_1 = 0.0
     total_pass_at_k = 0.0
+    total_pass_caret_k = 0.0
+    total_pass_rate = 0.0
     total_reward_per_prompt_sum = 0.0
+    total_best_of_k_reward_sum = 0.0
+    total_reward_std_per_prompt_sum = 0.0
 
     # example: rollout_gpus=2, rollout_batch_size_per_gpu=12, n_samples=3, rollout_samples_per_epoch = 25
     # local_batch_size = num_rollout_engines * rollout_batch_size_per_gpu = 2 * 12 = 24
@@ -184,13 +189,13 @@ def collect_rollouts(dataloader,
 
     batch_size = dataloader.batch_size
     num_batches_per_epoch = len(dataloader)
-    total_prompts = num_batches_per_epoch * batch_size
+    expected_total_prompts = num_batches_per_epoch * batch_size
     prompts_per_engine = batch_size // num_rollout_engines
 
-    logger.info(f"[Rollout] {total_prompts} prompts ({num_batches_per_epoch} batches x {batch_size} prompts/batch), "
+    logger.info(f"[Rollout] {expected_total_prompts} prompts ({num_batches_per_epoch} batches x {batch_size} prompts/batch), "
                 f"{num_rollout_engines} engines ({prompts_per_engine} prompts/engine/batch), "
                 f"{n_samples} samples/prompt, "
-                f"~{total_prompts * n_samples} expected samples in replay buffer")
+                f"~{expected_total_prompts * n_samples} expected samples in replay buffer")
 
     for batch_idx, rollout_batch in enumerate(dataloader, start=1):
         # 1. split data across rollout engines
@@ -215,8 +220,13 @@ def collect_rollouts(dataloader,
         batch_reward_sum = 0.0
         batch_response_len = 0
         batch_prompts = 0.0
+        batch_pass_at_1_sum = 0.0
         batch_pass_at_k_sum = 0.0
+        batch_pass_caret_k_sum = 0.0
+        batch_pass_rate_sum = 0.0
         batch_reward_per_prompt_sum = 0.0
+        batch_best_of_k_reward_sum = 0.0
+        batch_reward_std_per_prompt_sum = 0.0
         for rl in rollout_lists:
             rollout_merged.extend(rl)
             for sample in rl:
@@ -232,11 +242,21 @@ def collect_rollouts(dataloader,
                 if k > 0:
                     prompt_weight = 1.0 / k
                     total_prompts += prompt_weight
+                    total_pass_at_1 += sample.get("pass_at_1", 0.0) * prompt_weight
                     total_pass_at_k += sample.get("pass_at_k", 0.0) * prompt_weight
+                    total_pass_caret_k += sample.get("pass_caret_k", 0.0) * prompt_weight
+                    total_pass_rate += sample.get("pass_rate", 0.0) * prompt_weight
                     total_reward_per_prompt_sum += sample.get("group_mean_reward", 0.0) * prompt_weight
+                    total_best_of_k_reward_sum += sample.get("best_of_k_reward", 0.0) * prompt_weight
+                    total_reward_std_per_prompt_sum += sample.get("reward_std_per_prompt", 0.0) * prompt_weight
                     batch_prompts += prompt_weight
+                    batch_pass_at_1_sum += sample.get("pass_at_1", 0.0) * prompt_weight
                     batch_pass_at_k_sum += sample.get("pass_at_k", 0.0) * prompt_weight
+                    batch_pass_caret_k_sum += sample.get("pass_caret_k", 0.0) * prompt_weight
+                    batch_pass_rate_sum += sample.get("pass_rate", 0.0) * prompt_weight
                     batch_reward_per_prompt_sum += sample.get("group_mean_reward", 0.0) * prompt_weight
+                    batch_best_of_k_reward_sum += sample.get("best_of_k_reward", 0.0) * prompt_weight
+                    batch_reward_std_per_prompt_sum += sample.get("reward_std_per_prompt", 0.0) * prompt_weight
 
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
@@ -247,7 +267,12 @@ def collect_rollouts(dataloader,
                 f"avg_reward={batch_reward_sum / batch_samples_generated:.4f}, "
                 f"avg_response_len={batch_response_len / batch_samples_generated:.1f}, "
                 f"avg_reward_per_prompt={batch_reward_per_prompt_sum / max(batch_prompts, 1e-9):.4f}, "
-                f"pass@k={batch_pass_at_k_sum / max(batch_prompts, 1e-9):.4f}"
+                f"pass@1={batch_pass_at_1_sum / max(batch_prompts, 1e-9):.4f}, "
+                f"pass@k={batch_pass_at_k_sum / max(batch_prompts, 1e-9):.4f}, "
+                f"pass^k={batch_pass_caret_k_sum / max(batch_prompts, 1e-9):.4f}, "
+                f"pass_rate={batch_pass_rate_sum / max(batch_prompts, 1e-9):.4f}, "
+                f"best_of_k_reward={batch_best_of_k_reward_sum / max(batch_prompts, 1e-9):.4f}, "
+                f"reward_std_per_prompt={batch_reward_std_per_prompt_sum / max(batch_prompts, 1e-9):.4f}"
             )
 
     if len(replay_buffer) == 0:
@@ -259,19 +284,34 @@ def collect_rollouts(dataloader,
         avg_reward = 0.0
         avg_response_len = 0.0
         avg_reward_per_prompt = 0.0
+        avg_pass_at_1 = 0.0
         avg_pass_at_k = 0.0
+        avg_pass_caret_k = 0.0
+        avg_pass_rate = 0.0
+        avg_best_of_k_reward = 0.0
+        avg_reward_std_per_prompt = 0.0
     else:
         avg_reward = total_reward_sum / total_samples_generated
         avg_response_len = total_response_len / total_samples_generated
         avg_reward_per_prompt = total_reward_per_prompt_sum / max(total_prompts, 1e-9)
+        avg_pass_at_1 = total_pass_at_1 / max(total_prompts, 1e-9)
         avg_pass_at_k = total_pass_at_k / max(total_prompts, 1e-9)
+        avg_pass_caret_k = total_pass_caret_k / max(total_prompts, 1e-9)
+        avg_pass_rate = total_pass_rate / max(total_prompts, 1e-9)
+        avg_best_of_k_reward = total_best_of_k_reward_sum / max(total_prompts, 1e-9)
+        avg_reward_std_per_prompt = total_reward_std_per_prompt_sum / max(total_prompts, 1e-9)
 
     tps = total_tokens / max(1e-6, rollout_time)
 
     return {"total_samples_generated": total_samples_generated,
             "avg_reward": avg_reward,
             "avg_reward_per_prompt": avg_reward_per_prompt,
+            "avg_pass_at_1": avg_pass_at_1,
             "avg_pass_at_k": avg_pass_at_k,
+            "avg_pass_caret_k": avg_pass_caret_k,
+            "avg_pass_rate": avg_pass_rate,
+            "avg_best_of_k_reward": avg_best_of_k_reward,
+            "avg_reward_std_per_prompt": avg_reward_std_per_prompt,
             "total_reward": total_reward_sum,
             "avg_response_len": avg_response_len,
             "rollout_time": rollout_time,
@@ -369,7 +409,11 @@ if __name__ == "__main__":
 
     logger.info(f"Rollout complete: {rollout_stats['total_samples_generated']} samples, "
                 f"avg_reward={rollout_stats['avg_reward']:.4f}, total_reward={rollout_stats['total_reward']:.4f}, "
-                f"avg_reward_per_prompt={rollout_stats['avg_reward_per_prompt']:.4f}, pass@k={rollout_stats['avg_pass_at_k']:.4f}, "
+                f"avg_reward_per_prompt={rollout_stats['avg_reward_per_prompt']:.4f}, "
+                f"pass@1={rollout_stats['avg_pass_at_1']:.4f}, pass@k={rollout_stats['avg_pass_at_k']:.4f}, "
+                f"pass^k={rollout_stats['avg_pass_caret_k']:.4f}, pass_rate={rollout_stats['avg_pass_rate']:.4f}, "
+                f"best_of_k_reward={rollout_stats['avg_best_of_k_reward']:.4f}, "
+                f"reward_std_per_prompt={rollout_stats['avg_reward_std_per_prompt']:.4f}, "
                 f"avg_response_len={rollout_stats['avg_response_len']:.1f}, "
                 f"time={rollout_stats['rollout_time']:.2f}s, tps={rollout_stats['tokens_per_sec']:.2f}")
 
@@ -378,7 +422,12 @@ if __name__ == "__main__":
         tracker.log_metrics({
             "eval/avg_reward": rollout_stats['avg_reward'],
             "eval/avg_reward_per_prompt": rollout_stats['avg_reward_per_prompt'],
+            "eval/pass_at_1": rollout_stats['avg_pass_at_1'],
             "eval/pass_at_k": rollout_stats['avg_pass_at_k'],
+            "eval/pass_caret_k": rollout_stats['avg_pass_caret_k'],
+            "eval/pass_rate": rollout_stats['avg_pass_rate'],
+            "eval/avg_best_of_k_reward": rollout_stats['avg_best_of_k_reward'],
+            "eval/avg_reward_std_per_prompt": rollout_stats['avg_reward_std_per_prompt'],
             "eval/total_reward": rollout_stats['total_reward'],
             "eval/avg_response_len": rollout_stats['avg_response_len'],
             "eval/total_samples": rollout_stats['total_samples_generated'],

@@ -55,6 +55,9 @@ Read the guide to configure your environment and dependencies.
 🚀 **[Usage & Examples](experiments/README.md)**
 Learn how to launch jobs and run experiments.
 
+⚙️ **[Configuration Reference](configs/README.md)**
+Full parameter guide for RL, SFT, DPO, and evaluation configs.
+
 ✅ **[Testing](tests/README.md)**
 Run unit and integration tests using `pytest`.
 ```bash

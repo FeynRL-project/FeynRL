@@ -4,7 +4,7 @@ This repository uses GitHub Actions for pull-request quality gates.
 
 ## What runs on pull requests
 
-- `Lint`: `make lint`
+- `Lint`: `make -f .github/Makefile lint`
 - `Unit Tests (py3.10)`
 - `Unit Tests (py3.11)`
 - `Integration Tests`
@@ -25,11 +25,11 @@ If any of these checks fail, the PR should be blocked from merge using branch pr
 ## Local commands (match CI)
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r .github/requirements-dev.txt
 pip install --index-url https://download.pytorch.org/whl/cpu torch
 
-make lint
-make test-unit
+make -f .github/Makefile lint
+make -f .github/Makefile test-unit
 ```
 
 ## Enable PR blocking (GitHub settings)
@@ -53,6 +53,6 @@ In `Settings -> Branches -> Add branch protection rule` for `main`:
 - `.github/dependabot.yml`
 - `.github/CODEOWNERS`
 - `.github/pull_request_template.md`
-- `.pre-commit-config.yaml`
-- `requirements-dev.txt`
-- `Makefile`
+- `.github/pre-commit-config.yaml`
+- `.github/requirements-dev.txt`
+- `.github/Makefile`

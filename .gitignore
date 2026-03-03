@@ -121,3 +121,8 @@ checkpoints/
 
 # Weights and Biases
 wandb/
+
+# Murdock
+configs/murdock_configs/
+scripts/
+.clean_git.sh

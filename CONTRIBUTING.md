@@ -28,7 +28,7 @@ Thank you for your interest in contributing to FeynRL! We welcome contributions 
 5. **Add Tests**: If you're adding a new feature or fixing a bug, please include relevant tests.
 6. **Run Tests**:
    ```bash
-   pytest tests/
+   pytest -c .github/pytest.ini unit_tests/
    ```
 7. **Submit a Pull Request**: Once your changes are ready and tests pass, submit a PR to the `main` branch. Provide a clear description of your changes and link to any relevant issues.
 

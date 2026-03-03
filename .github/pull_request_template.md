@@ -5,6 +5,6 @@
 ## Checklist
 
 - [ ] Tests added/updated for behavior changes
-- [ ] `make lint` passes locally
-- [ ] `make test-unit` passes locally
+- [ ] `make -f .github/Makefile lint` passes locally
+- [ ] `make -f .github/Makefile test-unit` passes locally
 - [ ] Documentation updated (if needed)

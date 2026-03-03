@@ -62,10 +62,10 @@ def run_set_seed():
 
 @pytest.fixture
 def tiny_model():
-    from tests.models import TinyModel
+    from unit_tests.models import TinyModel
     return TinyModel()
 
 @pytest.fixture
 def tiny_value_model():
-    from tests.models import TinyValueModel
+    from unit_tests.models import TinyValueModel
     return TinyValueModel()

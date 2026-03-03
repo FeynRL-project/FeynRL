@@ -32,7 +32,7 @@ jobs:
           pip install ruff
 
       - name: Run lint
-        run: make lint
+        run: make -f .github/Makefile lint
 
   unit-tests:
     name: Unit Tests (py${{ matrix.python-version }})
@@ -55,11 +55,11 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          pip install -r .github/requirements-dev.txt
           pip install --index-url https://download.pytorch.org/whl/cpu torch
 
       - name: Run unit tests
-        run: make test-unit
+        run: make -f .github/Makefile test-unit
 
   integration-tests:
     name: Integration Tests
@@ -78,8 +78,8 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          pip install -r .github/requirements-dev.txt
           pip install --index-url https://download.pytorch.org/whl/cpu torch
 
       - name: Run integration tests
-        run: make test-integration
+        run: make -f .github/Makefile test-integration

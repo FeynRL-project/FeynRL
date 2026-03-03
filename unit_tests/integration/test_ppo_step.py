@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytest
-from tests.models import TinyModel, TinyValueModel
+from unit_tests.models import TinyModel, TinyValueModel
 
 def test_ppo_integration_step():
     """

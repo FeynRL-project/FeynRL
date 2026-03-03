@@ -1,0 +1,7 @@
+pytest
+pytest-cov
+pytest-mock
+hypothesis
+ruff
+pre-commit
+pip-audit

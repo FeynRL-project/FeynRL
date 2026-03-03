@@ -37,7 +37,7 @@ def test_merge_peft_state_dict_logic():
         prefix + "model.embed_tokens.weight": torch.ones(10, 10) # Non-lora param
     }
     
-    merged = COMMON._merge_peft_state_dict(dummy_self, raw_sd)
+    merged = COMMON.merge_peft_state_dict(dummy_self, raw_sd)
     
     # HF names should be stripped of prefix and .base_layer.
     assert "model.layers.0.self_attn.q_proj.weight" in merged

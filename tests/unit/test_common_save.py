@@ -32,9 +32,10 @@ def test_save_checkpoint_peft(tmp_path):
     dummy_self.policy_engine = MagicMock()
     dummy_self.policy_engine.module = MagicMock()
     dummy_self.peft_config = SimpleNamespace(use_peft=True, lora_alpha=32, lora_rank=8)
+    dummy_self.gather_params_for_save = MagicMock(return_value={"weight": torch.tensor([1.0])})
     
-    # Mocking _merge_peft_state_dict
-    dummy_self._merge_peft_state_dict = MagicMock(return_value={"weight": torch.tensor([1.0])})
+    # Mocking merge_peft_state_dict
+    dummy_self.merge_peft_state_dict = MagicMock(return_value={"weight": torch.tensor([1.0])})
     
     # Mock deepspeed.zero.GatheredParameters
     import deepspeed
@@ -50,6 +51,6 @@ def test_save_checkpoint_peft(tmp_path):
         COMMON.save_checkpoint(dummy_self, output_dir, "tag_peft")
         
         mock_save.assert_called_once()
-        dummy_self._merge_peft_state_dict.assert_called_once()
+        dummy_self.merge_peft_state_dict.assert_called_once()
 
 from types import SimpleNamespace

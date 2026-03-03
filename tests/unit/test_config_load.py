@@ -38,6 +38,7 @@ def test_config_load_sl_success(tmp_path):
         },
         "data": {
             "train_files_path": ["data.jsonl"],
+            "val_files_path": ["val.jsonl"],
             "num_workers": 2,
             "max_seq_len": 512,
             "prompt_key": "prompt",

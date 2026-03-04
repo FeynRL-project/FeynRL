@@ -61,11 +61,11 @@ For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTU
 - 📈 **Experiment tracking**: MLflow and Weights & Biases support
 - 🏅 **Evaluation**: Standalone eval pipeline with vLLM engines
 
-FeynRL runs at scale with multi-GPU and multi-node training, and uses vLLM-powered rollout engines for fast inference and evaluation. Ray orchestrates training and rollout workers across nodes, with periodic weight synchronization from training to rollout workers via in-memory transfer when supported (and a disk-based fallback). To improve overall throughput, FeynRL can run in synchronous mode (generate rollouts, then train) or asynchronous mode (overlap generation and training), trading off utilization against how off-policy the collected samples may be. It also supports LoRA fine-tuning, pluggable experiment tracking, configurable mixed-dataset sampling, and a standalone evaluation pipeline.
+For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training workers and vLLM rollout workers across nodes, and coordinates periodic weight synchronization between them via in-memory transfer (with a disk-based fallback). Training and rollout can run synchronously (generate, then train, then sync) or asynchronously (overlap generation with training to reduce GPU idle time, with a configurable staleness bound). SFT and DPO are simpler as they only need a single model and no rollout workers, so they run directly on DeepSpeed without Ray. All paradigms support full fine-tuning and LoRA, and plug into mixed-dataset sampling, experiment tracking, and standalone evaluation without changing the pipeline.
 
 ## 📢 News
 
-- **[2025-03-03]** 🎉  We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
+- **[2026-03-03]** 🎉  We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
 
 ## How to Use FeynRL
 

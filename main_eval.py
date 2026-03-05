@@ -122,7 +122,6 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "eos_id":eos_id,
               "tensor_parallel_size":tp,
               "model_dtype":params.model.dtype,
-              "max_seq_len":params.data.max_seq_len,
 
               # reward related arguments
               "reward_func":reward_fnc,

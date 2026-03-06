@@ -73,8 +73,8 @@ class MixedDatasetSampler(Sampler):
 
     def _fixed_sample_count(self):
         '''
-            Stable rounding to make sure the sum of the ratios is equal to the batch size. This 
-            method also returns same ratio hence it is fixed ratio and needs to be called just once. 
+            Stable rounding to make sure the sum of the ratios is equal to the batch size. This
+            method also returns same ratio hence it is fixed ratio and needs to be called just once.
             This is largest remainder method appraoch.
         '''
         raw_samples = self.probs * self.local_batch_size
@@ -89,6 +89,14 @@ class MixedDatasetSampler(Sampler):
             order = np.argsort(frac)[::-1] # descending order
             base_samples[order[:remaining_samples]] += 1
         out_counts = {name: int(count) for name, count in zip(self.dnames, base_samples)}
+
+        # if a dataset got 0 samples despite having positive ratios, we will print out a warning
+        zero_datasets = [name for name, count in out_counts.items() if count == 0]
+        if zero_datasets:
+            print(f"[MixedDatasetSampler] WARNING: datasets {zero_datasets} received 0 samples "
+                  f"per batch (local_batch_size={self.local_batch_size}, ratios={dict(zip(self.dnames, self.probs.tolist()))}). "
+                  f"These datasets will never be sampled. Consider increasing local_batch_size "
+                  f"or setting dynamic_ratio_every_step=True.")
 
         return out_counts
 

@@ -160,6 +160,7 @@ All experiments are configured via YAML files validated by Pydantic schemas in `
 | `stop` | Stop string for generation | String | `""` |
 | `stop_token_ids` | Token IDs that trigger stop | List of integers | `[]` |
 | `prompt_logprobs` | Return prompt token logprobs (memory intensive) | Boolean | `false` |
+| `batch_invariant` | Force batch-invariant kernels (See [vLLM Reproducibility Doc](https://docs.vllm.ai/en/stable/examples/offline_inference/reproducibility/)) | Boolean | `false` |
 
 ---
 

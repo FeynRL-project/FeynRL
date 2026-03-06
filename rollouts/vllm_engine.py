@@ -7,6 +7,7 @@ from vllm import LLM, SamplingParams
 from typing import Optional, List, Callable, Any, Dict
 import numpy as np
 import pickle
+from misc.utils import set_random_seeds
 
 @ray.remote
 class VLLMRolloutEngine:
@@ -33,7 +34,19 @@ class VLLMRolloutEngine:
                  model_dtype: str,
                  max_seq_len: int,
                  engine_id: int = 0,
+                 batch_invariant: bool = False,
                  ):
+
+        # This can reduce throughput depending on model size and batch composition
+        # because it forces batch-invariant kernels.
+        # https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/reproducibility.py
+        if batch_invariant:
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
+
+        # Seed the rollout actor's Python/NumPy/PyTorch RNGs so any
+        # non-vLLM operations (reward computation, normalization) are deterministic.
+        set_random_seeds(seed + engine_id)
+
         # Ensure current working directory is in sys.path for this actor
         # and spawned vllm workers. This is required the model so
         # worker_extension_cls resolves to local source.
@@ -59,6 +72,7 @@ class VLLMRolloutEngine:
         self.force_strict_on_policy = bool(force_strict_on_policy)
         self.gpu_memory_utilization = float(gpu_memory_utilization)
         self.engine_id = int(engine_id)
+        self.batch_invariant = bool(batch_invariant)
         # prompt + response max length also known as context window size
         self.max_seq_len = int(max_seq_len)
 
@@ -135,22 +149,44 @@ class VLLMRolloutEngine:
             except Exception:
                 pass
 
+        llm_extra_kwargs = {}
+        if self.batch_invariant:
+            # vLLM batch invariance requires FlashAttention backend.
+            # We still keep a compatibility fallback below for older vLLM versions.
+            llm_extra_kwargs["attention_backend"] = "FLASH_ATTN"
+
         # Load new model
+        llm_kwargs = dict(model=self.model_path,
+                          trust_remote_code=self.trust_remote_code,
+                          tensor_parallel_size=self.tensor_parallel_size,
+                          gpu_memory_utilization=self.gpu_memory_utilization,
+                          dtype=self.model_dtype,
+                          # This enables collective_rpc("update_weights", ...) on all TP workers
+                          # for direct weight updates. If update_weights_direct is never called,
+                          # this sits idle and there is no real overhead since it is just a class
+                          # attached to the vllm worker.
+                          worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
+                          **llm_extra_kwargs)
         try:
-            self.vllm_engine = LLM(model=self.model_path,
-                                   trust_remote_code=self.trust_remote_code,
-                                   tensor_parallel_size=self.tensor_parallel_size,
-                                   gpu_memory_utilization=self.gpu_memory_utilization,
-                                   dtype=self.model_dtype,
-                                   # This enables collective_rpc("update_weights", ...) on all TP workers
-                                   # for direct weight updates. If update_weights_direct is never called,
-                                   # this sits idle and there is no real overhead since it is just a class
-                                   # attached to the vllm worker.
-                                   worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
-                                   )
+            self.vllm_engine = LLM(**llm_kwargs)
             self.log(f"Successfully loaded vllm model from {self.model_path}")
 
         except Exception as e:
+            # Compatibility fallback: some vLLM versions do not expose
+            # the attention_backend argument on LLM(...).
+            if self.batch_invariant and "attention_backend" in llm_kwargs:
+                msg = str(e)
+                backend_kw_error = ("attention_backend" in msg) or ("unexpected keyword" in msg)
+                if backend_kw_error:
+                    try:
+                        self.log("LLM(..., attention_backend=...) unsupported in this vLLM version; retrying without keyword.")
+                        llm_kwargs.pop("attention_backend", None)
+                        self.vllm_engine = LLM(**llm_kwargs)
+                        self.log(f"Successfully loaded vllm model from {self.model_path} (fallback mode)")
+                        return
+                    except Exception:
+                        pass
+
             print(f"Failed to load vllm model from {self.model_path}: {e}")
             self.vllm_engine = None
             raise
@@ -234,8 +270,13 @@ class VLLMRolloutEngine:
                     "(these change the trajectory distribution)."
                 )
 
+        # When batch_invariant=True, all engines use the same seed so the same
+        # prompt always produces the same output regardless of which engine or
+        # batch it lands in (topology-invariant).  Sharding in shard_batch_for_engines
+        # ensures each prompt goes to exactly one engine, so duplicates are impossible.
+        seed_base = self.seed if self.batch_invariant else (self.seed + self.engine_id * 1000)
         return SamplingParams(
-            seed=self.seed + self.engine_id * 1000,
+            seed=seed_base,
             n=self.n_samples,
 
             temperature=self.temperature,
@@ -325,8 +366,17 @@ class VLLMRolloutEngine:
                                      f"but loaded_version={int(self.loaded_version)}. ")
 
                 assert self.vllm_engine is not None, f"{self.model_path} not loaded."
-                # Rotate seed each epoch so the sampling rng varies across iterations.
-                self.sampling_params.seed = self.seed + self.engine_id * 1000 + (current_iter + 1) * 1000000000
+                # Rotate seed each epoch so sampling RNG varies across iterations.
+                # For batch invariance mode, exclude engine_id so the same prompt
+                # yields the same output regardless of how many engines are used
+                # (topology-invariant: 1-engine and N-engine runs match).
+                epoch_offset = (current_iter + 1) * 1000000000
+                if self.batch_invariant:
+                    self.sampling_params.seed = self.seed + epoch_offset
+
+                else:
+                    self.sampling_params.seed = self.seed + self.engine_id * 1000 + epoch_offset
+
                 self.log(f"Generating completions for {len(prompts)} prompts with {self.n_samples} samples each")
                 generated_outputs = self.vllm_engine.generate(prompts,
                                                              sampling_params=self.sampling_params,
@@ -517,6 +567,7 @@ class VLLMRolloutEngine:
             sample["pred_zscores"] = pred_zscores
 
 if __name__ == "__main__":
+    # to test cd ~/FeynRL && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python rollouts/vllm_engine.py
     from transformers import AutoTokenizer
     import ray
     ray.init(local_mode=True)
@@ -555,7 +606,10 @@ if __name__ == "__main__":
                                     eps_reward_norm=1e-8,
                                     gpu_memory_utilization=0.5,
                                     engine_id=0,
-                                    model_dtype='bfloat16')
+                                    max_seq_len=2048,
+                                    model_dtype='bfloat16',
+                                    batch_invariant=True,
+                                    )
 
     dummy_data = ["Hello, how are you?",
                   "Summer is the best season!",

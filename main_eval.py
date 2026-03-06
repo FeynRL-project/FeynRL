@@ -1,7 +1,6 @@
 import os
 import json
 import yaml
-import random
 import numpy as np
 import argparse
 import importlib
@@ -16,17 +15,10 @@ from tqdm import tqdm
 import configs.load as cfg # all config arguments
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from rollouts.vllm_engine import VLLMRolloutEngine
+from misc.utils import set_random_seeds, ray_get_with_timeout, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 from rollouts.replay_buffer import ReplayBuffer
 
-def set_random_seeds(seed):
-    '''
-        Set random seeds to make runs more reproducible (still not guaranteed).
-    '''
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 def setup_ray(ray_address):
     '''
@@ -122,20 +114,29 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "eos_id":eos_id,
               "tensor_parallel_size":tp,
               "model_dtype":params.model.dtype,
+              "max_seq_len":params.data.max_seq_len,
 
               # reward related arguments
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "eps_reward_norm":params.reward.eps_reward_norm,
+              "batch_invariant":params.rollout.batch_invariant,
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
     num_engines = max(1, rollout_gpus // tp)
     engines = []
+    cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
     for i in range(num_engines):
         kwargs['engine_id'] = i
+        rollout_env_vars = {"PYTHONPATH": os.getcwd(),
+                            "CUBLAS_WORKSPACE_CONFIG": cublas_workspace,
+                            "PYTHONHASHSEED": str(params.run.seed),
+                           }
+        if params.rollout.batch_invariant:
+            rollout_env_vars["VLLM_BATCH_INVARIANT"] = "1"
         engines.append(VLLMRolloutEngine.options(num_gpus=tp,
-                                                 runtime_env={"env_vars": {"PYTHONPATH": os.getcwd()}}
+                                                 runtime_env={"env_vars": rollout_env_vars}
                                                 ).remote(**kwargs))
 
     return engines
@@ -161,7 +162,8 @@ def collect_rollouts(dataloader,
                      policy_version,
                      replay_buffer,
                      n_samples,
-                     logger):
+                     logger,
+                     rollout_timeout):
 
     '''
         This function is used to run rollout engine and generate rollouts/samples.
@@ -204,7 +206,10 @@ def collect_rollouts(dataloader,
 
         # 3. gather rollouts. This is a blocking call means all engines must
         # finish generating rollouts before we can proceed.
-        rollout_lists = ray.get(rollout_samples)
+        rollout_lists = ray_get_with_timeout(refs=rollout_samples,
+                                             timeout=rollout_timeout,
+                                             description=f"evaluation rollout generation (epoch {epoch+1})",
+                                             logger=logger)
 
         # 4. merge rollouts across all engines and collect stats
         rollout_merged = []
@@ -327,7 +332,8 @@ if __name__ == "__main__":
                                      policy_version=0,
                                      replay_buffer=replay_buffer,
                                      n_samples=config.rollout.n_samples,
-                                     logger=logger)
+                                     logger=logger,
+                                     rollout_timeout=config.run.rollout_timeout)
 
 
     logger.info(f"Rollout complete: {rollout_stats['total_samples_generated']} samples, "

@@ -1,4 +1,5 @@
 import os
+import json
 import atexit
 import numpy as np
 import argparse
@@ -8,7 +9,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 import ray
 import time
-
+import shutil
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -19,13 +20,11 @@ from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
 
-Algorithm_Registry = {
-    # supported algorithms
-    'sgrpo': ('algs.SGRPO.sgrpo', 'SGRPO'),
-    'cispo': ('algs.CISPO.cispo', 'CISPO'),
-    'ppo':   ('algs.PPO.ppo', 'PPO'),
-}
-
+Algorithm_Registry = {# supported algorithms
+                      'sgrpo': ('algs.SGRPO.sgrpo', 'SGRPO'),
+                      'cispo': ('algs.CISPO.cispo', 'CISPO'),
+                       'ppo':   ('algs.PPO.ppo', 'PPO'),
+                     }
 
 def setup_ray(ray_address):
     '''
@@ -762,20 +761,35 @@ def run_training_step(engines, shard_refs, logger, train_step_timeout):
 
     return {k: np.mean([m.get(k, 0.0) for m in metrics_list]) for k in all_keys}
 
-def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir, experiment_id, rank, logger, save_timeout):
+def save_checkpoint(epoch,
+                    version,
+                    global_step,
+                    tokenizer,
+                    training_engines,
+                    checkpoint_dir,
+                    experiment_id,
+                    rank,
+                    logger,
+                    save_timeout):
     '''
-       Save model checkpoint (must run on all ranks for ZeRO-3)
+       Save model checkpoint. This must run on all ranks for ZeRO-3.
+       Writes hf compatible weights and for vllm, ds engine state
+       optimizer/scheduler for resume, training metadata, and a
+       CHECKPOINT_COMPLETE marker for crash-safe.
     '''
+    # Note if multi-node cluster is used, checkpoint_dir must be on a shared
+    # filesystem such as NFS, Lustre, etc. or each node writes to isolated local disk
+    # and the checkpoint is silently incomplete.
     tag = f"iter{epoch+1:06d}_v{version:06d}"
     model_path = get_experiment_dir_name(output_dir=checkpoint_dir, tag=tag, experiment_id=experiment_id)
     logger.info(f"[Epoch {epoch+1}] Saving checkpoint to {model_path}")
 
-    # save tokenizer so it's ready when vllm loads the model
+    # Create the checkpoint dir on the driver first so all actors can write to it
+    # immediately, avoiding mkdir races on slow NFS mounts.
     if rank == 0:
         os.makedirs(model_path, exist_ok=True)
-        tokenizer.save_pretrained(model_path)
 
-    # save must run on *all ranks* for zero-3 correctness.
+    # 1. save HF-compatible weights and this must run on ALL ranks for zero-3 correctness.
     save_futures = []
     for engine in training_engines:
         save_futures.append(engine.save_checkpoint.remote(output_dir=model_path, tag=tag))
@@ -786,8 +800,116 @@ def save_checkpoint(epoch, version, tokenizer, training_engines, checkpoint_dir,
                          description=f"checkpoint save (epoch {epoch+1})",
                          logger=logger)
 
+    # 2. save DeepSpeed engine state so we can resume training later
+    engine_state_dir = os.path.join(model_path, "ds_engine")
+    if rank == 0:
+        os.makedirs(engine_state_dir, exist_ok=True)
+
+    state_futures = [engine.save_engine_state.remote(engine_state_dir) for engine in training_engines]
+    ray_get_with_timeout(refs=state_futures,
+                         timeout=save_timeout,
+                         description=f"engine state save (epoch {epoch+1})",
+                         logger=logger)
+
+    # 3. Driver-side files: Save the tokenizer only after all engine saves
+    # finish to avoid racing with rank 0 writing config.json on shared filesystems.
+    if rank == 0:
+        tokenizer.save_pretrained(model_path)
+
+        # Training metadata for resume
+        training_state = {'epoch': epoch,
+                          'policy_version': version,
+                          'global_step': global_step,
+                          'training_gpus': len(training_engines),
+                         }
+        with open(os.path.join(model_path, "training_state.json"), "w") as f:
+            json.dump(training_state, f, indent=2)
+
+        # On load, only checkpoints with this file are considered complete and safe to resume from.
+        with open(os.path.join(model_path, "CHECKPOINT_COMPLETE"), "w") as f:
+            f.write("")
+
     logger.info(f"[Epoch {epoch+1}] Checkpoint saved: {model_path}")
     return model_path
+
+def load_checkpoint_for_resume(resume_path,
+                               training_engines,
+                               rollout_engines,
+                               weight_sync_method,
+                               logger,
+                               sync_timeout,
+                               save_timeout):
+    '''
+       Resume training from a previously saved checkpoint.
+       Loads deepspped engine state such as model weights, optimizer, scheduler, RNG
+       on all training engine ranks, then syncs the policy to rollout engines.
+       Returns (start_epoch, policy_version, global_step).
+    '''
+    # Validate checkpoint completeness
+    marker = os.path.join(resume_path, "CHECKPOINT_COMPLETE")
+    if not os.path.exists(marker):
+        raise FileNotFoundError(f"Checkpoint at {resume_path} is incomplete (missing CHECKPOINT_COMPLETE marker). "
+                                f"This checkpoint was likely interrupted during writing and is not safe to resume from.")
+
+    # Load training metadata
+    state_path = os.path.join(resume_path, "training_state.json")
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(f"training_state.json not found in {resume_path}. "
+                                f"Cannot determine epoch/version to resume from.")
+
+    with open(state_path) as f:
+        training_state = json.load(f)
+
+    epoch = training_state['epoch']
+    policy_version = training_state['policy_version']
+    global_step = training_state['global_step']
+
+    # Validate world size matches as ds optimizer state is partitioned
+    # by world size and cannot be resharded across a different number of GPUs.
+    if 'training_gpus' in training_state:
+        saved_gpus   = training_state['training_gpus']
+        current_gpus = len(training_engines)
+        if saved_gpus != current_gpus:
+            raise ValueError(f"Checkpoint was saved with {saved_gpus} training GPUs but "
+                             f"current run uses {current_gpus}. DeepSpeed ZeRO optimizer state "
+                             f"is partitioned by world size and cannot be resharded.")
+
+    logger.info(f"[Resume] Loading checkpoint from {resume_path} "
+                f"(epoch={epoch}, policy_version={policy_version}, global_step={global_step})")
+
+    # Load ds engine state on all training actors (model + optimizer + scheduler + RNG)
+    engine_state_dir = os.path.join(resume_path, "ds_engine")
+    load_futures = [engine.load_engine_state.remote(engine_state_dir) for engine in training_engines]
+
+    ray_get_with_timeout(refs=load_futures,
+                         timeout=save_timeout,
+                         description="load engine state for resume",
+                         logger=logger)
+    logger.info("[Resume] Engine state loaded on all training ranks")
+
+    # Sync resumed policy to rollout engines so they match the training policy
+    success = False
+    if weight_sync_method == "direct":
+        success = sync_weights_direct(training_engines=training_engines,
+                                      rollout_engines=rollout_engines,
+                                      version=policy_version,
+                                      logger=logger,
+                                      sync_timeout=sync_timeout)
+
+        if not success:
+            logger.warning("[Resume] Direct sync failed, falling back to disk refresh")
+
+    if success == False or weight_sync_method == "disk":
+        refresh_rollout_engine(rollout_engines=rollout_engines,
+                               updated_policy_path=resume_path,
+                               version=policy_version,
+                               logger=logger,
+                               sync_timeout=sync_timeout)
+
+    logger.info(f"[Resume] Rollout engines synced to policy v{policy_version}")
+
+    # Return next epoch (resume continues from epoch+1)
+    return epoch + 1, policy_version, global_step
 
 def sync_weights_direct(training_engines, rollout_engines, version, logger, sync_timeout):
     '''
@@ -869,9 +991,10 @@ def refresh_rollout_engine(rollout_engines, updated_policy_path, version, logger
 if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config-file", type=str, default="./config/rl_args.yaml", help="config file")
+    parser.add_argument("--config_file", type=str, default="./config/rl_args.yaml", help="config file")
     parser.add_argument("--experiment_id", type=str, default="run_1", help="experiment id")
-    parser.add_argument("--log-level", type=str, default="INFO", help="logging level")
+    parser.add_argument("--log_level", type=str, default="INFO", help="logging level")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to a ckp to resume training. It must contain a CHECKPOINT_COMPLETE marker.")
     args = parser.parse_args()
 
     ########
@@ -995,7 +1118,6 @@ if __name__ == "__main__":
     ########
     # 7. Training and evaluation loop
     ########
-    global_step = 0
     number_of_epochs  = config.train.total_number_of_epochs
     steps_per_epoch = config.train.train_steps_per_epoch
 
@@ -1008,8 +1130,8 @@ if __name__ == "__main__":
     train_step_timeout = config.run.train_step_timeout
     save_timeout = config.run.save_timeout
     # when overlap is enabled, sync_timeout must be large enough to cover the remaining in-flight rollout generation time PLUS the
-    # actual weight transfer time. This is because push_weights_to_rollout dispatches update_weights_direct to rollout actors that may 
-    # still be running generate tasks. Ray actors are single-threaded, so the update queues behind generation. 
+    # actual weight transfer time. This is because push_weights_to_rollout dispatches update_weights_direct to rollout actors that may
+    # still be running generate tasks. Ray actors are single-threaded, so the update queues behind generation.
     # Set sync_timeout >= rollout_timeout + expected weight transfer time to avoid spurious timeouts.
     sync_timeout = config.run.sync_timeout
 
@@ -1019,6 +1141,35 @@ if __name__ == "__main__":
     # since policy_version increments by 1 each epoch, lag reaches N every N epochs.
     overlap_max_lag = config.run.overlap_max_lag
 
+    ########
+    # 7b. Resume from checkpoint (if requested)
+    ########
+    start_epoch = 0
+    global_step = 0
+    policy_version = 0
+    rollout_policy_version = 0
+
+    if args.resume_from:
+        start_epoch, policy_version, global_step = load_checkpoint_for_resume(resume_path=args.resume_from,
+                                                                              training_engines=training_engine,
+                                                                              rollout_engines=rollout_engines,
+                                                                              weight_sync_method=weight_sync_method,
+                                                                              logger=logger,
+                                                                              sync_timeout=sync_timeout,
+                                                                              save_timeout=save_timeout)
+        rollout_policy_version = policy_version
+        logger.info(f"Resuming from epoch {start_epoch+1}, policy_version={policy_version}, global_step={global_step}")
+
+    # Clean up incomplete checkpoint directories from previous crashed runs.
+    # Only directories missing the CHECKPOINT_COMPLETE marker are removed.
+    experiment_dir = os.path.join(config.run.checkpoint_dir, config.run.experiment_id)
+    if os.path.isdir(experiment_dir):
+        for entry in os.listdir(experiment_dir):
+            ckpt_path = os.path.join(experiment_dir, entry)
+            if os.path.isdir(ckpt_path) and not os.path.exists(os.path.join(ckpt_path, "CHECKPOINT_COMPLETE")):
+                logger.warning(f"Removing incomplete checkpoint: {ckpt_path}")
+                shutil.rmtree(ckpt_path, ignore_errors=True)
+
     logger.info("=" * 50)
     logger.info(f"Starting training: {number_of_epochs} epochs, {steps_per_epoch} steps/epoch")
     logger.info(f"Training GPUs: {training_gpus}, Rollout GPUs: {rollout_gpus}")
@@ -1027,10 +1178,12 @@ if __name__ == "__main__":
     if overlap_enabled:
         logger.info(f"Overlap mode ENABLED: max_lag={overlap_max_lag}")
 
+    if args.resume_from:
+        logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch+1}/{number_of_epochs})")
+
     logger.info("=" * 50)
     entire_training_start_time = time.time()
 
-    policy_version = 0
     # rollout_policy_version tracks which policy version the rollout engines
     # currently have loaded. When overlap is enabled, we allow the rollout
     # engine to lag behind the training policy by up to overlap_max_lag versions.
@@ -1039,9 +1192,8 @@ if __name__ == "__main__":
     # version used to generate the prefetched data
     prefetch_start_time = None
     prefetch_policy_version = None
-    rollout_policy_version = 0
 
-    for epoch in range(number_of_epochs):
+    for epoch in range(start_epoch, number_of_epochs):
         epoch_start_time = time.time()
         is_last_epoch = (epoch == number_of_epochs - 1)
 
@@ -1276,6 +1428,7 @@ if __name__ == "__main__":
         if need_disk_for_rollout or should_save_disk or is_last_epoch:
             model_path = save_checkpoint(epoch=epoch,
                                          version=policy_version,
+                                         global_step=global_step,
                                          tokenizer=tokenizer,
                                          training_engines=training_engine,
                                          checkpoint_dir=config.run.checkpoint_dir,

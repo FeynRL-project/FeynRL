@@ -66,7 +66,7 @@ def test_compute_value_loss_correctness():
     assert np.isclose(loss.item(), 0.125)
     assert np.isclose(metrics['loss_v'], 0.125)
 
-def test_precompute_gae():
+def test_calculate_gae():
     dummy_self = SimpleNamespace()
     dummy_self.value_engine = MagicMock()
     dummy_self.value_engine.device = torch.device('cpu')
@@ -85,12 +85,14 @@ def test_precompute_gae():
         }
     ]
     
-    result = ppo_logic.precompute_gae(dummy_self, micro_batches)
+    result = ppo_logic.calculate_gae(dummy_self, micro_batches)
     
     assert len(result) == 1
     rets, advs = result[0]
     assert torch.all(rets == 1.0)
-    assert torch.all(advs == 1.0)
+    # calculate_gae normalizes advantages across the full batch.
+    # All-ones advantages have zero variance, so they normalize to zero.
+    assert torch.allclose(advs, torch.zeros(1, 3))
     
     dummy_self.value_forward.assert_called_once()
     dummy_self.compute_advantages.assert_called_once()

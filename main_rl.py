@@ -780,6 +780,11 @@ def save_checkpoint(epoch,
     # Note if multi-node cluster is used, checkpoint_dir must be on a shared
     # filesystem such as NFS, Lustre, etc. or each node writes to isolated local disk
     # and the checkpoint is silently incomplete.
+    gpu_nodes = [n for n in ray.nodes() if n.get("Alive") and n.get("Resources", {}).get("GPU", 0) > 0]
+    if len(gpu_nodes) > 1:
+        logger.warning(f"Multi-node cluster detected ({len(gpu_nodes)} GPU nodes). "
+                       f"Ensure checkpoint_dir is on a shared filesystem (NFS, Lustre, etc.) "
+                       f"or checkpoints may be silently incomplete.")
     tag = f"iter{epoch+1:06d}_v{version:06d}"
     model_path = get_experiment_dir_name(output_dir=checkpoint_dir, tag=tag, experiment_id=experiment_id)
     logger.info(f"[Epoch {epoch+1}] Saving checkpoint to {model_path}")

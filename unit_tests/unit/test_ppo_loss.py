@@ -19,13 +19,14 @@ def test_ppo_loss_clipped_objective():
     logprobs = torch.tensor([[-0.1, -0.2]])
     old_logprobs = torch.tensor([[-0.1, -0.2]])
     # Ratio = exp(0) = 1.0
-    advantages = torch.tensor([[1.0, 2.0]])
+    # Advantages must be pre-normalized.
+    # Mean-zero advantages with ratio=1 give pi_loss=0.
+    advantages = torch.tensor([[-1.0, 1.0]])
     mask = torch.tensor([[1.0, 1.0]])
-    
+
     # codebase logic
     loss, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
-    
-    # Advantages are normalized in code; [1, 2] becomes centered around zero.
+
     assert np.isclose(metrics['pi_loss'], 0.0, atol=1e-6)
     assert np.isclose(metrics['clipfrac'], 0.0)
     assert np.isclose(metrics['approx_kl'], 0.0)

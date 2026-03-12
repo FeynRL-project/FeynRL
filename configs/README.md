@@ -53,7 +53,9 @@ All `main_*.py` entry points accept the following arguments:
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
 | `nccl_socket_ifname` | Network interface for inter-node traffic | String \| `null` | `"eth0"`, `"bond0"` |
-| `nccl_ib_hca` | InfiniBand HCA device | String \| `null` | `"mlx5_0"` |
+| `nccl_ib_hca` | InfiniBand HCA device(s) to use or exclude | String \| `null` | `"mlx5_0"`, `"^mlx5_2,mlx5_3"` |
+
+If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 110 Connection timed out`), see the [Troubleshooting Guide — NCCL InfiniBand connection timeout](../docs/TROUBLESHOOTING.md#nccl-infiniband-connection-timeout) for diagnosis and fix steps.
 
 #### Timeouts (seconds)
 

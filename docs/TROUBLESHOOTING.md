@@ -4,6 +4,25 @@ This guide covers common issues encountered while running FeynRL, including mult
 
 ## Multi-Node & Scaling Issues
 
+### NCCL InfiniBand connection timeout
+
+**Symptom:** `ibv_modify_qp failed with 110 Connection timed out` or similar `ncclSystemError` during initialization.
+
+**Cause:** Nodes with multiple InfiniBand HCAs may have some for GPU data traffic and others for management/storage. NCCL can auto-select a management HCA that cannot reach other ranks.
+
+**Diagnosis and fix:**
+
+1. Run `ibdev2netdev` and `ip addr show` to map each HCA to its network interface and subnet. Management links typically have small subnets (`/30`), while data-fabric HCAs have larger subnets (`/24`, `/25`).
+2. Match the device in the error message (e.g. `on dev mlx5_3:1`) to the mapping — if it's a management HCA, exclude it:
+   ```yaml
+   run:
+     nccl_socket_ifname: "<interface_used_by_ray>"
+     nccl_ib_hca: "^<mgmt_hca_0>,<mgmt_hca_1>"   # exclude with ^ prefix
+   ```
+3. To quickly confirm the issue, disable IB and fall back to TCP: `export NCCL_IB_DISABLE=1`
+
+---
+
 ### RL run hangs during rollout or training step
 **Possible causes:**
 - **GPU over-allocation**: `training_gpus + rollout_gpus` exceeds available cluster GPUs.

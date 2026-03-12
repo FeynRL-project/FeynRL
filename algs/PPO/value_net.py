@@ -1,7 +1,11 @@
+import os
+import json
 import torch
 import torch.nn as nn
 from types import SimpleNamespace
-from peft import PeftModel
+from peft import PeftModel, get_peft_model, LoraConfig
+from transformers import AutoModelForCausalLM, AutoConfig
+from safetensors.torch import load_file
 
 class ValueNetwork(nn.Module):
     '''
@@ -89,6 +93,69 @@ class ValueNetwork(nn.Module):
         if hasattr(self.backbone, 'enable_input_require_grads'):
             self.backbone.enable_input_require_grads()
 
+    @classmethod
+    def load_from_checkpoint(cls,
+                             checkpoint_dir:str ,
+                             base_model_path:str,
+                             dtype:torch.dtype,
+                             trust_remote_code:bool):
+        '''
+            Load a ValueNetwork from a saved checkpoint directory. It supports both 
+            non-PEFT and PEFT models (using peft_config.json in checkpoint dir.)
+            Args:
+                cls: ValueNetwork class
+                checkpoint_dir: should contain model.safetensors + config.json, optionally peft_config.json
+                base_model_path: HF model name/path for the base CausalLM architecture.
+                dtype: Model dtype
+                trust_remote_code
+            Returns:
+                ValueNetwork with loaded weights
+        '''
+        # 1. Build the base CausalLM architecture (random weights, no download)
+        config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=trust_remote_code)
+        base_model = AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code)
+        base_model = base_model.to(dtype=dtype)
+
+        # 2. Apply PEFT/LoRA if the checkpoint was saved with it.
+        # This injects LoRA layers so parameter names (.base_layer., .lora_A., .lora_B.)
+        # match the saved state_dict.
+        peft_config_path = os.path.join(checkpoint_dir, "peft_config.json")
+        if os.path.exists(peft_config_path):
+            with open(peft_config_path) as f:
+                peft_cfg = json.load(f)
+            lora_config = LoraConfig(r=peft_cfg['lora_rank'],
+                                     lora_alpha=peft_cfg['lora_alpha'],
+                                     lora_dropout=peft_cfg['lora_dropout'],
+                                     target_modules=peft_cfg['lora_target_modules'],
+                                     task_type=peft_cfg['task_type'])
+
+            base_model = get_peft_model(base_model, lora_config)
+
+        # 3. Create ValueNetwork. It unwraps PeftModel but LoRA layers remain injected.
+        value_model = cls(base_model)
+
+        # 4. Load saved weights supporting both single and sharded safetensors)
+        index_path  = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+        single_path = os.path.join(checkpoint_dir, "model.safetensors")
+
+        state_dict = {}
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+            for shard_file in set(index['weight_map'].values()):
+                shard = load_file(os.path.join(checkpoint_dir, shard_file))
+                state_dict.update(shard)
+
+        elif os.path.exists(single_path):
+            state_dict = load_file(single_path)
+
+        else:
+            raise FileNotFoundError(f"No model weights found in {checkpoint_dir}. "
+                                    f"Expected model.safetensors or model.safetensors.index.json")
+
+        value_model.load_state_dict(state_dict, strict=True)
+        return value_model
+
 if __name__ == "__main__":
     from transformers import AutoModelForCausalLM, AutoConfig
     config = AutoConfig.from_pretrained('google/gemma-3-1b-it')
@@ -112,4 +179,3 @@ if __name__ == "__main__":
     attention_mask = torch.ones(B, T).to(torch.long)
     outputs = value_model(input_ids, attention_mask)
     print('The shape of the logits is: ', outputs.logits.shape)
-    

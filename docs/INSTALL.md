@@ -85,6 +85,26 @@ python -c "import flash_attn; print(flash_attn.__version__)"
 
 ---
 
+## Step 5: Authenticate with Hugging Face and Weights & Biases
+
+Many models (e.g. Llama, Gemma) require accepting a license on the Hugging Face Hub before you can download them. Log in so you can access gated models for training and evaluation:
+
+```bash
+huggingface-cli login
+```
+
+You will be prompted to paste a token from [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+
+If you use **Weights & Biases** as your experiment tracker (`logger_type: "wandb"` in your config), log in so training metrics are reported correctly:
+
+```bash
+wandb login
+```
+
+You will be prompted to paste an API key from [https://wandb.ai/authorize](https://wandb.ai/authorize).
+
+---
+
 ## Troubleshooting
 
 ### FlashAttention Installation Fails

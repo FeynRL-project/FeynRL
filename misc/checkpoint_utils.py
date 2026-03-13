@@ -247,15 +247,38 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer,
     save_ok = True
     try:
         if rank == 0:
-            if hasattr(model_engine.module, 'config'):
-                model_engine.module.config.save_pretrained(model_path)
+            # When PEFT is active, model_engine.module is a PeftModel.
+            # We must save the underlying base model's config so vllm can
+            # load the merged checkpoint without peft specific fields.
+            model_module = model_engine.module
+            if peft_config.use_peft and hasattr(model_module, 'get_base_model'):
+                base_config = model_module.get_base_model().config
+
+            elif hasattr(model_module, 'config'):
+                base_config = model_module.config
+
+            else:
+                base_config = None
+
+            if base_config is not None:
+                base_config.save_pretrained(model_path)
+                logger.info(f"[Epoch {epoch+1}] Model config  saved")
+
+            else:
+                logger.info(f"[Epoch {epoch+1}] Could not find model config to save for model")
             
-            gen_cfg = getattr(model_engine.module, 'generation_config', None)
+            # Save generation_config.json if available. This is needed by some hf pipelines or vllm.
+            gen_cfg = getattr(model_module, 'generation_config', None)
+            # For peft, generation_config lives on the base model.
+            if gen_cfg is None and hasattr(model_module, 'get_base_model'):
+                gen_cfg = getattr(model_module.get_base_model(), 'generation_config', None)
+
             if gen_cfg is not None:
                 gen_cfg.save_pretrained(model_path)
+                logger.info(f"[Epoch {epoch+1}] Generation config saved")
             
             tokenizer.save_pretrained(model_path)
-            logger.info(f"[Epoch {epoch+1}] Model config and tokenizer saved")
+            logger.info(f"[Epoch {epoch+1}] Tokenizer saved")
 
     except Exception as e:
         save_ok = False

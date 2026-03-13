@@ -27,7 +27,6 @@ All `main_*.py` entry points accept the following arguments:
 
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
-| `experiment_id` | Unique identifier for the run | String | `"rl_exp_01"`, `"sft_v2"` |
 | `seed` | Random seed to help with reproducibility | Integer ≥ 0 | `42`, `1337` |
 | `project_name` | Project name in experiment tracker | String | `"FeynRL"`, `"my-project"` |
 | `logger_type` | Tracker type | `"mlflow"` \| `"wandb"` | `"mlflow"` |

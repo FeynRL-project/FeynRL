@@ -64,7 +64,7 @@ def init_rank_world_size():
 
     return rank, world_size, local_rank
 
-def apply_peft_module(model, peft_config):
+def apply_peft_module(model, peft_config, rank=0):
     '''
         Apply PEFT module to the model if it is enabled.
     '''
@@ -76,7 +76,8 @@ def apply_peft_module(model, peft_config):
                                  task_type=peft_config.task_type)
 
         model_peft = get_peft_model(model, lora_config)
-        print("LoRA model loaded successfully")
+        if rank == 0:
+            print("LoRA model loaded successfully")
         return model_peft
 
     else:
@@ -190,6 +191,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     def worker_init_fn(worker_id):
         # each worker gets a different seed but deterministic across runs when seed fixed
         worker_seed = params.run.seed + worker_id + (rank * 100000)
+        # we already handled rank differentiation above so we don't need to send it to set_random_seeds
         set_random_seeds(worker_seed)
 
     if split == 'train':
@@ -235,7 +237,7 @@ if __name__ == "__main__":
                                  world_size=world_size,
                                  rank=rank,
                                  )
-    set_random_seeds(seed=config.run.seed)
+    set_random_seeds(seed=config.run.seed, rank=rank)
 
     # setup remote experiment tracker
     tracker = setup_tracker(config=config, rank=rank)
@@ -254,7 +256,7 @@ if __name__ == "__main__":
 
     # apply PEFT module if enabled
     if config.peft.use_peft:
-        model = apply_peft_module(model=model, peft_config=config.peft)
+        model = apply_peft_module(model=model, peft_config=config.peft, rank=rank)
 
         if rank == 0:
             model.print_trainable_parameters()
@@ -514,3 +516,9 @@ if __name__ == "__main__":
     # End experiment tracker run
     if tracker:
         tracker.finish()
+
+    # Clean shutdown: release NCCL communicators and process group resources
+    # to prevent orphaned processes and hangs on exit in multi-node setups.
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()

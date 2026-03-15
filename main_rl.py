@@ -1177,10 +1177,27 @@ if __name__ == "__main__":
                 logger.warning(f"Removing incomplete checkpoint: {ckpt_path}")
                 shutil.rmtree(ckpt_path, ignore_errors=True)
 
+    # Fetch model info from rank 0 engine (single remote call)
+    model_info = ray.get(training_engine[0].get_model_info.remote())
+    total_params = model_info['total_params']
+    trainable_params = model_info['trainable_params']
+    frozen_params = model_info['frozen_params']
+
     logger.info("=" * 50)
     logger.info(f"Starting training: {number_of_epochs} epochs, {steps_per_epoch} steps/epoch")
     logger.info(f"Training GPUs: {training_gpus}, Rollout GPUs: {rollout_gpus}")
-    logger.info(f"Weight sync: {weight_sync_method}, Checkpoint save interval: {checkpoint_save_interval}")
+    if model_info['peft_enabled']:
+        logger.info(f"Model: {config.model.name} | PEFT: {model_info['peft_type']} | "
+                    f"params: {total_params:,} total, {trainable_params:,} peft ({100*trainable_params/total_params:.2f}%), "
+                    f"{frozen_params:,} frozen")
+    else:
+        logger.info(f"Model: {config.model.name} | PEFT: off | "
+                    f"params: {total_params:,} total, {trainable_params:,} trainable")
+
+    if 'value_total_params' in model_info:
+        logger.info(f"Value model: {config.model.value_model or config.model.name} | "
+                    f"params: {model_info['value_total_params']:,} total, {model_info['value_trainable_params']:,} trainable")
+    logger.info(f"Weight sync: {weight_sync_method} | checkpoint_save_interval: {checkpoint_save_interval}")
 
     if overlap_enabled:
         logger.info(f"Overlap mode ENABLED: max_lag={overlap_max_lag}")
@@ -1360,15 +1377,22 @@ if __name__ == "__main__":
 
         epoch_avg = {k: np.mean(v) for k, v in epoch_metrics.items()}
 
+        # Fetch lr and gpu memory from rank 0 engine
+        train_stats = ray.get(training_engine[0].get_training_stats.remote())
+        current_lr = train_stats.get('lr', 0.0)
+        gpu_mem_gb = train_stats.get('gpu_peak_mem_gb', 0.0)
+
         logger.info(f"[Epoch {epoch+1}] Training complete: time={train_time:.2f}s, "
                     f"avg_loss={epoch_avg.get('loss_total', 0.0):.4f}, "
                     f"avg_kl_ref={epoch_avg.get('kl_ref', 0.0):.4f}, "
-                    f"avg_kl_old={epoch_avg.get('kl_old', 0.0):.6f}")
+                    f"avg_kl_old={epoch_avg.get('kl_old', 0.0):.6f}, "
+                    f"lr={current_lr:.2e}, gpu_peak_mem={gpu_mem_gb:.2f}GB")
 
         if tracker:
-            tracker.log_metrics({
-                "train/epoch_time_sec": train_time,
-            }, step=global_step)
+            tracker.log_metrics({"train/epoch_time_sec": train_time,
+                                 "train/lr": current_lr,
+                                 "train/gpu_peak_mem_gb": gpu_mem_gb,
+                                }, step=global_step)
 
         ################
         # 6. Sync weights to rollout engines
@@ -1487,8 +1511,7 @@ if __name__ == "__main__":
     if tracker:
         tracker.finish()
 
-    logger.info("Training completed successfully!")
     entire_training_time = time.time() - entire_training_start_time
-    logger.info(f"Total training time from start to finish: {entire_training_time:.2f}s")
+    logger.info(f"Training completed successfully! Total time: {entire_training_time:.2f}s ({entire_training_time/3600:.2f}h)")
     ray.shutdown()
     logger.info("Done!")

@@ -163,6 +163,38 @@ class COMMON:
 
         return model
 
+    def get_model_info(self):
+        '''
+            Return model parameter counts and PEFT status.
+            Uses ds_numel for ZeRO-3 partitioned params, numel() for non-ZeRO.
+        '''
+        total = sum(getattr(p, 'ds_numel', p.numel()) for p in self.policy_engine.module.parameters())
+        trainable = sum(getattr(p, 'ds_numel', p.numel()) for p in self.policy_engine.module.parameters() if p.requires_grad)
+        info = {'total_params': total,
+                'trainable_params': trainable,
+                'frozen_params': total - trainable,
+                'peft_enabled': self.peft_config.use_peft,
+                'peft_type': self.peft_config.peft_type if self.peft_config.use_peft else None,
+                }
+
+        if hasattr(self, 'value_engine') and self.value_engine is not None:
+            info['value_total_params'] = sum(getattr(p, 'ds_numel', p.numel()) for p in self.value_engine.module.parameters())
+            info['value_trainable_params'] = sum(getattr(p, 'ds_numel', p.numel()) for p in self.value_engine.module.parameters() if p.requires_grad)
+        return info
+
+    def get_training_stats(self):
+        '''
+            Return current LR and GPU peak memory.
+        '''
+        stats = {}
+        if self.policy_optimizer is not None:
+            stats['lr'] = self.policy_optimizer.param_groups[0]['lr']
+
+        if torch.cuda.is_available():
+            stats['gpu_peak_mem_gb'] = torch.cuda.max_memory_allocated(self.policy_engine.device) / (1024 ** 3)
+
+        return stats
+
     def apply_peft_module(self, model):
         '''
             Apply PEFT module to the model if it is enabled.

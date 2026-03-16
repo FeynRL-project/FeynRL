@@ -456,7 +456,7 @@ if __name__ == "__main__":
         # We accumulate and average across batches and GPUs.
         local_sums = {k: torch.tensor(0.0, device=model_engine.device)
                       for k in ('loss', 'chosen_rewards', 'rejected_rewards', 'reward_accuracies')}
-        local_batch_count = torch.tensor(0.0, device=model_engine.device)
+        local_sample_count = torch.tensor(0.0, device=model_engine.device)
 
         val_start_time = time.time()
         model_engine.eval()
@@ -464,22 +464,23 @@ if __name__ == "__main__":
         with torch.no_grad():
             for data in val_iter:
                 val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
+                batch_size = val_batch['input_ids'].shape[0]
                 val_metric = alg.eval_step(val_batch)
                 for k in local_sums:
-                    local_sums[k] += val_metric[k]
-                local_batch_count += 1.0
+                    local_sums[k] += val_metric[k] * batch_size
+                local_sample_count += batch_size
 
         # Aggregate across all ranks.
         if torch.distributed.is_initialized():
             for k in local_sums:
                 torch.distributed.all_reduce(local_sums[k], op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(local_batch_count, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(local_sample_count, op=torch.distributed.ReduceOp.SUM)
 
         # Avoid division by zero
-        if local_batch_count.item() == 0:
+        if local_sample_count.item() == 0:
             global_avgs = {k: 0.0 for k in local_sums}
         else:
-            global_avgs = {k: (v / local_batch_count).item() for k, v in local_sums.items()}
+            global_avgs = {k: (v / local_sample_count).item() for k, v in local_sums.items()}
 
         val_time = time.time() - val_start_time
         val_summary = " | ".join(f"{k}: {v:.4f}" for k, v in global_avgs.items())

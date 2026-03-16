@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 
 class SFT:
     def __init__(self, model_engine, optimizer, normalize_loss=False):
@@ -112,9 +111,6 @@ class SFT:
            This implements a single training step per rank/gpu
            for given micro_batch_size_per_gpu.
         '''
-        # make sure model is in training mode
-        self.model_engine.train()
-
         # Don't need to zero_grad() here as ds handles gradient zeroing
         # internally after step() when gradient_accumulation_steps boundary is reached.
         # 1. forward pass per gpu/rank

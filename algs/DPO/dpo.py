@@ -85,6 +85,9 @@ class DPO:
         '''
         # since torch.stack([chosen, rejected], dim=0) is used to stack them, data
         # are interleaved as [chosen0, rejected0, chosen1, rejected1, ...]
+        if batch['input_ids'].dim() != 3 or batch['input_ids'].shape[1] != 2:
+            raise ValueError(f"DPO expects input_ids of shape [B, 2, T], got {list(batch['input_ids'].shape)}")
+
         B, _, T = batch['input_ids'].shape
         # [B, 2, T] -> [2B, T]
         input_ids = batch['input_ids'].view(-1, T)
@@ -149,9 +152,6 @@ class DPO:
            This implements a single training step per rank/gpu
            for given micro_batch_size_per_gpu.
         '''
-        # make sure model is in training mode
-        self.model_engine.train()
-
         # 1. forward pass per gpu/rank
         # chosen and rejected data are stacked as [B, 2, T]
         logits, ref_logprobs, target_ids, loss_mask = self.forward(micro_batch)

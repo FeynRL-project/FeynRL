@@ -777,6 +777,8 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             os.makedirs(f"{config.run.checkpoint_dir}/{experiment_id}", exist_ok=True)
             with open(f"{config.run.checkpoint_dir}/{experiment_id}/{config.run.method}_config.yaml", "w") as f:
                 yaml.dump(config.model_dump(), f)
+                f.flush()
+                os.fsync(f.fileno())
 
     except ValidationError as e:
         print("Configuration Error:")

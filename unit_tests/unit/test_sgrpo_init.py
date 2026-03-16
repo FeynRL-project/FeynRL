@@ -58,7 +58,7 @@ def test_sgrpo_init_and_engine():
         
         # Mock forward/loss methods called inside train_step
         sgrpo.policy_forward = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 3)))
-        sgrpo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_loss': 0.0, 'pi_loss': 1.0, 'pi_loss_total': 1.0}))
+        sgrpo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_loss': 0.0, 'pi_loss': 1.0, 'loss_total': 1.0}))
         
         # Setup engine mocks
         sgrpo.policy_engine.device = torch.device('cpu')

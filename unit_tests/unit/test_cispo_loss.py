@@ -94,7 +94,7 @@ def test_cispo_loss_entropy():
     # Loss_pi = 0 (adv = 0, logprobs = -0.5)
     # Loss_ent = 0.7
     # Loss_total = 0 - 0.1 * 0.7 = -0.07
-    assert np.isclose(metrics['pi_loss_total'], -0.07)
+    assert np.isclose(metrics['loss_total'], -0.07)
 
 def test_cispo_loss_kl_ref():
     cispo_logic = CISPO

@@ -219,11 +219,11 @@ class COMMON:
             Since we are using deepspeed with ray, each ray actor MUST create its own deepspeed engine.
             This is because each ray actor process is a separate process (1 actor = 1 gpu = 1 ds rank).
         '''
-        # Seed every ray worker deterministically so model init, random.shuffle,
-        # and any stochastic components are reproducible run-to-run (hopefully).
-        # self.seed is passed from config via the algorithm constructor.
-        rank_for_seed = int(os.environ.get("RANK", "0"))
-        set_random_seeds(self.seed + rank_for_seed)
+        # All ranks MUST use the same seed for model initialization so that stochastic
+        #  components (e.g., LoRA adapter init via kaiming_uniform_) produce identical weights.
+        # Under zero-3, parameters are partitioned in-place without broadcast, so differing
+        # init weights across ranks would cause a problem. Per-rank seeds are applied AFTER deepspeed.initialize() below.
+        set_random_seeds(self.seed)
 
         # Convert pydantic model to python Dict for DeepSpeed
         ds_config_dict = self.deepspeed_config.model_dump()
@@ -231,11 +231,11 @@ class COMMON:
         # check to avoid re-initializing distributed backend
         if not torch.distributed.is_initialized():
             deepspeed.init_distributed()
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         print(f"[Alg:{self.alg_name}][Rank {rank}] Initializing training engine...")
 
-        # Load models
+        # Load models (all ranks get identical weights due to shared seed above)
         models = self.load_model()
 
         # Unpack models flexibly
@@ -286,6 +286,20 @@ class COMMON:
                                                     config=value_ds_dict
                                                     )
             print(f"[Alg:{self.alg_name}][Rank {rank}] Value model initialized with DeepSpeed")
+
+        # Now re-seed with rank-specific seeds so each rank would have different stochastic behavior.
+        set_random_seeds(self.seed + rank)
+
+    def shutdown(self):
+        '''
+            Clean up distributed state. Call before the ray actor is torn down
+            to release nccl resources and prevent stale connections on restart.
+        '''
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:
+                pass
 
     def save_checkpoint(self, output_dir: str, tag: str, value_output_dir: str = None):
         '''
@@ -411,6 +425,8 @@ class COMMON:
                                    }
                         with open(os.path.join(value_output_dir, "peft_config.json"), "w") as f:
                             json.dump(peft_cfg, f, indent=2)
+                            f.flush()
+                            os.fsync(f.fileno())
                         print(f"[Alg:{self.alg_name}][Rank {rank}] Saved value model weights + peft_config.json")
 
                 except Exception as e:
@@ -512,6 +528,8 @@ class COMMON:
 
             with open(os.path.join(output_dir, "model.safetensors.index.json"), "w") as f:
                 json.dump(index, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
 
     def merge_peft_state_dict(self, raw_state_dict):
         '''
@@ -552,8 +570,8 @@ class COMMON:
 
         for module_path in lora_a:
             if module_path not in lora_b:
-                print(f"[WARNING] merge_peft_state_dict: found lora_A but no lora_B for {module_path}")
-                continue
+                raise RuntimeError(f"merge_peft_state_dict: found lora_A but no lora_B for {module_path}. "
+                                   f"State dict is corrupt or incomplete.")
 
             A = lora_a[module_path]  # [r, D]
             B = lora_b[module_path]  # [H, r]
@@ -570,7 +588,8 @@ class COMMON:
                 base_weights[base_key] = base_weights[base_key] + delta.to(base_weights[base_key].dtype)
 
             else:
-                print(f"[WARNING] merge_peft_state_dict: no base weight found for {module_path}")
+                raise RuntimeError(f"merge_peft_state_dict: no base weight found for {module_path}, "
+                                   f"LoRA delta would be silently dropped.")
 
         # 3. Remap names: strip peft_prefix and .base_layer suffix
         for peft_name, tensor in base_weights.items():

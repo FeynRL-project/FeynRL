@@ -1523,7 +1523,7 @@ if __name__ == "__main__":
 
     # Clean up nccl process groups before ray tears down actors.
     # All engines must call destroy_process_group concurrently. it's collective.
-    shutdown_futures = [engine.shutdown.remote() for engine in training_engines]
+    shutdown_futures = [engine.shutdown.remote() for engine in training_engine]
     try:
         ray.get(shutdown_futures, timeout=30)
 

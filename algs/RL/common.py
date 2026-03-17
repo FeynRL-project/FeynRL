@@ -107,8 +107,8 @@ class COMMON:
         log_ratio = logprobs - ref_logprobs
         # pi_ref/pi = exp(ref_logprobs - logprobs)
         exponent = ref_logprobs - logprobs
-        if exponent.max().item() > 10.0:
-            print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
+        #if exponent.max().item() > 10.0:
+        #    print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
 
         ratio_inv = torch.exp(exponent)
         kl_dist = log_ratio + ratio_inv - 1

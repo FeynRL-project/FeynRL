@@ -1,5 +1,6 @@
 import os
 import json
+import copy
 import atexit
 import numpy as np
 import argparse
@@ -825,12 +826,18 @@ def save_checkpoint(epoch,
                           'global_step': global_step,
                           'training_gpus': len(training_engines),
                          }
-        with open(os.path.join(model_path, "training_state.json"), "w") as f:
+        state_file = os.path.join(model_path, "training_state.json")
+        with open(state_file, "w") as f:
             json.dump(training_state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
 
         # On load, only checkpoints with this file are considered complete and safe to resume from.
-        with open(os.path.join(model_path, "CHECKPOINT_COMPLETE"), "w") as f:
+        marker_file = os.path.join(model_path, "CHECKPOINT_COMPLETE")
+        with open(marker_file, "w") as f:
             f.write("")
+            f.flush()
+            os.fsync(f.fileno())
 
     logger.info(f"[Epoch {epoch+1}] Checkpoint saved: {model_path}")
     return model_path
@@ -1513,5 +1520,15 @@ if __name__ == "__main__":
 
     entire_training_time = time.time() - entire_training_start_time
     logger.info(f"Training completed successfully! Total time: {entire_training_time:.2f}s ({entire_training_time/3600:.2f}h)")
+
+    # Clean up nccl process groups before ray tears down actors.
+    # All engines must call destroy_process_group concurrently. it's collective.
+    shutdown_futures = [engine.shutdown.remote() for engine in training_engines]
+    try:
+        ray.get(shutdown_futures, timeout=30)
+
+    except Exception:
+        pass
+
     ray.shutdown()
     logger.info("Done!")

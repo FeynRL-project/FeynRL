@@ -1,6 +1,6 @@
 ### P3O (Policy Performance on Previous Policies Optimization)
 
-P3O uses the **Effective Sample Size (ESS)** of importance weights to adaptively clip the importance ratio, enabling safe learning from off-policy (stale) data. The clipped ratio serves as a stop-gradient weighting coefficient for the log-probability.
+P3O uses the **Effective Sample Size (ESS)** of importance weights to adaptively clip the importance ratio, enabling effective learning from off-policy (stale) data without fixed clip bounds which can be hard sometimes to tune. The clipped ratio serves as a stop-gradient weighting coefficient for the log-probability. 
 
 Based on [Fakoor et al., 2019 (arXiv:1905.01756)](https://arxiv.org/abs/1905.01756).
 

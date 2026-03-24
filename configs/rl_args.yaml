@@ -10,11 +10,6 @@ run:
   ray_master_port: 29500
   seed: 42
 
-  # Overlap training and rollout generation
-  overlap_enabled: False
-  # Max training steps ahead of rollout policy version
-  overlap_max_lag: 2
-
   # Weight sync: "direct" pushes weights via GPU memory (no disk I/O),
   # "disk" uses save-to-disk + vllm reload.
   weight_sync_method: "direct"
@@ -23,11 +18,13 @@ run:
   checkpoint_save_interval: 1
 
   # NCCL config for multi-node training over InfiniBand.
+  # Leave nccl_socket_ifname and nccl_ib_hca null for single-node or when NCCL auto-detection works.
   # Set nccl_socket_ifname to the network interface carrying inter-node traffic (e.g., "eth0", "bond0"). run ip addr | grep addr
-  # Set nccl_ib_hca to the InfiniBand HCA device (e.g., "mlx5_0", "mlx5_0:1"). run ibstat | grep "CA '" to find it
-  # Leave null for single-node or when NCCL auto-detection works.
   nccl_socket_ifname: null
+  # Set nccl_ib_hca to the InfiniBand HCA device (e.g., "mlx5_0", "mlx5_0:1"). run ibstat | grep "CA '" to find it
   nccl_ib_hca: null
+  # Port for NCCL weight sync rendezvous (default: ray_master_port + 100)
+  nccl_sync_port: null
 
   # Timeout settings (seconds) for ray.get() calls
   # need to be updated based on a specific setup
@@ -36,6 +33,21 @@ run:
   train_step_timeout: 1800
   save_timeout: 1800
   sync_timeout: 900
+
+overlap:
+  # Overlap training and rollout generation
+  enabled: False
+  # Max training steps ahead of rollout policy version
+  max_lag: 2
+  # Dataloader batches per generation chunk.
+  # One chunk in-flight at a time; smaller = more frequent NCCL sync windows.
+  # 1 means max overlap, fastest ESS response. >1 means fewer round-trips, coarser sync.
+  chunk_size: 1
+  # ESS below this triggers sync between training steps (P3O only)
+  # lower threshold means more acceptance of offpolicyiness.
+  ess_sync_threshold: 0.5
+  # Static sync interval in training steps for non-P3O algorithms regardless of off-policness of data.
+  fixed_sync_interval: 1
 
 train:
   ###############

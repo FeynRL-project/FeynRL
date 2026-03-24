@@ -26,12 +26,6 @@ class Run(BaseModel):
     ray_master_port: int | None = None
     checkpoint_dir: str | None = None
 
-    # Overlap training and rollout generation
-    # Enable overlap mode
-    overlap_enabled: bool | None = None
-    # Max training steps ahead of rollout policy version
-    overlap_max_lag: int | None = None
-
     # Weight sync: "direct" pushes weights via gpu memory (no disk I/O),
     # "disk" uses save-to-disk + vllm reload.
     weight_sync_method: str | None = "direct"
@@ -39,11 +33,14 @@ class Run(BaseModel):
     # 0 = only at end.
     checkpoint_save_interval: int | None = 1
 
-    # NCCL configuration for multi-node clusters
-    # e.g., "eth0", "ens3", "bond0"
+    # NCCL configuration for multi-node training over InfiniBand.
+    # Leave nccl_socket_ifname and nccl_ib_hca null for single-node or when NCCL auto-detection works.
+    # Set nccl_socket_ifname to the network interface carrying inter-node traffic (e.g., "eth0", "bond0"). run ip addr | grep addr
     nccl_socket_ifname: str | None = None
-    # e.g., "mlx5_0" for InfiniBand HCA selection
+    # Set nccl_ib_hca to the InfiniBand HCA device (e.g., "mlx5_0", "mlx5_0:1"). run ibstat | grep "CA '" to find it
     nccl_ib_hca: str | None = None
+    # Port for NCCL weight sync rendezvous (default: ray_master_port + 100)
+    nccl_sync_port: int | None = None
 
     # Timeout (seconds) for ray.get() calls to prevent indefinite hangs.
     # None means use the default for each category.
@@ -231,6 +228,24 @@ class Reward(BaseModel):
     eps_reward_norm: float | None = None
     reward_func: str | None = None
 
+class Overlap(BaseModel):
+    '''
+        Overlap training and rollout generation (RL-specific).
+    '''
+    model_config = ConfigDict(extra='forbid')
+    enabled: bool  | None = None
+    # Max training steps ahead of rollout policy version
+    max_lag: int | None = None
+    # Dataloader batches per generation chunk.
+    # One chunk in-flight at a time; smaller = more frequent NCCL sync windows.
+    # =1: max overlap, fastest ESS response. >1: fewer round-trips, coarser sync.
+    chunk_size: int | None = None
+    # ESS below this triggers sync between training steps (P3O only)
+    ess_sync_threshold: float | None = None
+    # Static sync interval in training steps for non-P3O algorithms.
+    # None = disabled (only ESS-driven sync).
+    fixed_sync_interval: int | None = None
+
 class Rollout(BaseModel):
     '''
         Everything related to rollout generation (RL-specific).
@@ -267,6 +282,7 @@ class Config(BaseModel):
     # RL-specific sections
     reward: Reward | None = None
     rollout: Rollout | None = None
+    overlap: Overlap | None = None
     # Reference model DeepSpeed config
     deepspeed_ref: DeepSpeedRef | None = None
     # Value model DeepSpeed config
@@ -721,14 +737,18 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 raise ValueError("run.sync_timeout must be specified for RL training")
 
             # Overlap mode validation
-            if config.run.overlap_enabled:
-                if config.run.overlap_max_lag is None:
-                    raise ValueError("run.overlap_max_lag must be specified when overlap_enabled=True. "
-                                     "It controls how many training steps ahead the policy can be relative "
-                                     "to the rollout policy version (e.g., overlap_max_lag=1).")
+            if config.overlap and config.overlap.enabled:
+                if config.overlap.max_lag is None or config.overlap.max_lag < 1:
+                    raise ValueError(f"overlap.max_lag must be >= 1, got {config.overlap.max_lag}")
 
-                if config.run.overlap_max_lag < 1:
-                    raise ValueError(f"run.overlap_max_lag must be >= 1, got {config.run.overlap_max_lag}")
+                if config.overlap.chunk_size is None or config.overlap.chunk_size < 1:
+                    raise ValueError(f"overlap.chunk_size must be >= 1, got {config.overlap.chunk_size}")
+
+                if config.run.weight_sync_method != "nccl":
+                    raise ValueError(f"when overlap is enabled, weight_sync_method must be nccl")
+
+                if config.overlap.ess_sync_threshold is None or not (0.0 < config.overlap.ess_sync_threshold <= 1.0):
+                    raise ValueError(f"overlap.ess_sync_threshold must be in (0.0, 1.0], got {config.overlap.ess_sync_threshold}")
 
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:

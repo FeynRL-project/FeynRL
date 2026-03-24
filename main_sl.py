@@ -93,7 +93,7 @@ def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_i
     model_dtype = safe_string_to_torch_dtype(model_dtype)
 
     # 1. model and its config initialization
-    model_config = AutoConfig.from_pretrained(model_name)
+    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     model = AutoModelForCausalLM.from_pretrained(model_name,
                                                 dtype=model_dtype,
                                                 trust_remote_code=trust_remote_code,
@@ -117,6 +117,11 @@ def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_i
         else:
             # fallback to eos token id
             tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Sync pad_token_id into model config so exported checkpoints are consistent
+    # as vllm and similar read pad_token_id from config.json, not tokenizer
+    if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     return model, tokenizer
 
@@ -231,11 +236,29 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                 model_dtype=config.model.dtype,
-                                                 trust_remote_code=config.model.trust_remote_code,
-                                                 attn_impl=config.model.attn_implementation,
-                                                 rank=rank)
+    # Initialize distributed backend early so deepspeed.zero.Init() can partition
+    # parameters at creation time
+    if not torch.distributed.is_initialized():
+        deepspeed.init_distributed()
+
+    is_zero3 = config.deepspeed.zero_optimization.get("stage", 0) == 3
+    if is_zero3:
+        # stage 3 partitions parameters at creation to avoid every rank loading the full
+        # model into cpu ram which causes oom for large models on multi-gpu nodes.
+        # for stages 0/1/2, every rank must hold the full model parameters.
+        ds_config_dict = config.deepspeed.model_dump()
+        with deepspeed.zero.Init(config_dict_or_path=ds_config_dict):
+            model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+                                                         model_dtype=config.model.dtype,
+                                                         trust_remote_code=config.model.trust_remote_code,
+                                                         attn_impl=config.model.attn_implementation,
+                                                         rank=rank)
+    else:
+        model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+                                                     model_dtype=config.model.dtype,
+                                                     trust_remote_code=config.model.trust_remote_code,
+                                                     attn_impl=config.model.attn_implementation,
+                                                     rank=rank)
     # apply PEFT module if enabled
     if config.peft.use_peft:
         model = apply_peft_module(model=model, peft_config=config.peft, rank=rank)
@@ -264,6 +287,11 @@ if __name__ == "__main__":
             model.enable_input_require_grads()
 
     model_engine, optimizer = create_training_engine(deepspeed_config=config.deepspeed, model=model)
+    engine_ga_steps_value = getattr(model_engine, "gradient_accumulation_steps")
+    ga_steps = int(engine_ga_steps_value() if callable(engine_ga_steps_value) else engine_ga_steps_value)
+    if ga_steps != config.train.gradient_accumulation_steps:
+        raise RuntimeError(f"DeepSpeed gradient_accumulation_steps ({ga_steps}) does not match config "
+                           f"({config.train.gradient_accumulation_steps}).")
 
     ########
     # 6. Build env or data loader
@@ -282,43 +310,57 @@ if __name__ == "__main__":
                                           world_size=world_size,
                                           rank=rank)
 
+    # ZeRO-3 uses all-gather collectives inside every forward pass, sized for
+    # train_micro_batch_size_per_gpu. A larger val batch can OOM because
+    # activation memory exceeds what DeepSpeed budgeted.
+    if is_zero3 and config.train.val_batch_size_per_gpu > config.train.train_batch_size_per_gpu:
+        logger.warning(f"val_batch_size_per_gpu ({config.train.val_batch_size_per_gpu}) > "
+                       f"train_batch_size_per_gpu ({config.train.train_batch_size_per_gpu}) with ZeRO stage 3. "
+                       f"This may cause OOM during validation. Consider setting val_batch_size_per_gpu <= "
+                       f"train_batch_size_per_gpu.")
+
     ########
     # 7. Intitate the learning algorithm (e.g., ppo)
     ########
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
     alg = alg_class(model_engine=model_engine,
                     optimizer=optimizer,
-                    normalize_loss=config.train.normalize_loss)
+                    normalize_loss=config.train.normalize_loss,
+                    world_size=world_size)
 
     ########
-    # 8. Training and evaluation loop
+    # 8. Variable initialization
     ########
     if rank == 0:
         print("Starting training...")
 
     total_number_of_train_samples = len(train_dataloader.dataset)
     micro_batches_per_epoch = config.train.micro_batches_per_epoch
-    optimizer_steps_per_epoch = micro_batches_per_epoch // config.train.gradient_accumulation_steps
+    optimizer_steps_per_epoch = micro_batches_per_epoch // ga_steps
 
     # if micro_batches_per_epoch is not divisible by gradient_accumulation_steps
-    if micro_batches_per_epoch % config.train.gradient_accumulation_steps != 0:
-        remainder = micro_batches_per_epoch % config.train.gradient_accumulation_steps
+    if micro_batches_per_epoch % ga_steps != 0:
+        remainder = micro_batches_per_epoch % ga_steps
         # raising error to enforce correctness
         raise ValueError(f"micro_batches_per_epoch ({micro_batches_per_epoch}) MUST be divisible by "
-                         f"gradient_accumulation_steps ({config.train.gradient_accumulation_steps}) to ensure "
+                         f"gradient_accumulation_steps ({ga_steps}) to ensure "
                          "all gradients are applied within the epoch boundaries. "
                          f"Adjust configuration. Remainder: {remainder}")
 
     ########
-    # 8a. Resume from checkpoint
+    # 9. Resume from checkpoint
     ########
     start_epoch = 0
     global_step = 0
     if args.resume_from:
+        zero_stage = config.deepspeed.zero_optimization.get("stage", 0)
         start_epoch, global_step = resume_from_checkpoint(resume_path=args.resume_from,
                                                           model_engine=model_engine,
                                                           world_size=world_size,
-                                                          logger=logger)
+                                                          logger=logger,
+                                                          zero_stage=zero_stage,
+                                                          model_dtype=config.model.dtype,
+                                                          use_peft=config.peft.use_peft)
 
     experiment_dir = os.path.join(config.run.checkpoint_dir, config.run.experiment_id)
     cleanup_incomplete_checkpoints(experiment_dir=experiment_dir, rank=rank, logger=logger)
@@ -331,9 +373,9 @@ if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info(f"Starting training: {config.train.total_number_of_epochs} epochs")
     logger.info(f"Train set: {len(train_dataloader.dataset)} samples | micro_batches/epoch={micro_batches_per_epoch} | "
-                f"optimizer_steps/epoch={optimizer_steps_per_epoch} | grad_accum={config.train.gradient_accumulation_steps}")
+                f"optimizer_steps/epoch={optimizer_steps_per_epoch} | grad_accum={ga_steps}")
     logger.info(f"batch_size_per_gpu={config.train.train_batch_size_per_gpu} | "
-                f"global_batch_size={config.train.train_batch_size_per_gpu * config.train.gradient_accumulation_steps * world_size}")
+                f"global_batch_size={config.train.train_batch_size_per_gpu * ga_steps * world_size}")
 
     if config.peft.use_peft:
         logger.info(f"Model: {config.model.name} | PEFT: {config.peft.peft_type} | "
@@ -349,6 +391,9 @@ if __name__ == "__main__":
         logger.info(f"Resuming from: {args.resume_from} (epoch {start_epoch + 1}/{config.train.total_number_of_epochs})")
     logger.info("=" * 50)
 
+    ########
+    # 10. Training and evaluation loop
+    ########
     # Sync before starting
     # Ensure all nodes have loaded the model and data before anyone starts iterating
     if torch.distributed.is_initialized():
@@ -358,56 +403,92 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, config.train.total_number_of_epochs):
         epoch_start_time = time.time()
         is_last_epoch = (epoch == config.train.total_number_of_epochs - 1)
+
+        ########
+        # 11 Training loop
+        ########
         train_sampler.set_epoch(epoch)
         # Ensure gradients are zeroed at the start of epoch to prevent any bleeding from previous epoch
         # if accumulation steps were not perfectly aligned (though we enforce alignment above).
         model_engine.train()
-        model_engine.optimizer.zero_grad()
-        ########
-        # 8.1 Training loop
-        ########
+        model_engine.zero_grad()
+
         if rank == 0:
             progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.train.total_number_of_epochs}", disable=(rank != 0))
         else:
             progress_bar = train_dataloader
 
-        # micro_batches_per_epoch = number of micro-batch iterations per epoch.
-        # This allows processing a subset of the data per epoch (useful for large datasets).
-        # Optimizer steps per epoch = micro_batches_per_epoch // gradient_accumulation_steps
-        epoch_loss_sum = 0.0
-        epoch_step_count = 0
+        epoch_loss_sum    = torch.tensor(0.0, device=model_engine.device)
+        epoch_token_count = torch.tensor(0.0, device=model_engine.device)
+        data_iter = iter(progress_bar)
 
-        for step, micro_batch in enumerate(progress_bar):
-            # Move batch to gpu (deepspeed engine device)
-            micro_batch = {k: v.to(model_engine.device) for k, v in micro_batch.items()}
+        for window_idx in range(optimizer_steps_per_epoch):
+            ########
+            # 11.1 Calculate global token count across all gpus for loss normalization.
+            ########
+            window_cpu = []
+            local_token_count = 0.0
+            for _ in range(ga_steps):
+                # Collect one GA window on cpu
+                #  we do not move to gpu yet to avoid holding ga_steps batches in vram.
+                mb = next(data_iter)
+                local_token_count += mb['loss_mask'].sum().item()
+                window_cpu.append(mb)
 
-            # Run one train step for micro-batch.
-            metric = alg.train_step(micro_batch)
-            epoch_loss_sum += metric['loss']
-            epoch_step_count += 1
+            # All-reduce to get global token count across all gpus.
+            # We need this because different ranks may have different number of tokens.
+            # This ensures correct normalization regardless of token distribution across ranks.
+            ga_denom_tensor = torch.tensor(local_token_count, device=model_engine.device)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(ga_denom_tensor, op=torch.distributed.ReduceOp.SUM)
 
-            # Only increment global_step when ds actually updates weights
-            if model_engine.is_gradient_accumulation_boundary():
-                global_step += 1
+            ga_denom = ga_denom_tensor.item()
+            if ga_denom <= 0:
+                raise RuntimeError(f"Invalid global GA token denominator: {ga_denom}")
 
-            # logging
+            ########
+            # 11.2 Run train step for each micro-batch with correct global normalization.
+            ########
+            window_loss_sum = 0.0
+            for mb in window_cpu:
+                micro_batch = {k: v.to(model_engine.device) for k, v in mb.items()}
+                metric      = alg.train_step(micro_batch, ga_denom=ga_denom, ga_steps=ga_steps)
+                window_loss_sum   += metric['loss_sum']
+                epoch_loss_sum    += metric['loss_sum']
+                epoch_token_count += metric['num_tokens']
+
+            global_step += 1
+
+            ########
+            # 11.3 Logging at GA boundary and report the global per-token mean over the full GA window.
+            ########
+            window_loss_sum_tensor = torch.tensor(window_loss_sum, device=model_engine.device)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(window_loss_sum_tensor, op=torch.distributed.ReduceOp.SUM)
+
             if rank == 0:
-                progress_bar.set_postfix(loss=metric['loss'])
+                per_token_loss = window_loss_sum_tensor.item() / ga_denom
+                progress_bar.set_postfix(loss=per_token_loss)
 
-                if tracker and model_engine.is_gradient_accumulation_boundary():
+                if tracker:
                     current_lr = optimizer.param_groups[0]['lr']
-                    tracker.log_metrics({
-                        "train/loss": metric['loss'],
-                        "train/lr": current_lr,
-                    }, step=global_step)
+                    tracker.log_metrics({"train/loss": per_token_loss,
+                                         "train/lr": current_lr,
+                                         }, step=global_step)
 
-        # Sync before validation to ensure consistent state
+        ########
+        # 12 Sync before validation to ensure consistent state
+        ########
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        epoch_time = time.time() - epoch_start_time
-        avg_train_loss = epoch_loss_sum / epoch_step_count if epoch_step_count > 0 else 0.0
-        gpu_mem_gb = torch.cuda.max_memory_allocated(model_engine.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(epoch_loss_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(epoch_token_count, op=torch.distributed.ReduceOp.SUM)
+
+        epoch_time     = time.time() - epoch_start_time
+        avg_train_loss = (epoch_loss_sum / epoch_token_count).item() if epoch_token_count.item() > 0 else 0.0
+        gpu_mem_gb     = torch.cuda.max_memory_allocated(model_engine.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
         logger.info(f"Epoch {epoch+1}/{config.train.total_number_of_epochs} completed in {epoch_time:.2f}s | "
                     f"avg_train_loss: {avg_train_loss:.4f} | global_step: {global_step} | "
                     f"lr: {optimizer.param_groups[0]['lr']:.2e} | gpu_peak_mem: {gpu_mem_gb:.2f}GB")
@@ -417,11 +498,11 @@ if __name__ == "__main__":
         gc.collect()
 
         ########
-        # 8.2 Validation loop
+        # 13. Validation loop
         ########
         # to be safe and caculate loss average across batches and across GPUs correctly, we use
         # the following method: sum total loss and total tokens, then divide.
-        local_loss_sum   = torch.tensor(0.0, device=model_engine.device)
+        local_loss_sum    = torch.tensor(0.0, device=model_engine.device)
         local_token_count = torch.tensor(0.0, device=model_engine.device)
 
         val_start_time = time.time()
@@ -453,7 +534,7 @@ if __name__ == "__main__":
                 tracker.log_metrics({"val/loss": global_avg_loss}, step=global_step)
 
         ########
-        # 8.3 Save checkpoint
+        # 14. Save checkpoint
         ########
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -472,7 +553,9 @@ if __name__ == "__main__":
                                      rank=rank,
                                      world_size=world_size,
                                      logger=logger,
-                                     label="sl")
+                                     label="sl",
+                                     zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
+                                     model_dtype=config.model.dtype)
 
     total_training_time = time.time() - training_start_time
     logger.info(f"Training completed successfully! Total time: {total_training_time:.2f}s ({total_training_time/3600:.2f}h)")
@@ -481,7 +564,10 @@ if __name__ == "__main__":
     if tracker:
         tracker.finish()
 
-    # Clean shutdown: release NCCL communicators and process group resources
+    ########
+    # 15. Clean shutdow
+    ########
+    # release NCCL communicators and process group resources
     # to prevent orphaned processes and hangs on exit in multi-node setups.
     if torch.distributed.is_initialized():
         torch.distributed.barrier()

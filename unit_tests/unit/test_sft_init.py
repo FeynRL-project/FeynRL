@@ -36,7 +36,7 @@ def test_sft_train_step():
         'loss_mask': torch.ones(1, 4),
     }
     
-    metrics = sft.train_step(micro_batch)
+    metrics = sft.train_step(micro_batch, ga_steps=1)
     
     assert metrics['loss'] == 1.0
     assert model_engine.backward.called

@@ -39,15 +39,59 @@ def test_sft_compute_loss_with_mask():
 def test_sft_normalize_loss():
     sft = SFT(MagicMock(), MagicMock(), normalize_loss=True)
     
-    # loss_sum = S, total_possible_tokens = B * (T-1)
     logits = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]]) # 2 tokens
     target_ids = torch.tensor([[0, 0]])
     loss_mask = torch.tensor([[1.0, 1.0]])
     
     loss, loss_sum, num_tokens = sft.compute_loss(logits, target_ids, loss_mask)
     
-    # tokens = 2. Loss = loss_sum / 2
+    # stats/eval path returns the raw masked sum. train_step applies GA-aware scaling.
+    assert np.isclose(loss.item(), loss_sum)
+
+def test_sft_normalize_loss_for_backward_matches_global_token_mean():
+    sft = SFT(MagicMock(), MagicMock(), normalize_loss=True, world_size=4)
+
+    logits = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    target_ids = torch.tensor([[0, 0]])
+    loss_mask = torch.tensor([[1.0, 1.0]])
+
+    loss, loss_sum, num_tokens = sft.compute_loss(
+        logits,
+        target_ids,
+        loss_mask,
+        ga_denom=16.0,
+        ga_steps=2,
+        for_backward=True,
+    )
+
     assert np.isclose(loss.item(), loss_sum / 2.0)
+
+def test_sft_sum_loss_for_backward_is_ga_invariant():
+    sft = SFT(MagicMock(), MagicMock(), normalize_loss=False, world_size=4)
+
+    logits = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    target_ids = torch.tensor([[0, 0]])
+    loss_mask = torch.tensor([[1.0, 1.0]])
+
+    loss, loss_sum, num_tokens = sft.compute_loss(
+        logits,
+        target_ids,
+        loss_mask,
+        ga_steps=2,
+        for_backward=True,
+    )
+
+    assert np.isclose(loss.item(), loss_sum * 8.0)
+
+def test_sft_normalize_loss_requires_positive_ga_denom_for_backward():
+    sft = SFT(MagicMock(), MagicMock(), normalize_loss=True, world_size=2)
+
+    logits = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    target_ids = torch.tensor([[0, 0]])
+    loss_mask = torch.tensor([[1.0, 1.0]])
+
+    with pytest.raises(ValueError, match="ga_denom"):
+        sft.compute_loss(logits, target_ids, loss_mask, ga_steps=2, for_backward=True)
 
 def test_sft_gradient_flow():
     sft = SFT(MagicMock(), MagicMock())

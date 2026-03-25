@@ -39,6 +39,7 @@ def test_ppo_init_and_engine():
             entropy_coeff=0.01,
             micro_batch_size_per_gpu=1,
             update_after_full_replay=True,
+            normalize_loss=False,
             deepspeed_config=deepspeed_config,
             gradient_checkpointing=False,
             seed=42,
@@ -71,8 +72,8 @@ def test_ppo_init_and_engine():
         # Mock forward/loss methods called inside train_step
         ppo.policy_forward = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 3)))
         ppo.value_forward = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1)))
-        ppo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_loss': 0.0, 'pi_loss': 1.0, 'loss_total': 1.0}))
-        ppo.compute_value_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), {'loss_v': 1.0}))
+        ppo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(1.0), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_loss': 0.0, 'pi_loss': 1.0, 'loss_total': 1.0}))
+        ppo.compute_value_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(1.0), {'loss_v': 1.0}))
         
         # Setup engine mocks
         ppo.policy_engine.device = torch.device('cpu')

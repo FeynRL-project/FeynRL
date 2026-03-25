@@ -1,16 +1,16 @@
 import torch
 import pytest
 from unittest.mock import MagicMock, patch
-from algs.SGRPO.sgrpo import SGRPO
+from algs.GRPO.grpo import GRPO
 
-def test_sgrpo_init_and_engine():
+def test_grpo_init_and_engine():
     # Mocking arguments
     model_path = "mock/model"
     deepspeed_config = MagicMock()
     deepspeed_config.model_dump.return_value = {}
     
     # We need to patch load_model to avoid HF calls
-    with patch.object(SGRPO, 'load_model') as mock_load:
+    with patch.object(GRPO, 'load_model') as mock_load:
         # Mocking values returned by load_model
         policy_model = MagicMock(spec=torch.nn.Module)
         policy_model.parameters.return_value = [torch.nn.Parameter(torch.randn(1), requires_grad=True)]
@@ -24,7 +24,7 @@ def test_sgrpo_init_and_engine():
         import deepspeed
         deepspeed.initialize.return_value = (MagicMock(), MagicMock(), None, None)
         
-        sgrpo = SGRPO(
+        grpo = GRPO(
             model_path=model_path,
             model_dtype=torch.float32,
             trust_remote_code=True,
@@ -35,13 +35,14 @@ def test_sgrpo_init_and_engine():
             entropy_coeff=0.01,
             micro_batch_size_per_gpu=1,
             update_after_full_replay=True,
+            normalize_loss=False,
             deepspeed_config=deepspeed_config,
             gradient_checkpointing=False,
             seed=42,
         )
         
-        assert sgrpo.ready is True
-        assert sgrpo.alg_name == "SGRPO"
+        assert grpo.ready is True
+        assert grpo.alg_name == "GRPO"
         assert deepspeed.initialize.call_count >= 1 # policy
         mock_load.assert_called_once()
 
@@ -57,14 +58,14 @@ def test_sgrpo_init_and_engine():
         ]
         
         # Mock forward/loss methods called inside train_step
-        sgrpo.policy_forward = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 3)))
-        sgrpo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_loss': 0.0, 'pi_loss': 1.0, 'loss_total': 1.0}))
+        grpo.policy_forward = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 3)))
+        grpo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(1.0), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_loss': 0.0, 'pi_loss': 1.0, 'loss_total': 1.0}))
         
         # Setup engine mocks
-        sgrpo.policy_engine.device = torch.device('cpu')
-        sgrpo.policy_engine.gradient_accumulation_steps = MagicMock(return_value=1)
+        grpo.policy_engine.device = torch.device('cpu')
+        grpo.policy_engine.gradient_accumulation_steps = MagicMock(return_value=1)
         
-        metrics = sgrpo.train_step(engine_id=0, micro_batches=micro_batches)
+        metrics = grpo.train_step(engine_id=0, micro_batches=micro_batches)
         
         assert 'pi_loss' in metrics
-        assert sgrpo.policy_engine.backward.called
+        assert grpo.policy_engine.backward.called

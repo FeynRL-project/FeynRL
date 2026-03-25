@@ -48,7 +48,7 @@ def test_sft_normalize_loss():
     # stats/eval path returns the raw masked sum. train_step applies GA-aware scaling.
     assert np.isclose(loss.item(), loss_sum)
 
-def test_sft_normalize_loss_for_backward_matches_global_token_mean():
+def test_sft_normalize_loss_is_training_matches_global_token_mean():
     sft = SFT(MagicMock(), MagicMock(), normalize_loss=True, world_size=4)
 
     logits = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
@@ -61,12 +61,12 @@ def test_sft_normalize_loss_for_backward_matches_global_token_mean():
         loss_mask,
         ga_denom=16.0,
         ga_steps=2,
-        for_backward=True,
+        is_training=True,
     )
 
     assert np.isclose(loss.item(), loss_sum / 2.0)
 
-def test_sft_sum_loss_for_backward_is_ga_invariant():
+def test_sft_sum_loss_is_training_is_ga_invariant():
     sft = SFT(MagicMock(), MagicMock(), normalize_loss=False, world_size=4)
 
     logits = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
@@ -78,12 +78,12 @@ def test_sft_sum_loss_for_backward_is_ga_invariant():
         target_ids,
         loss_mask,
         ga_steps=2,
-        for_backward=True,
+        is_training=True,
     )
 
     assert np.isclose(loss.item(), loss_sum * 8.0)
 
-def test_sft_normalize_loss_requires_positive_ga_denom_for_backward():
+def test_sft_normalize_loss_requires_positive_ga_denom_is_training():
     sft = SFT(MagicMock(), MagicMock(), normalize_loss=True, world_size=2)
 
     logits = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
@@ -91,7 +91,7 @@ def test_sft_normalize_loss_requires_positive_ga_denom_for_backward():
     loss_mask = torch.tensor([[1.0, 1.0]])
 
     with pytest.raises(ValueError, match="ga_denom"):
-        sft.compute_loss(logits, target_ids, loss_mask, ga_steps=2, for_backward=True)
+        sft.compute_loss(logits, target_ids, loss_mask, ga_steps=2, is_training=True)
 
 def test_sft_gradient_flow():
     sft = SFT(MagicMock(), MagicMock())

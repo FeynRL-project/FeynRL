@@ -3,10 +3,10 @@ import pytest
 import numpy as np
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from algs.SGRPO.sgrpo import SGRPO
+from algs.GRPO.grpo import GRPO
 
-def test_sgrpo_loss_clipped_objective():
-    sgrpo_logic = SGRPO
+def test_grpo_loss_clipped_objective():
+    grpo_logic = GRPO
     dummy_self = SimpleNamespace(
         clip_low=0.2, 
         clip_high=0.2, 
@@ -21,15 +21,15 @@ def test_sgrpo_loss_clipped_objective():
     advantages = torch.tensor([[1.0, 2.0]])
     mask = torch.tensor([[1.0, 1.0]])
     
-    loss, metrics = sgrpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
-    
+    loss, denom, metrics = grpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
+
     # Loss = - (1.0 * 1.0 + 1.0 * 2.0) / 2 = -1.5
     assert np.isclose(metrics['pi_loss'], -1.5)
     assert np.isclose(metrics['clipfrac'], 0.0)
     assert np.isclose(metrics['approx_kl'], 0.0)
 
-def test_sgrpo_loss_clipping():
-    sgrpo_logic = SGRPO
+def test_grpo_loss_clipping():
+    grpo_logic = GRPO
     dummy_self = SimpleNamespace(
         clip_low=0.2, 
         clip_high=0.2, 
@@ -43,8 +43,8 @@ def test_sgrpo_loss_clipping():
     advantages = torch.tensor([[1.0]])
     mask = torch.tensor([[1.0]])
     
-    loss, metrics = sgrpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
-    
+    loss, denom, metrics = grpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
+
     # Ratio = exp(10) >> 1.2
     # Clipped = 1.2 * 1.0 = 1.2
     # Unclipped = exp(10) * 1.0 = VERY LARGE
@@ -52,8 +52,8 @@ def test_sgrpo_loss_clipping():
     assert np.isclose(metrics['pi_loss'], -1.2)
     assert np.isclose(metrics['clipfrac'], 1.0)
 
-def test_sgrpo_loss_entropy():
-    sgrpo_logic = SGRPO
+def test_grpo_loss_entropy():
+    grpo_logic = GRPO
     dummy_self = SimpleNamespace(
         clip_low=0.2, 
         clip_high=0.2, 
@@ -68,15 +68,15 @@ def test_sgrpo_loss_entropy():
     mask = torch.tensor([[1.0]])
     entropies = torch.tensor([[0.7]])
     
-    loss, metrics = sgrpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, entropies, None)
+    loss, denom, metrics = grpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, entropies, None)
     
     # Loss_pi = 0 (adv = 0)
     # Loss_ent = 0.7
     # Loss_total = 0 - 0.1 * 0.7 = -0.07
     assert np.isclose(metrics['loss_total'], -0.07)
 
-def test_sgrpo_loss_gradient_flow():
-    sgrpo_logic = SGRPO
+def test_grpo_loss_gradient_flow():
+    grpo_logic = GRPO
     dummy_self = SimpleNamespace(
         clip_low=0.2, 
         clip_high=0.2, 
@@ -90,15 +90,15 @@ def test_sgrpo_loss_gradient_flow():
     advantages = torch.tensor([[1.0]])
     mask = torch.tensor([[1.0]])
     
-    loss, metrics = sgrpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
+    loss, denom, metrics = grpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
     loss.backward()
     
     assert logprobs.grad is not None
     assert not torch.isnan(logprobs.grad).any()
     assert logprobs.grad.item() != 0.0
 
-def test_sgrpo_loss_kl_ref():
-    sgrpo_logic = SGRPO
+def test_grpo_loss_kl_ref():
+    grpo_logic = GRPO
     dummy_self = SimpleNamespace(
         clip_low=0.2, 
         clip_high=0.2, 
@@ -115,10 +115,10 @@ def test_sgrpo_loss_kl_ref():
     mask = torch.tensor([[1.0, 1.0]])
     ref_logprobs = torch.tensor([[-0.1, -0.2]]) # Values don't matter as kl_dist is mocked
     
-    loss, metrics = sgrpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, ref_logprobs)
-    
+    loss, denom, metrics = grpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, ref_logprobs)
+
     # kl_ref = (0.2 + 0.4) / 2 = 0.3
-    # Loss = 0 (pi) + 0.5 * 0.3 (kl) = 0.15
+    # loss_total_sum (raw sum) = 0.5 * (0.2 + 0.4) = 0.3
     assert np.isclose(metrics['kl_ref'], 0.3)
-    assert np.isclose(loss.item(), 0.15)
+    assert np.isclose(loss.item(), 0.3)
     dummy_self.compute_kl_distance.assert_called_once()

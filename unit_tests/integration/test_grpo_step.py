@@ -4,10 +4,10 @@ import torch.optim as optim
 import pytest
 from unit_tests.models import TinyModel
 
-def test_sgrpo_integration_step():
+def test_grpo_integration_step():
     '''
-        Minimal integration test for a single SGRPO update step.
-        SGRPO uses z-score advantages (no value network) with a clipped policy gradient.
+        Minimal integration test for a single GRPO update step.
+        GRPO uses z-score advantages (no value network) with a clipped policy gradient.
         Verifies that gradients are computed, parameters are updated, and loss is finite.
     '''
     torch.manual_seed(42)
@@ -25,10 +25,10 @@ def test_sgrpo_integration_step():
     input_ids = torch.randint(0, vocab_size, (B, T))
     old_logprobs = torch.randn(B, T-1)
     mask = torch.ones(B, T-1)
-    # SGRPO uses z-score normalized rewards as advantages directly
+    # GRPO uses z-score normalized rewards as advantages directly
     zscores = torch.randn(B, T-1)
 
-    # 3. Policy update (SGRPO style: clipped ratio * advantages, no value net)
+    # 3. Policy update (GRPO style: clipped ratio * advantages, no value net)
     optimizer.zero_grad()
     p_output = policy_net(input_ids)
     logits = p_output.logits[:, :-1, :].contiguous()
@@ -40,7 +40,7 @@ def test_sgrpo_integration_step():
         reduction='none'
     ).reshape(B, T-1)
 
-    # Clipped loss (same formula as SGRPO.compute_policy_loss)
+    # Clipped loss (same formula as GRPO.compute_policy_loss)
     ratio = torch.exp(logprobs - old_logprobs)
     clip_eps = 0.2
     unclipped = ratio * zscores

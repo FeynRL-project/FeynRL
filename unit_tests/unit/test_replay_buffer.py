@@ -14,6 +14,7 @@ def test_replay_buffer_add_batch_seqs():
         "pred_masks": torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         "pred_dones": torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
         "pred_old_logprobs": torch.randn(10),
+        "policy_version": 0,
     }
     
     rb.add_batch_seqs([sample1])
@@ -70,7 +71,8 @@ def test_replay_buffer_max_seq_len_truncation():
         zscores=torch.randn(10),
         masks=torch.ones(10),
         dones=torch.zeros(10),
-        old_logprobs=torch.randn(10)
+        old_logprobs=torch.randn(10),
+        policy_version=0,
     )
     
     item = rb[0]

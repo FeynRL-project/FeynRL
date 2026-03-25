@@ -54,16 +54,17 @@ def test_compute_value_loss_correctness():
     returns = torch.tensor([[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]])
     mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
     
-    loss, metrics = ppo_logic.compute_value_loss(dummy_self, values, returns, mask)
-    
-    # 手算:
+    loss, v_denom, metrics = ppo_logic.compute_value_loss(dummy_self, values, returns, mask)
+
     # (values - returns)^2 = [[0.25, 0.25, 0.25], [0.25, 0.25, 0.25]]
     # mask * errors^2 = [[0.25, 0.25, 0.0], [0.25, 0.25, 0.25]]
     # Sum = 0.25 * 5 = 1.25
     # Denom = mask.sum() = 5
-    # Loss = 0.5 * 1.25 / 5 = 0.5 * 0.25 = 0.125
-    
-    assert np.isclose(loss.item(), 0.125)
+    # v_loss_sum (raw sum) = 0.5 * 1.25 = 0.625
+    # metrics['loss_v'] = v_loss_sum / v_denom = 0.625 / 5 = 0.125
+
+    assert np.isclose(loss.item(), 0.625)
+    assert np.isclose(v_denom.item(), 5.0)
     assert np.isclose(metrics['loss_v'], 0.125)
 
 def test_calculate_gae():

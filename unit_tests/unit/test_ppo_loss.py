@@ -25,7 +25,7 @@ def test_ppo_loss_clipped_objective():
     mask = torch.tensor([[1.0, 1.0]])
 
     # codebase logic
-    loss, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
+    loss, denom, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
 
     assert np.isclose(metrics['pi_loss'], 0.0, atol=1e-6)
     assert np.isclose(metrics['clipfrac'], 0.0)
@@ -46,7 +46,7 @@ def test_ppo_loss_clipping():
     advantages = torch.tensor([[1.0]])
     mask = torch.tensor([[1.0]])
     
-    loss, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
+    loss, denom, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
     
     # Single-token advantages normalize to zero variance case; loss should stay finite.
     assert np.isfinite(metrics['pi_loss'])
@@ -68,7 +68,7 @@ def test_ppo_loss_entropy():
     mask = torch.tensor([[1.0]])
     entropies = torch.tensor([[0.7]])
     
-    loss, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, entropies, None)
+    loss, denom, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, entropies, None)
     
     # Loss_pi = 0 (adv = 0)
     # Loss_ent = 0.7
@@ -90,7 +90,7 @@ def test_ppo_loss_gradient_flow():
     advantages = torch.tensor([[1.0]])
     mask = torch.tensor([[1.0]])
     
-    loss, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
+    loss, denom, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
     loss.backward()
     
     assert logprobs.grad is not None
@@ -115,10 +115,10 @@ def test_ppo_loss_kl_ref():
     mask = torch.tensor([[1.0, 1.0]])
     ref_logprobs = torch.tensor([[-0.1, -0.2]]) # Values don't matter as kl_dist is mocked
     
-    loss, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, ref_logprobs)
-    
+    loss, denom, metrics = ppo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, ref_logprobs)
+
     # kl_ref = (0.2 + 0.4) / 2 = 0.3
-    # Loss = 0 (pi) + 0.5 * 0.3 (kl) = 0.15
+    # loss_total_sum (raw sum) = 0.5 * (0.2 + 0.4) = 0.3
     assert np.isclose(metrics['kl_ref'], 0.3)
-    assert np.isclose(loss.item(), 0.15)
+    assert np.isclose(loss.item(), 0.3)
     dummy_self.compute_kl_distance.assert_called_once()

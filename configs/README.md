@@ -33,6 +33,18 @@ All `main_*.py` entry points accept the following arguments:
 | `tracking_uri` | URI for the tracking server | String (URL) - only for mlflow | `"http://mlflow:8080/"` |
 | `method` | Set automatically by entry point | `"rl"` \| `"sl"` \| `"cl"` \| `"eval"` | `"rl"` |
 | `checkpoint_dir` | Directory for saving checkpoints | Path string | `"./ckps"`, `"/data/ckps"` |
+| `checkpoint_save_interval` | Save checkpoint every N epochs; 0 = end only (default: `1`) | Integer ≥ 0 | `1`, `5`, `0` |
+
+#### NCCL / Multi-Node
+
+These settings apply to all experiment types (SL, CL, RL). Leave as `null` for single-node or when NCCL auto-detection works.
+
+| Parameter | Description | Type / Constraint | Examples |
+|:---|:---|:---|:---|
+| `nccl_socket_ifname` | Network interface for inter-node traffic. Run `ip addr` to find it. | String \| `null` | `"eth0"`, `"bond0"` |
+| `nccl_ib_hca` | InfiniBand HCA device(s) to use or exclude. Run `ibstat` to find it. | String \| `null` | `"mlx5_0"`, `"^mlx5_2,mlx5_3"` |
+
+If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 110 Connection timed out`), see the [Troubleshooting Guide — NCCL InfiniBand connection timeout](../docs/TROUBLESHOOTING.md#nccl-infiniband-connection-timeout) for diagnosis and fix steps.
 
 #### RL-Specific Run Settings
 
@@ -45,18 +57,9 @@ All `main_*.py` entry points accept the following arguments:
 | `overlap_enabled` | Enable async overlap of rollout and training |  `True`, `False` | `True` |
 | `overlap_max_lag` | Max policy versions rollout can lag behind | Integer ≥ 1 | `1`, `2`, `3` |
 | `weight_sync_method` | Weight sync method (default: `"direct"`) | `"direct"` \| `"disk"` | `"direct"` |
-| `checkpoint_save_interval` | Save checkpoint every N epochs; 0 = end only (default: `1`) | Integer ≥ 0 | `1`, `5`, `0` |
+| `nccl_sync_port` | Port for NCCL weight sync rendezvous (default: `ray_master_port + 100`) | Integer \| `null` | `29600` |
 
-#### NCCL / Multi-Node
-
-| Parameter | Description | Type / Constraint | Examples |
-|:---|:---|:---|:---|
-| `nccl_socket_ifname` | Network interface for inter-node traffic | String \| `null` | `"eth0"`, `"bond0"` |
-| `nccl_ib_hca` | InfiniBand HCA device(s) to use or exclude | String \| `null` | `"mlx5_0"`, `"^mlx5_2,mlx5_3"` |
-
-If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 110 Connection timed out`), see the [Troubleshooting Guide — NCCL InfiniBand connection timeout](../docs/TROUBLESHOOTING.md#nccl-infiniband-connection-timeout) for diagnosis and fix steps.
-
-#### Timeouts (seconds)
+#### RL Timeouts (seconds)
 
 | Parameter | Description | Type | Examples |
 |:---|:---|:---|:---|
@@ -95,7 +98,7 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 | `gradient_accumulation_steps` | Gradient accumulation steps | Integer ≥ 1 | `1`, `4` |
 | `val_batch_size_per_gpu` | Validation batch size per GPU | Integer ≥ 1 | `16` |
 | `dynamic_ratio_every_step` | Recalculate dataset mix ratios every step | Boolean | `False` |
-| `normalize_loss` | Normalize loss by token count | Boolean | `True` |
+| `normalize_loss` | `True`: global per-token mean. `False`: global sum. See [SFT README — Loss Normalization](../algs/SFT/README.md#loss-normalization). | Boolean | `True` |
 
 ### RL Policy Arguments
 

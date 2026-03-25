@@ -26,6 +26,7 @@ class PPO(COMMON):
                  entropy_coeff: float,
                  micro_batch_size_per_gpu: int,
                  update_after_full_replay: bool,
+                 normalize_loss: bool,
                  deepspeed_config: Any,
                  gradient_checkpointing: bool,
                  seed: int,
@@ -74,6 +75,7 @@ class PPO(COMMON):
         # if true, it means the update is done after seeing all samples in the reply buffer
         # treating the entire buffer as a single batch.
         self.update_only_after_full_replay = update_after_full_replay
+        self.normalize_loss = normalize_loss
 
         self.ready = False
         self.init_training_engine()
@@ -226,11 +228,15 @@ class PPO(COMMON):
             Compute policy loss:
                 1. ratio = exp(logprobs - old_logprobs)
                 2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
+            Returns:
+                loss_total_sum: scalar tensor — raw sum of masked losses (no normalization).
+                denom: float — local token count in this micro-batch.
+                metrics: dict — per-token mean metrics using local denom for interpretability.
         '''
         device = logprobs.device
         dtype = logprobs.dtype
-        loss_ent = torch.tensor(0.0, device=device, dtype=dtype)
-        kl_ref   = torch.tensor(0.0, device=device, dtype=dtype)
+        ent_sum = torch.tensor(0.0, device=device, dtype=dtype)
+        kl_sum  = torch.tensor(0.0, device=device, dtype=dtype)
 
         # 1. make sure advantages are detached and
         # convert to float32 for stability under bf16/fp16
@@ -247,24 +253,24 @@ class PPO(COMMON):
         logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
         ratio   = torch.exp(logratio)
 
-        # 3. compute loss: -(min(ratio * adv, clip_adv)) * mask
+        # 3. compute loss as raw sums (caller normalizes for backward)
         unclipped = ratio * adv
         clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
-        loss_pi   = -(torch.minimum(unclipped, clip_adv) * mask).sum() / denom
+        pi_sum    = -(torch.minimum(unclipped, clip_adv) * mask).sum()
 
-        # 4. compute entropy loss
+        # 4. compute entropy loss (raw sum)
         if entropies is not None and self.ent_coeff > 0.0:
-            loss_ent = (entropies * mask).sum() / denom
+            ent_sum = (entropies * mask).sum()
 
         if ref_logprobs is not None and self.kl_coeff > 0.0:
             kl_dist = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=ref_logprobs)
             # avoid calculating kl for padded tokens.
             kl_dist = torch.where(mask_bool, kl_dist, torch.zeros_like(kl_dist))
-            kl_ref  = (kl_dist * mask).sum() / denom
+            kl_sum  = (kl_dist * mask).sum()
 
-        loss_total = loss_pi - self.ent_coeff * loss_ent + self.kl_coeff * kl_ref
+        loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum
 
-        # 5. useful metrics
+        # 5. useful metrics. Here per-token means using local denom for interpretability.
         with torch.no_grad():
             # first term too large ==> policy changed too much upward
             # second term too small ==> policy changed too much downward
@@ -279,16 +285,14 @@ class PPO(COMMON):
             approx_kl = (approx_kl_t.to(dtype=dtype) * mask).sum() / denom
 
             # save the metrics for debugging
-            metrics = {
-                'clipfrac': clipfrac.item(),
-                'approx_kl': approx_kl.item(),
-                'ent_loss': loss_ent.item(),
-                'pi_loss': loss_pi.item(),
-                'loss_total': loss_total.item(),
-                'kl_ref': kl_ref.item(),
-            }
+            metrics = {'clipfrac': clipfrac.item(),
+                       'approx_kl': approx_kl.item(),
+                       'ent_loss': (ent_sum / denom).item(),
+                       'pi_loss': (pi_sum / denom).item(),
+                       'loss_total': (loss_total_sum / denom).item(),
+                       'kl_ref': (kl_sum / denom).item(),}
 
-        return loss_total, metrics
+        return loss_total_sum, denom, metrics
 
     def value_forward(self, input_ids, att_mask, pos_ids):
         '''
@@ -336,23 +340,25 @@ class PPO(COMMON):
         '''
             values/returns/mask: [B, T-1]
             Compute value loss: 0.5 * (values - returns)^2
+            Returns:
+                v_loss_sum: scalar tensor — raw sum of masked value losses (no normalization).
+                v_denom: float — local token count in this micro-batch.
+                metrics: dict — per-token mean metrics using local denom for interpretability.
         '''
         device = values.device
 
         # Compute value loss in float32 for numerical stability under bf16/fp16.
-        rets   = returns.detach().to(torch.float32)
-        v_loss = (values.to(torch.float32) - rets).pow(2)
-        mask   = (mask.to(device=device) > 0.5).to(dtype=torch.float32)
-        denom  = mask.sum().clamp(min=1.0)
+        rets     = returns.detach().to(torch.float32)
+        v_loss   = (values.to(torch.float32) - rets).pow(2)
+        mask     = (mask.to(device=device) > 0.5).to(dtype=torch.float32)
+        v_denom  = mask.sum().clamp(min=1.0)
 
-        loss = 0.5 * (v_loss * mask).sum() / denom
+        v_loss_sum = 0.5 * (v_loss * mask).sum()
 
-        # save the metrics for debugging
-        metrics = {
-            'loss_v': loss.item(),
-        }
+        # save the metrics for debugging (per-token mean)
+        metrics = {'loss_v': (v_loss_sum / v_denom).item(),}
 
-        return loss, metrics
+        return v_loss_sum, v_denom, metrics
 
     def calculate_gae(self, micro_batches):
         '''
@@ -487,6 +493,12 @@ class PPO(COMMON):
         # those losses up by ga_steps/remainder to get the correct mean gradient.
         ga_remainder = num_micro % ga_steps
 
+        # Compute global token count for global token normalization.
+        ga_denom = None
+        dp_scale = None
+        if self.normalize_loss:
+            ga_denom, dp_scale = self.compute_global_token_denom(micro_batches, ga_steps, device)
+
         # track metrics across all micro-batches
         all_metrics_policy = []
         all_metrics_value = []
@@ -529,26 +541,30 @@ class PPO(COMMON):
                                                 )
 
             # Compute policy loss using the current policy.
-            pi_loss, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
-                                                           old_logprobs=old_logprobs,
-                                                           advantages=advs,
-                                                           mask=mask,
-                                                           entropies=pi_entropies,
-                                                           ref_logprobs=ref_logprobs)
+            loss_total_sum, local_denom, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
+                                                                               old_logprobs=old_logprobs,
+                                                                               advantages=advs,
+                                                                               mask=mask,
+                                                                               entropies=pi_entropies,
+                                                                               ref_logprobs=ref_logprobs)
 
             # store metrics
             all_metrics_policy.append(pi_metrics)
-            # When accumulating over the full replay shard, normalize the loss
-            # by the number of micro-batches so the gradient magnitude equals the
-            # mean (not the sum) of per-micro-batch gradients. DeepSpeed will
-            # still divide by gradient_accumulation_steps, so we multiply by
-            # ga_pi to keep the effective scale consistent with standard GA.
-            if self.update_only_after_full_replay:
-                pi_loss = pi_loss * (ga_steps / num_micro)
+
+            # Scale loss for backward pass.
+            if self.normalize_loss:
+                # Global token normalization:
+                pi_loss = loss_total_sum * (dp_scale / ga_denom)
 
             else:
-                if ga_remainder != 0 and step >= (num_micro - ga_remainder):
-                    pi_loss = pi_loss * (ga_steps / ga_remainder)
+                # local per-micro-batch mean + manual GA scaling.
+                pi_loss = loss_total_sum / local_denom
+                if self.update_only_after_full_replay:
+                    pi_loss = pi_loss * (ga_steps / num_micro)
+
+                else:
+                    if ga_remainder != 0 and step >= (num_micro - ga_remainder):
+                        pi_loss = pi_loss * (ga_steps / ga_remainder)
 
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
@@ -563,26 +579,29 @@ class PPO(COMMON):
             values, _ = self.value_forward(input_ids=input_ids, att_mask=att_mask, pos_ids=pos_ids)
 
             # Compute value loss
-            v_loss, v_metrics = self.compute_value_loss(values=values, returns=returns, mask=mask)
+            v_loss_sum, v_denom, v_metrics = self.compute_value_loss(values=values, returns=returns, mask=mask)
 
             # store metrics
             all_metrics_value.append(v_metrics)
             if engine_id == 0:
-                progress_bar.set_postfix({
-                    "pi_loss": f"{pi_loss.item():.4f}",
-                    "clipfrac": f"{pi_metrics['clipfrac']:.3f}",
-                    "approx_kl": f"{pi_metrics['approx_kl']:.4f}",
-                    "kl_ref": f"{pi_metrics['kl_ref']:.4f}",
-                    "v_loss": f"{v_metrics['loss_v']:.4f}",
-                })
+                progress_bar.set_postfix({"pi_loss": f"{pi_metrics['pi_loss']:.4f}",
+                                          "clipfrac": f"{pi_metrics['clipfrac']:.3f}",
+                                          "approx_kl": f"{pi_metrics['approx_kl']:.4f}",
+                                          "kl_ref": f"{pi_metrics['kl_ref']:.4f}",
+                                          "v_loss": f"{v_metrics['loss_v']:.4f}",})
 
-            # Same loss scaling for value function
-            if self.update_only_after_full_replay:
-                v_loss = v_loss * (ga_steps / num_micro)
+            # Scale value loss for backward pass.
+            if self.normalize_loss:
+                v_loss = v_loss_sum * (dp_scale / ga_denom)
 
             else:
-                if ga_remainder != 0 and step >= (num_micro - ga_remainder):
-                    v_loss = v_loss * (ga_steps / ga_remainder)
+                v_loss = v_loss_sum / v_denom
+                if self.update_only_after_full_replay:
+                    v_loss = v_loss * (ga_steps / num_micro)
+
+                else:
+                    if ga_remainder != 0 and step >= (num_micro - ga_remainder):
+                        v_loss = v_loss * (ga_steps / ga_remainder)
 
             self.value_engine.set_gradient_accumulation_boundary(is_boundary)
 

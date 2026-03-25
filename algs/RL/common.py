@@ -117,6 +117,34 @@ class COMMON:
         kl_dist = log_ratio + ratio_inv - 1
         return kl_dist
 
+    def compute_global_token_denom(self, micro_batches, ga_steps, device):
+        '''
+            Compute global token count for global token normalization.
+            ga_denom = total valid tokens across ALL micro-batches on ALL ranks.
+            dp_scale = ga_steps * world_size cancels DeepSpeed's internal averaging
+            so each token contributes equally to the gradient. This is the exact same logic as what
+            we have in sft.py
+            micro_batches: list of micro-batch dicts with mask key, shape [B, T].
+            ga_steps: gradient accumulation steps from DeepSpeed config.
+            device: torch device.
+            Returns:
+                (ga_denom, dp_scale) where ga_denom is the global token count
+                and dp_scale is ga_steps * world_size.
+        '''
+        local_token_count = sum((mb['mask'][:, :-1] > 0.5).sum().item() for mb in micro_batches)
+        ga_denom_tensor   = torch.tensor(local_token_count, dtype=torch.float64, device=device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(ga_denom_tensor, op=torch.distributed.ReduceOp.SUM)
+
+        ga_denom = ga_denom_tensor.item()
+        if ga_denom <= 0:
+            raise RuntimeError(f"[Alg:{self.alg_name}] Invalid global token denominator: {ga_denom}")
+
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        dp_scale   = ga_steps * world_size
+
+        return ga_denom, dp_scale
+
     def load_single_model(self, model_path: str, dtype: torch.dtype, model_name: str):
         '''
             Helper to load a single model from HuggingFace.

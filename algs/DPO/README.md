@@ -10,7 +10,7 @@ This DPO variant computes the usual policy-vs-reference log-ratio, but instead o
 
 - **Log-probability computation**: Both policy and reference logprobs are computed via `CrossEntropyLoss(reduction="none")` in float32 (negated to get logprobs), avoiding bf16/fp16 quantization in the softmax.
 
-- **Length normalization**: Token log-ratios are summed per sequence and divided by the number of valid (unmasked) tokens `max(L, 1)` for each completion independently. This prevents longer completions from having disproportionately larger reward magnitudes.
+- **Length normalization**: Token log-ratios are summed per sequence and divided by the number of valid (unmasked) tokens `max(L, 1)` for each completion independently. This prevents longer completions from having disproportionately larger reward magnitudes. See [SimPO (Meng et al., 2024)](https://arxiv.org/abs/2405.14734) and [DPOP (Pal et al., 2024)](https://arxiv.org/abs/2305.18290) for discussion of length normalization in preference optimization.
 
 - **Tracked metrics**: Such as `loss` (DPO loss), `chosen_rewards` (mean length-normalized chosen reward), `rejected_rewards` (mean length-normalized rejected reward), `reward_accuracies` (fraction of examples where chosen reward > rejected reward), etc.
 
@@ -58,3 +58,13 @@ $$
 $$
 
 **Return:** $\theta_T$
+
+---
+
+## Loss Normalization and Gradient Accumulation
+
+Unlike SFT (see [SFT README — Loss Normalization](../SFT/README.md#loss-normalization)), DPO does **not** need the global token-count fix for gradient accumulation. The reason is structural:
+
+- **SFT** computes a per-token cross-entropy summed over variable-length sequences. When micro-batches have different numbers of valid tokens, a naive per-micro-batch mean produces "mean of means != global mean" — requiring a global token-count denominator computed across the entire gradient accumulation window and all GPUs.
+
+- **DPO** computes a per-example loss: each example's reward is already length-normalized (sum of token log-ratios / number of valid tokens), and the final loss is `.mean()` over the batch dimension (number of preference pairs). Since every micro-batch contributes equally many *examples* (not tokens), DeepSpeed's default gradient accumulation averaging (divide accumulated gradients by `ga_steps`) produces the correct global mean over examples. The `normalize_loss` parameter is accepted for interface consistency but is unused.

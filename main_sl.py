@@ -333,7 +333,6 @@ if __name__ == "__main__":
     if rank == 0:
         print("Starting training...")
 
-    total_number_of_train_samples = len(train_dataloader.dataset)
     micro_batches_per_epoch = config.train.micro_batches_per_epoch
     optimizer_steps_per_epoch = micro_batches_per_epoch // ga_steps
 
@@ -448,7 +447,7 @@ if __name__ == "__main__":
             ########
             # 11.2 Run train step for each micro-batch with correct global normalization.
             ########
-            window_loss_sum = 0.0
+            window_loss_sum = torch.tensor(0.0, device=model_engine.device)
             for mb in window_cpu:
                 micro_batch = {k: v.to(model_engine.device) for k, v in mb.items()}
                 metric      = alg.train_step(micro_batch, ga_denom=ga_denom, ga_steps=ga_steps)
@@ -461,12 +460,11 @@ if __name__ == "__main__":
             ########
             # 11.3 Logging at GA boundary and report the global per-token mean over the full GA window.
             ########
-            window_loss_sum_tensor = torch.tensor(window_loss_sum, device=model_engine.device)
             if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(window_loss_sum_tensor, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(window_loss_sum, op=torch.distributed.ReduceOp.SUM)
 
             if rank == 0:
-                per_token_loss = window_loss_sum_tensor.item() / ga_denom
+                per_token_loss = window_loss_sum.item() / ga_denom
                 progress_bar.set_postfix(loss=per_token_loss)
 
                 if tracker:
@@ -493,8 +491,8 @@ if __name__ == "__main__":
                     f"lr: {optimizer.param_groups[0]['lr']:.2e} | gpu_peak_mem: {gpu_mem_gb:.2f}GB")
 
         # Clear graph and to reclaim fragmented memory from training ONCE per epoch
-        torch.cuda.empty_cache()
         gc.collect()
+        torch.cuda.empty_cache()
 
         ########
         # 13. Validation loop
@@ -581,5 +579,4 @@ if __name__ == "__main__":
 
     # use os._exit to skip python atexit handlers that may trigger segv
     # during final garbage collection of remaining cuda/nccl objects.
-    print('Done!')
     os._exit(0)

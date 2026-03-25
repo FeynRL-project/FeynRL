@@ -280,7 +280,7 @@ class COMMON:
             print(f"[Alg:{self.alg_name}][Rank {rank}] Models loaded: policy={self.model_path}, value={self.value_model_path}, ref={self.ref_model_path}")
 
         else:
-            # SGRPO/CISPO has policy only
+            # GRPO/CISPO has policy only
             print(f"[Alg:{self.alg_name}][Rank {rank}] Model loaded: {self.model_path}")
 
         # Initialize policy engine

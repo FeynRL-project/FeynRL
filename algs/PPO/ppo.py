@@ -612,7 +612,7 @@ class PPO(COMMON):
         # aggregate metrics across all micro-batches into a single dict
         aggregated_metrics = {}
 
-        # Policy metrics use the same keys as SGRPO for compatibility with run_training_step
+        # Policy metrics use the same keys as GRPO for compatibility with run_training_step
         if all_metrics_policy:
             for key in all_metrics_policy[0].keys():
                 aggregated_metrics[key] = np.mean([m[key] for m in all_metrics_policy])

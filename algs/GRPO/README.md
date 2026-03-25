@@ -1,6 +1,6 @@
-### SGRPO (our implementation)
+### GRPO (our implementation)
 
-SGRPO is a PPO-style update trained from a replay buffer. During rollout, for each prompt we generate multiple completions and compute group-normalized advantages (e.g., z-scored rewards within the set of completions for the same prompt). These advantages, along with the corresponding old policy log-probabilities (`old_logprobs`) and a token mask (to exclude prompt/padding), are stored in the replay buffer.
+GRPO is a PPO-style update trained from a replay buffer. During rollout, for each prompt we generate multiple completions and compute group-normalized advantages (e.g., z-scored rewards within the set of completions for the same prompt). These advantages, along with the corresponding old policy log-probabilities (`old_logprobs`) and a token mask (to exclude prompt/padding), are stored in the replay buffer.
 
 At training time, we do **not** construct batches that keep all completions of the same prompt together. Instead, we **uniformly sample** from the replay buffer, so each (micro-)batch contains a mixture of tokens from many prompts and many generations. For each micro-batch we run a forward pass under the current policy to obtain token log-probabilities, form the PPO ratio, and apply the standard clipped surrogate objective using the stored advantages. Optionally, we add an entropy bonus and an optional KL-to-reference penalty implemented in a variance-reduced form.
 
@@ -10,7 +10,9 @@ We do this replay-style, uniform sampling for two practical reasons. First, it m
 
 Common GRPO implementations typically build each training step around prompt-groups: start from a batch of prompts, generate G completions per prompt, and compute normalization (advantages/scaling) within each group (across the G completions for the same prompt). Training batches therefore preserve group structure by construction.
 
-In contrast, our SGRPO uses uniform sampling from replay buffer, so training batches are not group-structured (even though the stored advantages are computed using per-prompt group normalization at rollout time). This changes the update statistics: instead of operating on a self-contained set of completions for a prompt, each update is driven by a mixture of replay samples across many prompts.
+In contrast, our GRPO uses uniform sampling from replay buffer, so training batches are not group-structured (even though the stored advantages are computed using per-prompt group normalization at rollout time). This changes the update statistics: instead of operating on a self-contained set of completions for a prompt, each update is driven by a mixture of replay samples across many prompts.
+
+Additionally, standard GRPO implementations typically use a per-micro-batch masked mean for loss normalization (`loss_sum / mask.sum()`). When micro-batches have different numbers of valid tokens, which is common with variable-length rollouts, this produces "mean of means != global mean", giving disproportionate gradient weight to micro-batches with fewer valid tokens. Our implementation supports global token normalization (`normalize_loss=True`): the global token count (total valid tokens across all micro-batches and all GPUs) is computed before the training loop and used as the loss denominator. This ensures every action token contributes equally to the gradient regardless of which micro-batch or rank it lands on. See [RL Common README — Global Token Normalization](../RL/README.md#global-token-normalization-for-rl) and [SFT README — Loss Normalization](../SFT/README.md#loss-normalization) for the full derivation.
 
 #### `update_only_after_full_replay=True`
 

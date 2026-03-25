@@ -53,7 +53,7 @@ train:
   ###############
   # optimizer related arguments
   ###############
-  alg_name: "sgrpo" # options: sgrpo, cispo, ppo
+  alg_name: "grpo" # options: grpo, cispo, ppo
 
   # The optimizer related arguments will be automatically copied to deepspeed config or others
   # distributed training frameworks. this way make it easier to handle them in one place and avoid any duplication.
@@ -100,7 +100,7 @@ train:
   # Note: train_batch_size_per_gpu is same as train_micro_batch_size_per_gpu in deepspeed.
   # batch size for sampling from the replay buffer during training.
   train_batch_size_per_gpu: 2
-  # The ga will be canceled out algebraically when update_after_full_replay is True in sgrpo/cispo/etc.
+  # The ga will be canceled out algebraically when update_after_full_replay is True in grpo/cispo/etc.
   gradient_accumulation_steps: 1
   val_batch_size_per_gpu: 16
 

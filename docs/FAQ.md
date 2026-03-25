@@ -29,9 +29,7 @@ That said, some improvements may have a modest impact on end-to-end performance 
 
 ## There are differences between your implementation of methods like GRPO. Why is that the case?
 
-That is correct. RL training is sensitive to small implementation details, and some choices that work well in classic RL settings (such as games) may need revisiting when applying RL to large models. As a result, FeynRL sometimes makes deliberate implementation choices to improve stability and performance, even if that means it does not match a specific reference implementation line for line.
-
-When the differences are intentional, we document them and name variants explicitly. For example, you may see SGRPO, which indicates a GRPO style method with stability focused implementation choices and some clear changes from the original work.
+That is correct. RL training is sensitive to small implementation details, and some choices that work well in settings like games may need revisiting when applying RL to large models. As a result, FeynRL sometimes makes deliberate implementation choices to improve stability and performance, even if that means it does not match a specific reference implementation line for line. When the differences are intentional, we document them explicitly.
 
 ## I found a bug. What should I do?
 

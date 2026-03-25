@@ -51,7 +51,7 @@ For a more detailed breakdown, see the **[Architecture Overview](docs/ARCHITECTU
 
 ### ✅ What’s Included
 
-- 🧪 **Training paradigms**: RL (PPO, SGRPO, CISPO), preference-based learning (DPO), and supervised fine-tuning (SFT)
+- 🧪 **Training paradigms**: RL (PPO, GRPO, CISPO, P3O), preference-based learning (DPO), and supervised fine-tuning (SFT)
 - 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
 - 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
 - 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes

@@ -10,7 +10,7 @@ The `value_forward` method returns `values [B, T-1]` (prediction-aligned, droppi
 
 #### Key implementation details
 
-- **Advantage normalization**: Unlike SGRPO/CISPO which use pre-computed z-scored rewards from the replay buffer, PPO normalizes advantages **inside `compute_policy_loss`** to have mean=0 and std=1 across valid (masked) positions within each micro-batch.
+- **Advantage normalization**: Unlike GRPO/CISPO which use pre-computed z-scored rewards from the replay buffer, PPO normalizes advantages **inside `compute_policy_loss`** to have mean=0 and std=1 across valid (masked) positions within each micro-batch.
 
 - **GAE precomputation**: `precompute_gae` runs the value model in `eval()` mode over all micro-batches before any updates begin, so the value estimates used for GAE are consistent (not affected by value model updates during the training step). The precomputed `(returns, advs)` are stored on CPU and moved back to GPU per micro-batch during the update loop.
 

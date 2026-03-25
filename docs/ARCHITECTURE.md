@@ -42,7 +42,7 @@ FeynRL supports two execution modes that control how rollout generation and trai
 
 ```text
 FeynRL/
-├── algs/               # Implementation of various algorithms such as PPO, SGRPO, CISPO, DPO, SFT
+├── algs/               # Implementation of various algorithms such as PPO, GRPO, CISPO, DPO, SFT
 ├── configs/            # YAML configuration files and Pydantic schema validation
 ├── data_feeds/         # Data loading, mixed-dataset sampling, and dataset construction
 ├── data_prep/          # Scripts for processing raw datasets

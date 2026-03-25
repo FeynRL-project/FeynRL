@@ -60,7 +60,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3 main_cl.py --config_file 
 
 RL runs are more involved because they use **Ray** to orchestrate DeepSpeed **training** and **rollout** engines.
 
-`main_rl.py` is the entry point for RL experiments (e.g., PPO, SGRPO, CISPO, etc.).
+`main_rl.py` is the entry point for RL experiments (e.g., PPO, GRPO, CISPO, etc.).
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4 python main_rl.py --config_file ./configs/rl_args.yaml --experiment_id exp3

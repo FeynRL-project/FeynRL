@@ -3,7 +3,7 @@
 All experiments are configured via YAML files validated by Pydantic schemas in `load.py`. Template configs are provided for each experiment type.
 
 ## Experiment Types
-1. **Reinforcement Learning (RL)**: `rl_args.yaml` — supports SGRPO, CISPO, PPO
+1. **Reinforcement Learning (RL)**: `rl_args.yaml` — supports GRPO, CISPO, PPO, P3O
 2. **Supervised Learning (SL)**: `sl_args.yaml` — Supervised Fine-Tuning (SFT)
 3. **Contrastive Learning (CL)**: `cl_args.yaml` — Direct Preference Optimization (DPO)
 4. **Evaluation**: `eval_args.yaml` — inference and scoring
@@ -90,7 +90,7 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
-| `alg_name` | Algorithm name | RL: `"sgrpo"` \| `"cispo"` \| `"ppo"`, SL: `"sft"`, CL: `"dpo"` | `"sgrpo"` |
+| `alg_name` | Algorithm name | RL: `"grpo"` \| `"cispo"` \| `"ppo"` \| `"p3o"`, SL: `"sft"`, CL: `"dpo"` | `"grpo"` |
 | `total_number_of_epochs` | Total training epochs | Integer ≥ 1 | `30`, `100` |
 | `train_steps_per_epoch` | RL: optimizer steps per epoch | Integer ≥ 1 | `5`, `10` |
 | `micro_batches_per_epoch` | SL/CL: micro-batch iterations per epoch | Integer ≥ 1 | `1000` |

@@ -581,5 +581,5 @@ if __name__ == "__main__":
 
     # use os._exit to skip python atexit handlers that may trigger segv
     # during final garbage collection of remaining cuda/nccl objects.
-    os._exit(0)
     print('Done!')
+    os._exit(0)

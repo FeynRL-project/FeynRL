@@ -210,11 +210,12 @@ def create_dataset_and_sampler(data_paths,
                                      drop_last=False)
 
     if rank == 0:
+        samples_per_epoch = steps_per_epoch * local_batch_size if steps_per_epoch is not None else len(concat_ds)
         print(f"[DataSampler] split={split}, "
               f"datasets={len_datasets}, "
               f"total={len(concat_ds)}, "
               f"bs={local_batch_size}, "
-              f"Number of samples per epoch={steps_per_epoch}, ")
+              f"samples_per_epoch={samples_per_epoch}")
 
     return concat_ds, sampler
 

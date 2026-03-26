@@ -18,6 +18,7 @@ import configs.load as cfg # all config arguments
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from data_feeds.mixed_sampler import create_prompt_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, ray_get_with_timeout, set_random_seeds, get_determinism_env_vars
+from misc.nccl_utils import NCCLBarrier
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.vllm_engine_async import VLLMRolloutEngineAsync
 from rollouts.replay_buffer import ReplayBuffer
@@ -153,6 +154,12 @@ def create_rollout_engines(params, reward_fnc, eos_id):
         # same prompt → same output regardless of engine count
         if params.rollout.batch_invariant:
             rollout_env_vars["VLLM_BATCH_INVARIANT"] = "1"
+
+        if params.run.nccl_socket_ifname:
+            rollout_env_vars["NCCL_SOCKET_IFNAME"] = params.run.nccl_socket_ifname
+        if params.run.nccl_ib_hca:
+            rollout_env_vars["NCCL_IB_HCA"] = params.run.nccl_ib_hca
+
         if params.overlap and params.overlap.enabled:
             engines.append(VLLMRolloutEngineAsync.options(num_gpus=tp,
                                                           runtime_env={"env_vars": rollout_env_vars}
@@ -552,66 +559,116 @@ def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_p
                                                                     rank=0,
                                                                     world_size=world_size,
                                                                     group_name=group_name,
-                                                                    timeout_seconds=init_timeout))
+                                                                    timeout_seconds=init_timeout,
+                                                                    backend="gloo"))
+
     # Each rollout engine gets rank_offset = 1 + engine_idx * tp_size,
     # and its TP workers compute their own ranks internally.
     for engine_idx, engine in enumerate(rollout_engines):
         rank_offset = 1 + engine_idx * tp_size
         futures.append(engine.init_nccl_group.remote(master_addr=master_addr,
                                                     master_port=nccl_port,
-                                                    rank=rank_offset,
+                                                    rank_offset=rank_offset,
                                                     world_size=world_size,
                                                     group_name=group_name,
-                                                    timeout_seconds=init_timeout))
+                                                    timeout_seconds=init_timeout,
+                                                    backend="gloo"))
     # no need to return results, just waiting for all to finish
     ray_get_with_timeout(refs=futures,
                         timeout=init_timeout,
                         description="NCCL weight sync group initialization at main",
                         logger=logger)
-    logger.info(f"[NCCL] Weight sync group initialized successfully")
+    logger.info(f"[WeightSync] Weight sync group initialized (world_size={world_size}, backend=gloo)")
+
     return world_size, group_name
 
 def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_timeout):
     '''
-        Broadcast weights from training engines (all engines should participate) to rollout engines via nccl.
-        Only rank 0 actually broadcasts over nccl though. This function schedules collective operations, on all training engines.
-        It must only be called when ALL training engines are idle, i.e. no train_step in progress.
-        Calling it concurrently with training would deadlock because zero-3 collectives require all ranks
-        to participate in the same operation at the same time.
+        Broadcast weights from training engines to rollout engines via NCCL.
+        It is done in three phases:
+          1. Gather: all training ranks participate in zero-3 collective gather.
+             Rank 0 returns param metadata to the driver; others return [].
+          2. Barrier + Broadcast: fire receive on all rollout engines, wait for
+             each to signal readiness via NCCLBarrier (from inside the method),
+             then fire training broadcast. This guarantees all participants are
+             in the NCCL collective before the sender enters.
+          3. Finalize: rollout engines load received weights into vLLM.
+        Must only be called when ALL training engines are idle.
     '''
     start_time = time.time()
     logger.info(f"[NCCL] Broadcasting weights v{version} to rollout engines...")
 
-    # Each engine returns a list of Ray ObjectRefs for rollout-side receives.
-    broadcast_futures = [engine.broadcast_weights_nccl.remote(rollout_engines) for engine in training_engines]
-    broadcast_results = ray_get_with_timeout(refs=broadcast_futures,
-                                            timeout=sync_timeout,
-                                            description=f"NCCL weight broadcast v{version}",
-                                            logger=logger)
+    # Phase 1: Gather state dict on all training ranks.
+    # Rank 0 stores the state dict and returns [(name, dtype_str, shape), ...].
+    gather_futures = [engine.gather_weights_for_nccl.remote() for engine in training_engines]
+    gather_results = ray_get_with_timeout(refs=gather_futures,
+                                          timeout=sync_timeout,
+                                          description=f"NCCL weight gather v{version}",
+                                          logger=logger)
 
-    # Rank 0 returns a list of rollout engine futures; other ranks return [].
-    # Wait for all rollout engines to finish receiving.
-    rollout_refs = []
-    for result in broadcast_results:
-        if isinstance(result, list):
-            rollout_refs.extend(result)
+    param_metadata = []
+    for result in gather_results:
+        if isinstance(result, list) and len(result) > 0:
+            param_metadata = result
+            break
 
-    if rollout_refs:
-        ray_get_with_timeout(refs=rollout_refs,
-                            timeout=sync_timeout,
-                            description=f"rollout engines receive weights v{version}",
-                            logger=logger)
+    if not param_metadata:
+        logger.warning("[NCCL] No parameters gathered; skipping broadcast")
+        return True
 
-    # Update loaded_version on all rollout engines so generate() version
-    # checks stay consistent, especially with force_strict_on_policy.
+    num_params = len(param_metadata)
+    num_engines = len(rollout_engines)
+
+    # Phase 2a: Create barrier and fire receive on all engines.
+    # Each engine signals the barrier from INSIDE receive_all_weights_nccl
+    # BEFORE entering the NCCL broadcast loop.
+    barrier = NCCLBarrier.remote(expected=num_engines)
+    logger.info(f"[Sync-NCCL] Dispatching receive ({num_params} params) to {num_engines} engines...")
+    rollout_refs = [eng.receive_all_weights_nccl.remote(param_metadata, barrier)
+                    for eng in rollout_engines]
+
+    # Phase 2b: Poll barrier until ALL engines have signaled ready.
+    # This replaces the unreliable time.sleep(5). Each engine signals from
+    # inside the method, so when count == num_engines, all engines are
+    # guaranteed to be about to enter (or already inside) the NCCL loop.
+    # Use sync_timeout (configurable) instead of a hardcoded value.
+    barrier_timeout = min(sync_timeout, 300)
+    barrier_deadline = time.time() + barrier_timeout
+    while time.time() < barrier_deadline:
+        count = ray.get(barrier.get_count.remote())
+        if count >= num_engines:
+            break
+        time.sleep(0.5)
+
+    else:
+        count = ray.get(barrier.get_count.remote())
+        if count < num_engines:
+            raise TimeoutError(f"[Sync-NCCL] Only {count}/{num_engines} engines signaled ready "
+                               f"within {barrier_timeout}s. Check engine logs for errors.")
+
+    logger.info(f"[Sync-NCCL] All {num_engines} engines confirmed ready via barrier, "
+                f"firing training broadcast...")
+
+    # Phase 2c: Fire training broadcast. All engines are now inside
+    # receive_all_weights_nccl and waiting on the first NCCL broadcast.
+    broadcast_ref = training_engines[0].nccl_broadcast_gathered.remote()
+
+    # Wait for all NCCL broadcasts to complete.
+    all_refs = rollout_refs + [broadcast_ref]
+    ray_get_with_timeout(refs=all_refs,
+                         timeout=sync_timeout,
+                         description=f"NCCL broadcast v{version}",
+                         logger=logger)
+
+    # Phase 3: Finalize — load received weights into vLLM model.
     finalize_refs = [eng.finalize_weight_nccl.remote(version) for eng in rollout_engines]
     ray_get_with_timeout(refs=finalize_refs,
-                        timeout=sync_timeout,
-                        description=f"finalize weight sync v{version}",
-                        logger=logger)
+                         timeout=sync_timeout,
+                         description=f"finalize weight sync v{version}",
+                         logger=logger)
 
     elapsed = time.time() - start_time
-    logger.info(f"[NCCL] Weight broadcast v{version} complete in {elapsed:.2f}s")
+    logger.info(f"[Sync-NCCL] Weight broadcast v{version} complete in {elapsed:.2f}s")
     return True
 
 @dataclass
@@ -864,7 +921,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                         training_done = True
                         ess_break     = True
 
-                    elif ess is None and fixed_sync_interval and \
+                    elif fixed_sync_interval and \
                          train_step_count % fixed_sync_interval == 0:
                         logger.info(f"[Epoch {epoch+1}][Step {train_step_count}] "
                                     f"Fixed interval sync, ending training early")
@@ -1007,7 +1064,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                 f"ESS={ess:.4f} < {ess_sync_threshold}, ending training early")
                     should_break = True
 
-                elif ess is None and fixed_sync_interval and \
+                elif fixed_sync_interval and \
                      train_step_count % fixed_sync_interval == 0:
                     should_break = True
 

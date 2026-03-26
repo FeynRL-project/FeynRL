@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="docs/feynrl.png" alt="FeynRL Logo" width="400">
+  <img src="docs/feynrl.png" alt="FeynRL Logo" width="300">
 </p>
-
-<h1 align="center">FeynRL</h1>
 
 <p align="center">
   Lightweight, modular, and scalable framework for post-training and fine-tuning large models.

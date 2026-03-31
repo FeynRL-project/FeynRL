@@ -64,73 +64,61 @@ class WeightSyncExtension:
                 return param.data.float().sum().item()
         return None
 
-    def init_weight_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend="gloo"):
+    def init_weight_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend):
         '''
-            Initialize a custom NCCL process group for direct gpu-to-gpu broadcast.
-            This group connects training rank 0 (rank=0) to all vllm TP workers
-            (rank=1..N). It is separate from DeepSpeed's and vllm's internal groups.
-            master_addr: IP for TCP rendezvous, from ray.util.get_node_ip_address().
-                         Must be reachable from all nodes in the cluster.
-            master_port: Free port for this group (NOT the deepspeed port).
-            rank_offset: Starting rank for this rollout engine in the sync group.
-                         Each TP worker computes its own rank as rank_offset + tp_rank.
-            world_size: 1 (training rank 0) + num_rollout_engines * tp_size.
-            group_name: Unique name to namespace the TCP store and avoid key collisions
-                        with deepspeed's and vllm's internal groups.
-            timeout_seconds: Timeout for NCCL rendezvous and operations, from config.run.init_timeout.
+            Initialize a process group for weight broadcast from training rank 0.
+            For gloo backend: we use create_nccl_process_group (torch.distributed internals).
+            For nccl backend: we use vllm's StatelessProcessGroup + PyNcclCommunicator.
+                This bypasses torch.distributed entirely and creates a raw nccl communicator
+                inside the EngineCore subprocess, avoiding conflicts with vllm's own cuda context.
+                The trainer side (rank 0) uses a standard torch.distributed ProcessGroupNCCL
+                created via init_extra_process_group. Both sides share the same underlying nccl
+                communicator bootstrapped via the same TCP store (same pattern as PipelineRL).
         '''
-        # Each TP worker determines its own rank within the sync group.
-        # vllm initializes torch.distributed for TP communication (ranks 0..tp-1).
-        # For TP=1, torch.distributed may not be initialized, so tp_rank defaults to 0.
         tp_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         my_rank = rank_offset + tp_rank
         self.weight_sync_rank = my_rank
         self.weight_sync_backend = backend
-        self.weight_sync_group = create_nccl_process_group(init_method=f"tcp://{master_addr}:{master_port}",
-                                                           rank=my_rank,
-                                                           world_size=world_size,
-                                                           group_name=group_name,
-                                                           timeout_seconds=timeout_seconds,
-                                                           backend=backend,
-                                                          )
+
+        if backend == "nccl":
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+            from vllm.distributed.utils import StatelessProcessGroup
+
+            pg = StatelessProcessGroup.create(
+                host=master_addr, port=master_port, rank=my_rank, world_size=world_size)
+            device = torch.device("cuda", torch.cuda.current_device())
+            self.weight_sync_pynccl = PyNcclCommunicator(pg, device=device)
+            self.weight_sync_group = None
+
+        else:
+            self.weight_sync_group = create_nccl_process_group(
+                init_method=f"tcp://{master_addr}:{master_port}",
+                rank=my_rank, world_size=world_size,
+                group_name=group_name, timeout_seconds=timeout_seconds,
+                backend=backend)
+            self.weight_sync_pynccl = None
+
         return True
 
     def update_weights_nccl(self, param_name, dtype_str, shape, empty_cache=False):
         '''
-            Receive a single weight tensor via NCCL broadcast from training rank 0
-            and load it into the model. In particular, training rank 0 calls
-            torch.distributed.broadcast as sender, and this worker calls it as
-            receiver. NCCL synchronizes automatically.
-            Args:
-                param_name: HF parameter name, e.g. model.layers.0.self_attn.q_proj.weight.
-                dtype_str: String dtype, e.g. "torch.bfloat16".
-                shape: Tuple of ints for the full (unsharded) parameter shape.
-                empty_cache: Whether to call torch.cuda.empty_cache() after loading.
-            Returns the number of weights loaded (0 or 1).
+            Receive a single weight tensor via broadcast from training rank 0
+            and load it into the model.
         '''
         dtype_map = {"torch.float16":  torch.float16,
                      "torch.bfloat16": torch.bfloat16,
                      "torch.float32":  torch.float32,}
         target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
 
-        # Allocate receive buffer. Use CPU for gloo (native), CUDA for nccl.
-        # Gloo handles CUDA tensors by staging through host memory, so using
-        # CPU directly avoids the redundant CUDA→CPU→gloo→CPU→CUDA round-trip.
-        backend = getattr(self, 'weight_sync_backend', 'gloo')
-        buf_device = "cuda" if backend == "nccl" else "cpu"
-        buffer = torch.empty(shape, dtype=target_dtype, device=buf_device)
+        if self.weight_sync_backend == "nccl":
+            buffer = torch.empty(shape, dtype=target_dtype, device="cuda")
+            self.weight_sync_pynccl.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
 
-        # Broadcast: rank 0 sends, all others receive
-        torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
+        else:
+            buffer = torch.empty(shape, dtype=target_dtype, device="cpu")
+            torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
 
-        # Load into model. vllm's load_weights handles tp sharding and
-        # device placement internally (CPU tensors are moved to GPU).
         self.model_runner.model.load_weights(weights=[(param_name, buffer)])
-
-        # Synchronize before deleting the buffer to ensure load_weights kernels
-        # have completed reading from it. Without this, the async CUDA kernels
-        # may still be reading the buffer when it is deallocated, causing
-        # use-after-free and silent weight corruption.
         torch.cuda.synchronize()
         del buffer
         if empty_cache:
@@ -138,15 +126,48 @@ class WeightSyncExtension:
 
         return 1
 
+    def receive_all_weights_nccl(self, param_metadata):
+        '''
+            Receive ALL weight tensors via broadcast in a single collective_rpc call.
+            For nccl: uses PyNcclCommunicator.broadcast.
+            For gloo: uses torch.distributed.broadcast.
+        '''
+        dtype_map = {"torch.float16":  torch.float16,
+                     "torch.bfloat16": torch.bfloat16,
+                     "torch.float32":  torch.float32,}
+
+        use_pynccl = (self.weight_sync_backend == "nccl")
+        num_loaded = 0
+
+        for name, dtype_str, shape in param_metadata:
+            target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
+
+            if use_pynccl:
+                buffer = torch.empty(tuple(shape), dtype=target_dtype, device="cuda")
+                self.weight_sync_pynccl.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
+
+            else:
+                buffer = torch.empty(tuple(shape), dtype=target_dtype, device="cpu")
+                torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
+
+            self.model_runner.model.load_weights(weights=[(name, buffer)])
+            torch.cuda.synchronize()
+            del buffer
+            num_loaded += 1
+
+        return num_loaded
+
     def close_weight_nccl_group(self):
         '''
-            Destroy the custom NCCL process group which is called during shutdown.
+            Destroy the weight sync group. Called during shutdown.
         '''
+        if hasattr(self, 'weight_sync_pynccl') and self.weight_sync_pynccl is not None:
+            del self.weight_sync_pynccl
+            self.weight_sync_pynccl = None
+
         if hasattr(self, 'weight_sync_group') and self.weight_sync_group is not None:
             try:
                 torch.distributed.destroy_process_group(self.weight_sync_group)
-
             except Exception:
                 pass
-
             self.weight_sync_group = None

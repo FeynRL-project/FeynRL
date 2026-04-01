@@ -773,6 +773,14 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                               f"Set overlap.fixed_sync_interval > 0 for mid-epoch weight sync, "
                               f"otherwise sync only happens at end-of-epoch boundaries as it does not compute ess_factor")
 
+                steps_per_epoch = config.train.train_steps_per_epoch
+                if fixed_interval is not None and fixed_interval > 0 and fixed_interval < steps_per_epoch:
+                    if rank == 0:
+                        print(f"[Config] WARNING: overlap.fixed_sync_interval={fixed_interval} < "
+                              f"train.train_steps_per_epoch={steps_per_epoch}. Training will be truncated to "
+                              f"{fixed_interval} step(s) per epoch before sync triggers. "
+                              f"Set fixed_sync_interval >= train_steps_per_epoch to use all training steps.")
+
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:
             try:

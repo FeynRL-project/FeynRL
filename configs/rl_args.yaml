@@ -49,7 +49,10 @@ overlap:
   # lower threshold means more acceptance of offpolicyiness.
   ess_sync_threshold: 0.5
   # Static sync interval in training steps for non-P3O algorithms regardless of off-policness of data.
-  fixed_sync_interval: 1
+  # Set to null for P3O (ESS drives sync). For GRPO/CISPO, set >= steps_per_epoch
+  # to sync once per epoch, or null to only sync at epoch boundaries via max_lag.
+  # Note setting to 1 forces sync after every step, effectively limiting training to 1 step.
+  fixed_sync_interval: null
 
 train:
   ###############

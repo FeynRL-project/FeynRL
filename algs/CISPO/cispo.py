@@ -255,12 +255,16 @@ class CISPO(COMMON):
                                                                         att_mask=att_mask,
                                                                         pos_ids=pos_ids)
 
+            # Sanitize logprobs before loss computation to prevent NaN into loss
+            pi_logprobs = self.sanitize_logprobs(pi_logprobs, engine_id, step, num_micro)
+
             ref_logprobs = None
             if self.kl_coeff > 0.0 and self.ref_model_engine is not None:
                 ref_logprobs = self.ref_forward(input_ids=input_ids,
                                                 att_mask=att_mask,
                                                 pos_ids=pos_ids,
                                                 )
+                ref_logprobs = self.sanitize_logprobs(ref_logprobs, engine_id, step, num_micro)
 
             # Compute policy loss using the current policy.
             loss_total_sum, local_denom, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
@@ -293,7 +297,6 @@ class CISPO(COMMON):
                     if ga_remainder != 0 and step >= (num_micro - ga_remainder):
                         pi_loss = pi_loss * (ga_pi / ga_remainder)
 
-            pi_loss = self.sanitize_loss(pi_loss, engine_id, step, num_micro)
 
             # For DeepSpeed, we must coordinate is_boundary with the backward pass.
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)

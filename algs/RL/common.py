@@ -117,25 +117,17 @@ class COMMON:
         kl_dist = log_ratio + ratio_inv - 1
         return kl_dist
 
-    def sanitize_loss(self, loss, engine_id, step, num_micro):
+    def sanitize_logprobs(self, logprobs, engine_id, step, num_micro):
         '''
-            Replace NaN/Inf loss with zero to keep all ranks in sync.
-            ZeRO-3 requires every rank to participate in every collective
-            (forward gather, backward reduce-scatter). If one rank skips
-            backward() due to NaN while others proceed, the collectives
-            desynchronize and all ranks deadlock at the next NCCL operation.
-            Zeroing the loss ensures backward() runs and produces zero gradients —
-            the micro-batch simply contributes nothing to the update.
+            Prevent NaN from entering into loss
         '''
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"[Alg:{self.alg_name}][Engine {engine_id}] WARNING: NaN/Inf loss at "
-                  f"micro-batch {step}/{num_micro}, zeroing to prevent collective deadlock",
+        has_nan = torch.isnan(logprobs).any() or torch.isinf(logprobs).any()
+        if has_nan:
+            print(f"[Alg:{self.alg_name}][Engine {engine_id}] WARNING: NaN/Inf in logprobs at "
+                  f"micro-batch {step}/{num_micro}, replacing with zeros",
                   flush=True)
-            # it preserves original computation graph (grad_fn intact),
-            # and backward() will propagate zeros through the NaN-producing ops.
-            loss.data.fill_(0.0)
-            return loss
-        return loss
+            logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
+        return logprobs
 
     def compute_global_token_denom(self, micro_batches, ga_steps, device):
         '''

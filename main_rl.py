@@ -699,25 +699,6 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
     logger.info(f"[sync_weights_nccl] Broadcast complete in {elapsed:.2f}s, finalize dispatched ({mode})")
     return True, finalize_refs
 
-# Background thread executor for non-blocking weight sync.
-# Single thread ensures syncs are serialized, no two syncs racing.
-sync_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="weight_sync")
-
-def sync_weights_nccl_async(training_engines, rollout_engines, version, logger, sync_timeout):
-    '''
-        Non-blocking wrapper: submits sync_weights_nccl (without barrier) to a background
-        thread so the driver can dispatch generation concurrently. Returns a Future whose
-        result is (success, finalize_refs).
-    '''
-    future = sync_executor.submit(sync_weights_nccl,
-                                  training_engines,
-                                  rollout_engines,
-                                  version,
-                                  logger,
-                                  sync_timeout,
-                                  use_barrier=False)
-    return future
-
 @dataclass
 class ChunkFuture:
     '''
@@ -1066,14 +1047,14 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                 f"Sync triggered (ESS={ess}), ending training early "
                                 f"({steps_per_epoch - train_step_count} steps skipped)")
 
-                if tracker and ess is not None:
-                    tracker.log_metrics({"nccl/ess_factor": ess,
-                                         "nccl/sync_triggered": 1 if sync_triggered_this_epoch else 0,
-                                        }, step=global_step)
-
                 if should_stop:
                     training_done = True
                     ess_break     = True
+
+                if tracker and ess is not None:
+                    tracker.log_metrics({"nccl/ess_factor": ess,
+                                         "nccl/sync_triggered": 1 if (sync_triggered_this_epoch or should_stop) else 0,
+                                        }, step=global_step)
 
                 if train_step_count >= steps_per_epoch:
                     training_done = True
@@ -1159,15 +1140,17 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                                       ess_sync_threshold,
                                                       fixed_sync_interval,
                                                       sync_triggered_this_epoch)
-                    if tracker and ess is not None:
-                        tracker.log_metrics({"nccl/ess_factor": ess,
-                                             "nccl/sync_triggered": 1 if sync_triggered_this_epoch else 0,
-                                            }, step=global_step)
-
                     if should_stop:
                         logger.info(f"[Epoch {epoch+1}][Drain Step {drain_steps_taken}] "
                                     f"Sync triggered (ESS={ess}), ending drain training")
                         ess_break = True
+
+                    if tracker and ess is not None:
+                        tracker.log_metrics({"nccl/ess_factor": ess,
+                                             "nccl/sync_triggered": 1 if (sync_triggered_this_epoch or should_stop) else 0,
+                                            }, step=global_step)
+
+                    if should_stop:
                         break
 
                     # Mid-drain chunk cycling: finalize ready chunks and dispatch next
@@ -1403,14 +1386,11 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
     if train_step_count > 0 and not version_bumped_early:
         policy_version += 1
 
-    if max_lag > 0:
-        evicted = replay_buffer.evict_stale(policy_version - max_lag)
-        if evicted > 0:
-            logger.info(f"[Epoch {epoch+1}] Post-training eviction: {evicted} stale samples removed, "
-                        f"{len(replay_buffer)} retained for next epoch")
-    else:
-        # the replay buffer can only data from one policy. this would be strict-on-policy.
-        replay_buffer.reset()
+    # max_lag >= 1 is enforced by config validation for overlap mode.
+    evicted = replay_buffer.evict_stale(policy_version - max_lag)
+    if evicted > 0:
+        logger.info(f"[Epoch {epoch+1}] Post-training eviction: {evicted} stale samples removed, "
+                    f"{len(replay_buffer)} retained for next epoch")
 
     # 6. Aggregate rollout stats
     generation_time = time.time() - generation_start_time
@@ -1804,21 +1784,24 @@ if __name__ == "__main__":
                     logger.info(f"[Epoch {epoch+1}] End-of-epoch NCCL sync "
                                 f"(v{rollout_policy_version} -> v{policy_version})...")
                     try:
-                        # Fire async sync runs in background thread so we can
-                        # dispatch generation with OLD weights concurrently.
-                        sync_future = sync_weights_nccl_async(training_engines=training_engines,
-                                                              rollout_engines=rollout_engines,
-                                                              version=policy_version,
-                                                              logger=logger,
-                                                              sync_timeout=sync_timeout)
+                        # Concurrent generation during an NCCL sync deadlocks the GPUs:
+                        # training engines wait inside the broadcast while rollout engines generate for minutes.
+                        # Thus, we execute NCCL synchronously across all engines before dispatching.
+                        _, nccl_finalize_refs = sync_weights_nccl(training_engines=training_engines,
+                                                                  rollout_engines=rollout_engines,
+                                                                  version=policy_version,
+                                                                  logger=logger,
+                                                                  sync_timeout=sync_timeout)
 
-                        # Dispatch next epoch's first chunk with OLD weights while sync runs.
-                        # The generate.remote() queues in each engine's Ray mailbox. If sync's
-                        # receive_all_weights_nccl.remote() arrives first, generate waits (gets new weights).
-                        # If generate arrives first, sync waits (generate uses old weights).
-                        # Either way, no corruption — just version staleness on the overlapped chunk.
-                        # Skip when max_lag=0 (strict on-policy): the next epoch resets the buffer
-                        # and any stale chunk would poison the clean buffer with off-policy data.
+                        ray_get_with_timeout(refs=nccl_finalize_refs,
+                                             timeout=sync_timeout,
+                                             description=f"finalize weight sync v{policy_version}",
+                                             logger=logger)
+
+                        rollout_policy_version = policy_version
+                        sync_success = True
+
+                        # Dispatch NEXT epoch chunk with *updated* weights now that sync is clean.
                         if overlap_enabled and not is_last_epoch and overlap_max_lag > 0:
                             rollout_dataloader.batch_sampler.set_epoch(epoch + 1)
                             early_iter = iter(rollout_dataloader)
@@ -1830,13 +1813,7 @@ if __name__ == "__main__":
                                                                       chunk_idx=0,
                                                                       logger=logger)
                             if pre_dispatched_chunk is not None:
-                                logger.info(f"[Epoch {epoch+1}] Early dispatch: next epoch's first chunk "
-                                            f"generating concurrently with weight sync")
-
-                        # Now wait for sync to complete.
-                        _, nccl_finalize_refs = sync_future.result(timeout=sync_timeout)
-                        rollout_policy_version = policy_version
-                        sync_success = True
+                                logger.info(f"[Epoch {epoch+1}] Early dispatch: next epoch's first chunk started")
 
                     except Exception as e:
                         nccl_finalize_refs = None

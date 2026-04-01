@@ -10,7 +10,40 @@ The `value_forward` method returns `values [B, T-1]` (prediction-aligned, droppi
 
 #### Key implementation details
 
-- **Advantage normalization**: Unlike GRPO/CISPO which use pre-computed z-scored rewards from the replay buffer, PPO normalizes advantages **inside `compute_policy_loss`** to have mean=0 and std=1 across valid (masked) positions within each micro-batch.
+- **Advantage normalization**: Unlike GRPO/CISPO which use pre-computed z-scored rewards from the replay buffer, PPO normalizes advantages **inside `calculate_gae`** to have mean=0 and std=1 across all valid (masked) positions globally across all ranks (see point 3 under GAE below).
+
+- **GAE**: Unlike GRPO/CISPO, which use group-normalized rewards directly as advantages and do not learn a value function, PPO computes advantages via **Generalized Advantage Estimation (GAE)** using a learned value function. For each valid position \(t\), the backward pass computes
+
+$$
+\delta_t = r_t + \gamma \, V_\phi(s_{t+1}) \, (1 - d_t) - V_\phi(s_t)
+$$
+
+$$
+A_t = \delta_t + \gamma \, \lambda \, A_{t+1} \, (1 - d_t)
+$$
+
+where \(d_t\) indicates a **true terminal transition** for bootstrapping purposes, and \(\lambda\) is the GAE parameter. Returns are then computed as
+
+$$
+R_t = A_t + V_\phi(s_t).
+$$
+
+In practice, implementations often append a `last_value` and run the GAE recursion backward from the end of the sequence. The key detail is how this final bootstrap is handled. If the rollout ends because of a **true terminal state**, the correct bootstrap value is zero. If the rollout ends because of **truncation**, such as a max-length cutoff or epoch boundary, the correct bootstrap is the critic prediction at the next state, \(V_\phi(s_T)\), not zero.
+
+This distinction matters. If a truncated rollout is incorrectly treated as terminal, the TD residual at the last valid step becomes
+
+$$
+\delta_{T-1} = r_{T-1} - V_\phi(s_{T-1}),
+$$
+
+instead of
+
+$$
+\delta_{T-1} = r_{T-1} + \gamma \, V_\phi(s_T) - V_\phi(s_{T-1}).
+$$
+
+That effectively assumes there is no future value beyond the cutoff, which introduces a downward bias at the end of the sequence. This bias then propagates backward through the GAE recursion and systematically underestimates advantages near the end of truncated rollouts.
+
 
 - **GAE precomputation**: `precompute_gae` runs the value model in `eval()` mode over all micro-batches before any updates begin, so the value estimates used for GAE are consistent (not affected by value model updates during the training step). The precomputed `(returns, advs)` are stored on CPU and moved back to GPU per micro-batch during the update loop.
 

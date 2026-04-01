@@ -183,6 +183,23 @@ def ray_get_with_timeout(refs, timeout, description, logger):
             current_timeout = min(poll_interval, deadline - now)
             ready, unready = ray.wait(unready, num_returns=len(unready), timeout=current_timeout)
 
+            # Check if any completed refs have errors — a failed engine stops
+            # participating in ZeRO-3 collectives, causing the remaining engines
+            # to hang forever at the next all-gather/reduce-scatter.
+            for ref in ready:
+                try:
+                    ray.get(ref, timeout=0)
+                except RayTaskError as e:
+                    logger.error(f"[EarlyFailure] {description}: one task failed, "
+                                 f"remaining {len(unready)} tasks will likely deadlock. Error: {e}")
+                    raise RuntimeError(f"{description} failed: {e}") from e
+                except RayActorError as e:
+                    logger.error(f"[EarlyFailure] {description}: actor died, "
+                                 f"remaining {len(unready)} tasks will likely deadlock. Error: {e}")
+                    raise RuntimeError(f"{description} failed: actor died: {e}") from e
+                except GetTimeoutError:
+                    pass  # ref is ready but ray.get(timeout=0) can race, so ignore
+
             if unready:
                 elapsed = int(time.time() - start_time)
                 total = len(wait_refs)

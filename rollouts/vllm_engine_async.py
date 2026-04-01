@@ -394,10 +394,12 @@ class VLLMRolloutEngineAsync:
                 if not isinstance(prompts, list) or len(prompts) == 0:
                     raise TypeError(f"prompts must be a non-empty list, got {type(prompts)}")
 
-                if self.force_strict_on_policy and int(policy_version) != int(self.loaded_version):
+                # Allow loaded_version to be ahead by 1 as non-blocking sync may update
+                # weights between dispatch and generate execution via Ray mailbox ordering.
+                if self.force_strict_on_policy and abs(int(policy_version) - int(self.loaded_version)) > 1:
                     raise ValueError(
                                      f"Off-policy rollout: policy_version={int(policy_version)} "
-                                     f"but loaded_version={int(self.loaded_version)}. ")
+                                     f"but loaded_version={int(self.loaded_version)} (lag > 1). ")
 
                 assert self.async_engine is not None, f"{self.model_path} not loaded."
                 # Rotate seed each epoch so sampling RNG varies across iterations.

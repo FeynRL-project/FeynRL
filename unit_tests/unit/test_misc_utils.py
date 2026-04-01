@@ -1,5 +1,4 @@
 import os
-import logging
 import torch
 import pytest
 from unittest.mock import MagicMock, patch
@@ -29,7 +28,9 @@ def test_set_random_seeds():
     assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
 
 def test_set_random_seeds_with_rank():
-    '''Verify that rank offset is applied to the seed.'''
+    '''
+        Verify that rank offset is applied to the seed.
+    '''
     os.environ.pop("PYTHONHASHSEED", None)
 
     set_random_seeds(seed=100, rank=3)
@@ -108,13 +109,17 @@ def test_load_algorithm_unknown():
         load_algorithm("nonexistent", registry)
 
 def test_ray_get_with_timeout_success():
-    import ray
-    ray.get = MagicMock(return_value="result")
-    logger = logging.getLogger("test")
-
-    result = ray_get_with_timeout(refs="ref", timeout=10, description="test_op", logger=logger)
-    assert result == "result"
-    ray.get.assert_called_once_with("ref", timeout=10)
+    '''
+        ray_get_with_timeout returns results when all refs complete.
+    '''
+    logger = MagicMock()
+    ref = MagicMock()
+    with patch('misc.utils.ray') as mock_ray:
+        # ray.wait returns all refs as ready immediately
+        mock_ray.wait.return_value = ([ref], [])
+        mock_ray.get.return_value = "result"
+        result = ray_get_with_timeout(refs=ref, timeout=10, description="test_op", logger=logger)
+        assert result == "result"
 
 # The global ray mock in conftest makes ray.exceptions.* into MagicMocks,
 # not real BaseException subclasses. We need real exception classes so that
@@ -130,7 +135,9 @@ class _TaskError(Exception):
     pass
 
 def _patch_ray_exceptions():
-    """Patch all ray exception names in misc.utils with real BaseException subclasses."""
+    '''
+        Patch all ray exception names in misc.utils with real BaseException subclasses.
+    '''
     return (
         patch('misc.utils.GetTimeoutError', _TimeoutError),
         patch('misc.utils.RayActorError', _ActorError),
@@ -138,17 +145,28 @@ def _patch_ray_exceptions():
     )
 
 def test_ray_get_with_timeout_timeout_error():
+    '''
+        ray_get_with_timeout raises RuntimeError when ray.wait never completes.
+    '''
     logger = MagicMock()
+    ref = MagicMock()
     p1, p2, p3 = _patch_ray_exceptions()
     with patch('misc.utils.ray') as mock_ray, p1, p2, p3:
-        mock_ray.get.side_effect = _TimeoutError("timeout")
+        # ray.wait always returns nothing ready (simulates timeout)
+        mock_ray.wait.return_value = ([], [ref])
         with pytest.raises(RuntimeError, match="timed out"):
-            ray_get_with_timeout(refs="ref", timeout=5, description="slow_op", logger=logger)
+            ray_get_with_timeout(refs=ref, timeout=0.01, description="slow_op", logger=logger)
 
 def test_ray_get_with_timeout_actor_error():
+    '''
+        ray_get_with_timeout raises RuntimeError when an actor dies mid-execution.
+    '''
     logger = MagicMock()
+    ref = MagicMock()
     p1, p2, p3 = _patch_ray_exceptions()
     with patch('misc.utils.ray') as mock_ray, p1, p2, p3:
-        mock_ray.get.side_effect = _ActorError()
+        # ray.wait reports ref as ready, but ray.get raises actor error (EarlyFailure path)
+        mock_ray.wait.return_value = ([ref], [MagicMock()])
+        mock_ray.get.side_effect = _ActorError("actor crashed")
         with pytest.raises(RuntimeError, match="actor died"):
-            ray_get_with_timeout(refs="ref", timeout=5, description="dead_op", logger=logger)
+            ray_get_with_timeout(refs=ref, timeout=10, description="dead_op", logger=logger)

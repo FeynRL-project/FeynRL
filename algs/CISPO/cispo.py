@@ -256,7 +256,8 @@ class CISPO(COMMON):
                                                                         pos_ids=pos_ids)
 
             # Sanitize logprobs before loss computation to prevent NaN into loss
-            pi_logprobs = self.sanitize_logprobs(pi_logprobs, engine_id, step, num_micro)
+            pi_logprobs, pi_nan = self.sanitize_logprobs(pi_logprobs, engine_id, step, num_micro)
+            mask = mask * (~pi_nan).to(mask.dtype)
 
             ref_logprobs = None
             if self.kl_coeff > 0.0 and self.ref_model_engine is not None:
@@ -264,7 +265,8 @@ class CISPO(COMMON):
                                                 att_mask=att_mask,
                                                 pos_ids=pos_ids,
                                                 )
-                ref_logprobs = self.sanitize_logprobs(ref_logprobs, engine_id, step, num_micro)
+                ref_logprobs, ref_nan = self.sanitize_logprobs(ref_logprobs, engine_id, step, num_micro)
+                mask = mask * (~ref_nan).to(mask.dtype)
 
             # Compute policy loss using the current policy.
             loss_total_sum, local_denom, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,

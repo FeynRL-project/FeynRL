@@ -119,15 +119,19 @@ class COMMON:
 
     def sanitize_logprobs(self, logprobs, engine_id, step, num_micro):
         '''
-            Prevent NaN from entering into loss
+            Prevent NaN from entering into loss.
+            Returns (logprobs, nan_mask) where nan_mask is True at positions
+            that had NaN/Inf.
         '''
-        has_nan = torch.isnan(logprobs).any() or torch.isinf(logprobs).any()
-        if has_nan:
+        nan_mask = torch.isnan(logprobs) | torch.isinf(logprobs)
+        if nan_mask.any():
             print(f"[Alg:{self.alg_name}][Engine {engine_id}] WARNING: NaN/Inf in logprobs at "
-                  f"micro-batch {step}/{num_micro}, replacing with zeros",
+                  f"micro-batch {step}/{num_micro}, masking {nan_mask.sum().item()} tokens out of loss",
                   flush=True)
-            logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
-        return logprobs
+            # sentinel: logprobs are always <= 0
+            logprobs = logprobs.masked_fill(nan_mask, 1.0)
+
+        return logprobs, nan_mask
 
     def compute_global_token_denom(self, micro_batches, ga_steps, device):
         '''

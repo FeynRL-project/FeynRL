@@ -101,7 +101,7 @@ class P3O(COMMON):
         valid_ratios = ratio[mask_bool]
         n = valid_ratios.numel()
         if n == 0:
-            return torch.tensor(1.0, device=ratio.device)
+            return 1.0
 
         ess = (valid_ratios.sum()**2) / (valid_ratios.pow(2).sum() + 1e-8) / n
         return ess.item()

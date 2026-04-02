@@ -15,6 +15,20 @@ import time
 # internal and local import
 from misc.nccl_utils import create_nccl_process_group
 
+@torch.compile(dynamic=True)
+def compiled_log_softmax_and_gather(logits_f32: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
+    '''
+        Fused log_softmax + gather via torch.compile.
+        Avoids materializing the full [B, T, V] logprobs tensor in memory.
+        See: https://github.com/allenai/open-instruct/pull/584
+
+        logits_f32: [B*T, V] in float32
+        target_ids: [B*T]
+        Returns: [B*T] per-token logprobs (negative of nll)
+    '''
+    logprobs = logits_f32.log_softmax(dim=-1)
+    return torch.gather(logprobs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+
 class COMMON:
     '''
         This class provides common functions for policy gradient algorithms.
@@ -46,15 +60,19 @@ class COMMON:
         # [B, T] -> [B, T-1]
         target_ids = input_ids[:, 1:].contiguous()
 
-        # cross_entropy return -logprobs but we need logprobs
-        # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
-        # target_ids is [B, T-1] --> [B * (T-1)]
-        # Compute token logprobs in float32 to avoid bf16/fp16 quantization
-        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
-        logprobs = -neg_logprobs.view(B, T_minus_1)
-        # we can also do this, but it is less efficient I guess
-        #   logprobs = logits.log_softmax(dim=-1)
-        #   logprobs = torch.gather(logprobs, dim=-1, index=target_ids)
+        # Inefficient way of computing cross_entropy:
+        # neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
+        # logprobs = -neg_logprobs.view(B, T_minus_1)
+        # Above has two kernels:
+        # kernel1: log_softmax: reads [B*T, V], writes  [B*T, V]
+        # kernel2: gather: reads that entire [B*T, V], picks one value per row, writes [B*T] output
+        # torch.compile fuses log_softmax + gather into a single kernel,
+        # avoiding the full [B*T, V] logprobs intermediate tensor. In particualr,
+        # it computes log_softmax and gathers the target index in the same kernel, in registers
+        # logits: [B, T-1, V] --> [B*(T-1), V], target_ids: [B, T-1] --> [B*(T-1)]
+        # The [B*T, V] intermediate never gets allocated in GPU memory in fused verson.
+        logprobs = compiled_log_softmax_and_gather(logits.to(torch.float32).view(-1, vocab_size),
+                                                   target_ids.view(-1)).view(B, T_minus_1)
 
         entropies = None
         if self.ent_coeff > 0.0:
@@ -87,12 +105,10 @@ class COMMON:
             # [B, T] -> [B, T-1]
             target_ids = input_ids[:, 1:].contiguous()
 
-            # cross_entropy return -logprobs but we need logprobs
-            # logits is [B, T-1, vocab_size] --> [B * (T-1), vocab_size]
-            # target_ids is [B, T-1] --> [B * (T-1)]
-            # Match policy path: keep logprob computation in float32 for KL stability.
-            neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
-            ref_logprobs = -neg_logprobs.view(B, T_minus_1)
+            # Compute logprobs in float32 for KL stability.
+            # logits: [B, T-1, V] --> [B*(T-1), V], target_ids: [B, T-1] --> [B*(T-1)]
+            ref_logprobs = compiled_log_softmax_and_gather(logits.to(torch.float32).view(-1, vocab_size),
+                                                           target_ids.view(-1)).view(B, T_minus_1)
 
         return ref_logprobs
 

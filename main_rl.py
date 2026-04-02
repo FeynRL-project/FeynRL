@@ -278,7 +278,7 @@ def merge_rollout_with_stats(rollout_lists):
             min_response_len = min(min_response_len, sample['response_len'])
             max_response_len = max(max_response_len, sample['response_len'])
             # pred_old_logprobs only contains logprob for response
-            resp_logprobs = sample['pred_old_logprobs']
+            resp_logprobs = sample['pred_old_logprobs'] * sample['pred_masks']
             total_logprob_sum += resp_logprobs.sum().item()
             total_logprob_tokens += (sample['pred_masks'] > 0.5).sum().item()
             # other stats

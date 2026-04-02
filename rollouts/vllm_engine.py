@@ -331,6 +331,19 @@ class VLLMRolloutEngine:
                               prompt_logprobs=(1 if self.prompt_logprobs else None), # it returns logprobs for each token in the prompt which is memory intensive
                               )
 
+    def sanitize_logprobs(self, token_logprobs):
+        '''
+            Prevent NaN from entering into calculations.
+        '''
+        logprobs_t = torch.tensor(token_logprobs, dtype=torch.float32, device='cpu')
+        nan_mask   = torch.isnan(logprobs_t) | torch.isinf(logprobs_t)
+        if nan_mask.any():
+            print(f"[vLLM] WARNING: {nan_mask.sum().item()} NaN/Inf in logprobs from vLLM, "
+                  f"replacing with sentinel 1.0", flush=True)
+            logprobs_t = logprobs_t.masked_fill(nan_mask, 1.0)
+
+        return logprobs_t, nan_mask
+
     def extract_logprobs(self, response_ids: List[int], logprobs_by_pos: Any) -> torch.Tensor:
         '''
            Extract logprobs for each token in response_ids from logprobs.
@@ -371,7 +384,7 @@ class VLLMRolloutEngine:
             else:
                 raise TypeError(f"Unexpected logprob type: {type(v)}")
 
-        return torch.tensor(token_logprobs, dtype=torch.float32, device='cpu')
+        return self.sanitize_logprobs(token_logprobs=token_logprobs)
 
     def generate(self,
                 prompts: List[Dict[str, List[int]]],
@@ -486,9 +499,9 @@ class VLLMRolloutEngine:
                             # token-aligned
                             #####
                             token_masks[prompt_len:] = 1 # 1 if valid token which we want to update.
-                            response_logprobs = self.extract_logprobs(response_ids, response.logprobs)
+                            response_logprobs, nan_mask = self.extract_logprobs(response_ids, response.logprobs)
                             token_old_logprobs[prompt_len:] = response_logprobs
-
+                            token_masks[prompt_len:] = token_masks[prompt_len:] * (~nan_mask).to(token_masks.dtype)
                             #####
                             # pred-aligned
                             #####
@@ -500,6 +513,7 @@ class VLLMRolloutEngine:
                             pred_start = prompt_len - 1
                             pred_end   = seq_len - 1
                             pred_masks[pred_start:pred_end] = 1
+                            pred_masks[pred_start:pred_end] = pred_masks[pred_start:pred_end] * (~nan_mask).to(pred_masks.dtype)
                             pred_old_logprobs[pred_start:pred_end] = response_logprobs
                             pred_rewards[pred_start:pred_end] = rewards[prompt_len:]
 

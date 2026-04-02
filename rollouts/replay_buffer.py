@@ -163,6 +163,8 @@ class ReplayBuffer(Dataset):
         # convert from list of [T] to [B, T]
         input_ids   = torch.stack(input_ids, dim=0)
         attn_masks  = torch.stack(attn_masks, dim=0)
+        # old_logps may contain sentinel 1.0 at nan positions,
+        # however mask is already zeroed there.
         old_logps   = torch.stack(old_logps, dim=0)
         masks       = torch.stack(masks, dim=0)
         rewards     = torch.stack(rewards, dim=0)

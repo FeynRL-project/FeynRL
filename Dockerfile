@@ -57,8 +57,5 @@ RUN uv pip install flash-attn --no-build-isolation
 # Copy project source
 COPY . /FeynRL
 
-ENV HF_HOME=/hot-data/hf_cache
-ENV HF_DATASETS_CACHE=/hot-data/hf_cache/datasets
-
 ENTRYPOINT []
 CMD ["/bin/bash"]

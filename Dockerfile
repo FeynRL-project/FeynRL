@@ -49,7 +49,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN uv pip install -r requirements.txt
+RUN uv pip install --index-strategy unsafe-best-match -r requirements.txt
 
 # Install flash-attn (improves vLLM and training performance)
 RUN uv pip install flash-attn --no-build-isolation

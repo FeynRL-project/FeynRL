@@ -100,8 +100,8 @@ deepspeed:
     stage3_param_persistence_threshold: 100000.0
 
     # Controls how much data is pre-fetched from CPU to GPU.
-    # Larger = faster but more VRAM.
-    stage3_prefetch_bucket_size: 50000000.0
+    # "auto" lets DeepSpeed size based on model hidden_size, avoiding excessive VRAM usage.
+    stage3_prefetch_bucket_size: "auto"
 
     # --- CPU Offloading ---
     # Offload optimizer to CPU. Use "none" if GPU VRAM suffices.
@@ -128,10 +128,11 @@ deepspeed:
 
     # --- Tuning Knobs ---
     # Controls the size of the chunks of data sent between GPUs.
-    # Larger = higher bandwidth efficiency but higher peak memory usage.
-    # 5e8 (500MB) is a standard aggressive default.
-    reduce_bucket_size: 500000000.0
-    allgather_bucket_size: 500000000.0
+    # "auto" lets DeepSpeed size based on model hidden_size (~hidden_size^2),
+    # avoiding excessive peak memory usage that can cause allocator cache
+    # flushes and corrupt bf16 persistent params during optimizer step.
+    reduce_bucket_size: "auto"
+    allgather_bucket_size: "auto"
 
     # --- Saving / Checkpointing ---
     # If true, gathers the fragmented ZeRO-3 weights into a single FP16 file when saving

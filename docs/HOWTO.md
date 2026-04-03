@@ -148,6 +148,65 @@ python main_rl.py --config_file ./configs/rl_args.yaml --experiment_id exp4
 
 ---
 
+## Running with Docker
+
+A pre-built Docker image is available on Docker Hub with all dependencies installed.
+
+### Pull the image
+
+```bash
+docker pull popsodazhp/feyn_rl:latest
+```
+
+Or build it yourself:
+
+```bash
+docker build -t feyn_rl:latest .
+```
+
+### SFT with Docker
+
+```bash
+docker run --gpus all --ipc=host --net=host \
+  -v /path/to/hf_cache:/root/.cache/huggingface \
+  -w /FeynRL \
+  popsodazhp/feyn_rl:latest \
+  torchrun --nproc_per_node=4 main_sl.py \
+    --config_file ./configs/sl_args.yaml \
+    --experiment_id myexp1
+```
+
+### RL with Docker
+
+```bash
+docker run --gpus all --ipc=host --net=host \
+  -v /path/to/hf_cache:/root/.cache/huggingface \
+  -w /FeynRL \
+  popsodazhp/feyn_rl:latest \
+  python main_rl.py \
+    --config_file ./configs/rl_args.yaml \
+    --experiment_id exp3
+```
+
+**Notes**
+
+* `--gpus all` exposes all GPUs. Use `--gpus '"device=0,1,2,3"'` to select specific GPUs.
+* `--ipc=host` is required for PyTorch shared memory.
+* Mount your HuggingFace cache to avoid re-downloading models.
+* Mount a volume for checkpoints if you want to persist them: `-v /path/to/ckps:/FeynRL/ckps`
+
+### Slurm (enroot)
+
+Convert the Docker image to an enroot squashfs image:
+
+```bash
+enroot import dockerd://popsodazhp/feyn_rl:latest
+```
+
+Then use it in your sbatch script with `--container-image`.
+
+---
+
 ## Troubleshooting
 
 For troubleshooting common issues related to DeepSpeed, Ray, multi-node scaling, and training stability, please refer to the [Troubleshooting Guide](../docs/TROUBLESHOOTING.md).

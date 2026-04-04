@@ -95,9 +95,9 @@ deepspeed:
     # 0:Disabled, 1:OptState, 2:Opt+Grad, 3:Opt+Grad+Param
     stage: 3
 
-    # Threshold for keeping small parameters on GPU. Default 1e8.
-    # Prevents "thrashing" (constant PCIe transfer) for small layers (like LayerNorm).
-    stage3_param_persistence_threshold: 100000.0
+    # Threshold for keeping small parameters on GPU.
+    # "auto" lets DeepSpeed set it to hidden_size * 10.
+    stage3_param_persistence_threshold: "auto"
 
     # Controls how much data is pre-fetched from CPU to GPU.
     # "auto" lets DeepSpeed size based on model hidden_size, avoiding excessive VRAM usage.

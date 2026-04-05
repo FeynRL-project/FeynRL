@@ -4,16 +4,13 @@ from misc.nccl_utils import create_nccl_process_group
 
 class WeightSyncExtension:
     '''
-        vllm WorkerExtension that enables in-place weight updates on vllm workers.
-        Used with worker_extension_cls parameter when creating vllm llm instances in vllm_engine.py.
-        This allows updating model weights directly in gpu memory without
-        destroying and recreating the vllm engine (no disk I/O).
+        vllm WorkerExtension mixin that enables in-place weight updates on vllm workers.
+        Used with worker_extension_cls parameter when creating vllm llm instances.
+        For 0.19, it injects this as a base class of the Worker via __bases__ manipulation,
+        so self.model_runner is inherited from the Worker instance.
     '''
 
-    def __init__(self, model_runner):
-        self.model_runner = model_runner
-
-    def update_weights(self, serialized_state):
+    def update_weights_from_state(self, serialized_state):
         '''
             Update model weights in-place on this vllm worker.
             vllm's load_weights handles name remapping and tp sharding internally.

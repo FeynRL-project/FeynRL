@@ -142,6 +142,14 @@ class VLLMRolloutEngine(Base):
             except Exception:
                 pass
 
+            # Shut down the vllm engine properly so engine-core subprocesses
+            # is terminated before we create a new engine.
+            try:
+                self.vllm_engine.shutdown()
+
+            except Exception as e:
+                self.log(f"Engine shutdown warning (non-fatal): {e}")
+
             try:
                 del self.vllm_engine
             except Exception as e:
@@ -154,50 +162,26 @@ class VLLMRolloutEngine(Base):
             except Exception:
                 pass
 
-        llm_extra_kwargs = {}
-        if self.batch_invariant:
-            # vLLM batch invariance requires FlashAttention backend.
-            # We still keep a compatibility fallback below for older vLLM versions.
-            llm_extra_kwargs["attention_backend"] = "FLASH_ATTN"
-
         # Load new model
         llm_kwargs = dict(model=self.model_path,
                           trust_remote_code=self.trust_remote_code,
                           tensor_parallel_size=self.tensor_parallel_size,
                           gpu_memory_utilization=self.gpu_memory_utilization,
                           dtype=self.model_dtype,
-                          # This enables collective_rpc("update_weights", ...) on all TP workers within one
+                          # This enables collective_rpc("update_weights_from_state", ...) on all TP workers within one
                           # rollout engine for direct weight updates. If update_weights_direct is never called,
                           # this sits idle and there is no real overhead since it is just a class
-                          # attached to the vllm worker. The orchestrator in main_rl.py calls update_weights on each
+                          # attached to the vllm worker. The orchestrator in main_rl.py calls update_weights_direct on each
                           # rollout engine separately via ray remote so the weight sync happens at both levels.
                           worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
-                          **llm_extra_kwargs)
+                          )
         if self.max_model_len is not None:
             llm_kwargs["max_model_len"] = self.max_model_len
-        try:
-            self.vllm_engine = LLM(**llm_kwargs)
-            self.log(f"Successfully loaded vllm model from {self.model_path}")
+        if self.batch_invariant:
+            llm_kwargs["attention_backend"] = "FLASH_ATTN"
 
-        except Exception as e:
-            # Compatibility fallback: some vLLM versions do not expose
-            # the attention_backend argument on LLM(...).
-            if self.batch_invariant and "attention_backend" in llm_kwargs:
-                msg = str(e)
-                backend_kw_error = ("attention_backend" in msg) or ("unexpected keyword" in msg)
-                if backend_kw_error:
-                    try:
-                        self.log("LLM(..., attention_backend=...) unsupported in this vLLM version; retrying without keyword.")
-                        llm_kwargs.pop("attention_backend", None)
-                        self.vllm_engine = LLM(**llm_kwargs)
-                        self.log(f"Successfully loaded vllm model from {self.model_path} (fallback mode)")
-                        return
-                    except Exception:
-                        pass
-
-            print(f"Failed to load vllm model from {self.model_path}: {e}")
-            self.vllm_engine = None
-            raise
+        self.vllm_engine = LLM(**llm_kwargs)
+        self.log(f"Successfully loaded vllm model from {self.model_path}")
 
     def update_weights_direct(self, state_dict: dict, version: int) -> bool:
         '''
@@ -237,7 +221,7 @@ class VLLMRolloutEngine(Base):
         del state_dict
         self.log(f"Updating weights directly to version {version}")
         try:
-            results = self.vllm_engine.collective_rpc("update_weights", args=(shm_path,))
+            results = self.vllm_engine.collective_rpc("update_weights_from_state", args=(shm_path,))
 
         finally:
             os.remove(shm_path)

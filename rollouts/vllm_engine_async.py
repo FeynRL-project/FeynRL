@@ -114,9 +114,8 @@ class VLLMRolloutEngineAsync(Base):
 
     def load_async_engine(self) -> None:
         '''
-            Create the AsyncLLMEngine. Handles vllm API differences:
+            Create the AsyncLLM engine. Tears down any existing engine first.
         '''
-        # newer versions may use AsyncLLM instead of AsyncLLMEngine.
         if self.async_engine is not None:
             try:
                 if torch.cuda.is_available():
@@ -125,8 +124,24 @@ class VLLMRolloutEngineAsync(Base):
             except Exception:
                 pass
 
+            # Close custom NCCL weight-sync group before tearing down the engine.
+            try:
+                self.close_nccl_group()
+
+            except Exception:
+                pass
+
+            # Shut down the vllm engine properly so engine-core subprocesses
+            # and NCCL groups are terminated before we create a new engine.
+            try:
+                self.async_engine.shutdown()
+
+            except Exception as e:
+                self.log(f"Engine shutdown warning (non-fatal): {e}")
+
             try:
                 del self.async_engine
+
             except Exception as e:
                 print(f"Error deleting async_engine: {e}")
 
@@ -150,8 +165,6 @@ class VLLMRolloutEngineAsync(Base):
             engine_kwargs["max_model_len"] = self.max_model_len
 
         if self.batch_invariant:
-            # vllm batch invariance requires FlashAttention backend.
-            # We still keep a compatibility fallback below for older vllm versions.
             engine_kwargs["attention_backend"] = "FLASH_ATTN"
 
         # Create engine inside the running event loop. vllm's AsyncLLM.__init__
@@ -161,41 +174,11 @@ class VLLMRolloutEngineAsync(Base):
         self.run_async(self.create_engine_on_loop(engine_kwargs))
 
     def create_async_engine(self, engine_kwargs):
-        try:
-            try:
-                # Prefer AsyncLLM (vllm 0.15+)
-                from vllm import AsyncLLM
-                self.async_engine = AsyncLLM(**engine_kwargs)
-                self.log(f"Loaded AsyncLLM from {self.model_path}")
-
-            except ImportError:
-                # AsyncLLMEngine is a legacy wrapper whose collective_rpc may not work correctly.
-                from vllm import AsyncLLMEngine
-                from vllm.engine.arg_utils import AsyncEngineArgs
-                args = AsyncEngineArgs(**engine_kwargs)
-                self.async_engine = AsyncLLMEngine.from_engine_args(args)
-                self.log(f"Loaded AsyncLLMEngine from {self.model_path}")
-
-        except TypeError as e:
-            # Compatibility fallback: some vLLM versions do not expose
-            # the attention_backend argument.
-            if self.batch_invariant and "attention_backend" in str(e):
-                engine_kwargs.pop("attention_backend", None)
-                self.log("attention_backend unsupported in this vLLM version; retrying without it.")
-                try:
-                    from vllm import AsyncLLM
-                    self.async_engine = AsyncLLM(**engine_kwargs)
-                    self.log(f"Loaded AsyncLLM from {self.model_path} (fallback mode)")
-
-                except ImportError:
-                    from vllm import AsyncLLMEngine
-                    from vllm.engine.arg_utils import AsyncEngineArgs
-                    args = AsyncEngineArgs(**engine_kwargs)
-                    self.async_engine = AsyncLLMEngine.from_engine_args(args)
-                    self.log(f"Loaded AsyncLLMEngine from {self.model_path} (fallback mode)")
-
-            else:
-                raise
+        from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.engine.arg_utils import AsyncEngineArgs
+        engine_args = AsyncEngineArgs(**engine_kwargs)
+        self.async_engine = AsyncLLM.from_engine_args(engine_args)
+        self.log(f"Loaded AsyncLLM from {self.model_path}")
 
     async def create_engine_on_loop(self, engine_kwargs):
         '''
@@ -488,7 +471,7 @@ class VLLMRolloutEngineAsync(Base):
         del state_dict
         self.log(f"Updating weights directly to version {version}")
         try:
-            results = self.run_async(self.async_engine.collective_rpc("update_weights", args=(shm_path,)))
+            results = self.run_async(self.async_engine.collective_rpc("update_weights_from_state", args=(shm_path,)))
 
         finally:
             os.remove(shm_path)  
@@ -678,7 +661,7 @@ class VLLMRolloutEngineAsync(Base):
             After all NCCL parameters have been received, load them into vLLM.
             For TP=1 + gloo (actor-side): loads the accumulated _nccl_state_dict
             into vllm via the existing update_weights_direct path (pickle to
-            /dev/shm → collective_rpc("update_weights")).
+            /dev/shm → collective_rpc("update_weights_from_state")).
             For TP>1 or nccl backend: weights were already loaded per-parameter
             in EngineCore via load_weights, so just update the version.
         '''

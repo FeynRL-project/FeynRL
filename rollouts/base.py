@@ -57,7 +57,6 @@ class Base:
                               logit_bias=None,
                               allowed_token_ids=None,
                               bad_words=None,
-                              logits_processors=None,
 
                               # setup to returns required info
                               logprobs=1, # it returns logprobs for each token

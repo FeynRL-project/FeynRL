@@ -140,7 +140,7 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
             "kl_coeff": 0.0, "clip_low": 0.2, "clip_high": 0.2,
             "entropy_coeff": 0.0, "tau": 0.95, "gamma": 0.99,
         },
-        "reward": {"broadcast": False, "eps_reward_norm": 1e-8, "reward_func": "dummy"},
+        "reward": {"broadcast": False, "reward_func": "dummy"},
         "rollout": {
             "temperature": 1.0, "max_tokens": 128, "n_samples": 4,
             "top_p": 1.0, "top_k": -1, "ignore_eos": False,

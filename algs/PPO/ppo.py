@@ -494,14 +494,23 @@ class PPO(COMMON):
         ga_remainder = num_micro % ga_steps
 
         # Compute global token count for global token normalization.
-        ga_denom = None
-        dp_scale = None
+        ga_denom  = None
+        ga_denoms = None
+        dp_scale  = None
         if self.normalize_loss:
-            ga_denom, dp_scale = self.compute_global_token_denom(micro_batches, ga_steps, device)
+            if self.update_only_after_full_replay:
+                ga_denom, dp_scale  = self.compute_global_token_denom(micro_batches=micro_batches, ga_steps=ga_steps, device=device)
+
+            else:
+                ga_denoms, dp_scale = self.compute_per_group_token_denoms(micro_batches=micro_batches, ga_steps=ga_steps, device=device)
+
+        # Weight health check before any update
+        self.check_weights_health(engine_id, "BEFORE training step")
 
         # track metrics across all micro-batches
         all_metrics_policy = []
         all_metrics_value = []
+        consecutive_nan_steps = 0
         for step, (micro_batch, (returns, advs)) in enumerate(progress_bar):
             is_last = (step == (num_micro - 1))
             # If update_only_after_full_replay is True, we only update at the very end
@@ -533,17 +542,20 @@ class PPO(COMMON):
                                                                         att_mask=att_mask,
                                                                         pos_ids=pos_ids)
 
+            # Snapshot pre-NaN valid token count for ga_denom correction.
+            pre_nan_valid = (mask > 0.5).sum().item() if self.normalize_loss else 0
+
             # Sanitize logprobs before loss computation to prevent NaN into loss
-            pi_logprobs, pi_nan = self.sanitize_logprobs(pi_logprobs, engine_id, step, num_micro)
+            pi_logprobs, pi_nan = self.sanitize_logprobs(logprobs=pi_logprobs, engine_id=engine_id, step=step, num_micro=num_micro)
             mask = mask * (~pi_nan).to(mask.dtype)
 
             ref_logprobs = None
             if self.kl_coeff > 0.0 and self.ref_model_engine is not None:
                 ref_logprobs = self.ref_forward(input_ids=input_ids,
                                                 att_mask=att_mask,
-                                                pos_ids=pos_ids,
-                                                )
-                ref_logprobs, ref_nan = self.sanitize_logprobs(ref_logprobs, engine_id, step, num_micro)
+                                                pos_ids=pos_ids)
+
+                ref_logprobs, ref_nan = self.sanitize_logprobs(logprobs=ref_logprobs, engine_id=engine_id, step=step, num_micro=num_micro)
                 mask = mask * (~ref_nan).to(mask.dtype)
 
             # Compute policy loss using the current policy.
@@ -559,8 +571,20 @@ class PPO(COMMON):
 
             # Scale loss for backward pass.
             if self.normalize_loss:
-                # Global token normalization:
-                pi_loss = loss_total_sum * (dp_scale / ga_denom)
+                if self.update_only_after_full_replay:
+                    # Single global denominator covering all micro-batches.
+                    # Adjust for tokens lost to nan sanitization in this micro-batch.
+                    nan_removed  = pre_nan_valid - local_denom.item()
+                    ga_denom_adj = max(ga_denom - nan_removed, 1.0) if nan_removed > 0 else ga_denom
+                    pi_loss      = loss_total_sum * (dp_scale / ga_denom_adj)
+
+                else:
+                    # Per-GA-group denominator so each optimizer step is normalized
+                    # only by its own group's tokens (not the entire replay buffer).
+                    group_idx    = step // ga_steps
+                    nan_removed  = pre_nan_valid - local_denom.item()
+                    ga_denom_adj = max(ga_denoms[group_idx] - nan_removed, 1.0) if nan_removed > 0 else ga_denoms[group_idx]
+                    pi_loss      = loss_total_sum * (dp_scale / ga_denom_adj)
 
             else:
                 # local per-micro-batch mean + manual GA scaling.
@@ -574,8 +598,21 @@ class PPO(COMMON):
 
             self.policy_engine.set_gradient_accumulation_boundary(is_boundary)
 
+            # track consecutive all-masked micro-batches and abort early
+            # to avoid a ZeRO-3 nccl hang from sustained zero gradients.
+            consecutive_nan_steps = self.check_all_masked(engine_id=engine_id,
+                                                          step=step,
+                                                          num_micro=num_micro,
+                                                          local_denom=local_denom,
+                                                          consecutive_nan_steps=consecutive_nan_steps)
+
             # backward pass
             self.policy_engine.backward(pi_loss)
+
+            # Proactive cache flush before optimizer step to reduce fragmentation.
+            if is_boundary:
+                torch.cuda.empty_cache()
+
             self.policy_engine.step()
 
             ########
@@ -597,8 +634,13 @@ class PPO(COMMON):
                                           "v_loss": f"{v_metrics['loss_v']:.4f}",})
 
             # Scale value loss for backward pass.
+            # Uses the same nan_removed adjustment as policy loss since both
+            # share the same mask (modified by NaN sanitization above).
             if self.normalize_loss:
-                v_loss = v_loss_sum * (dp_scale / ga_denom)
+                if self.update_only_after_full_replay:
+                    v_loss = v_loss_sum * (dp_scale / ga_denom_adj)
+                else:
+                    v_loss = v_loss_sum * (dp_scale / ga_denom_adj)
 
             else:
                 v_loss = v_loss_sum / v_denom
@@ -613,6 +655,11 @@ class PPO(COMMON):
 
             # backward pass
             self.value_engine.backward(v_loss)
+
+            # Proactive cache flush before optimizer step to reduce fragmentation.
+            if is_boundary:
+                torch.cuda.empty_cache()
+
             self.value_engine.step()
 
         # aggregate metrics across all micro-batches into a single dict
@@ -627,5 +674,8 @@ class PPO(COMMON):
         if all_metrics_value:
             for key in all_metrics_value[0].keys():
                 aggregated_metrics[f'value_{key}'] = np.mean([m[key] for m in all_metrics_value])
+
+        # check weights health after update
+        self.check_weights_health(engine_id, "AFTER training step")
 
         return aggregated_metrics

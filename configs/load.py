@@ -185,6 +185,12 @@ class DeepSpeed(BaseModel):
     fp16: Dict[str, Any] = Field(default_factory=lambda: {"enabled": False})
     bf16: Dict[str, Any] = Field(default_factory=lambda: {"enabled": False})
 
+    # Accumulate gradients in fp32 for numerical stability under bf16/fp16 training.
+    data_types: Dict[str, Any] = Field(default_factory=lambda: {"grad_accum_dtype": "fp32"})
+
+    # Disable gradient pre-scaling (scale loss after backward, not before).
+    prescale_gradients: bool = False
+
     # ZeRO Optimization
     zero_optimization: Dict[str, Any] = Field(default_factory=dict)
 

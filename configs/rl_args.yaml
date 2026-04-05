@@ -190,6 +190,16 @@ deepspeed:
     # "auto" lets DeepSpeed size based on model hidden_size, avoiding excessive VRAM usage.
     stage3_prefetch_bucket_size: "auto"
 
+    # Max parameters live on GPU simultaneously during forward/backward.
+    # "auto" lets DeepSpeed pick a conservative value (default 1e9 is too large).
+    stage3_max_live_parameters: "auto"
+
+    # When to release gathered parameters. "auto" releases sooner for memory savings.
+    stage3_max_reuse_distance: "auto"
+
+    # Sub-group size for gradient partitioning. "auto" lets DeepSpeed optimize.
+    sub_group_size: "auto"
+
     # --- CPU Offloading ---
     # Offload optimizer to CPU. Use "none" if GPU VRAM suffices.
     offload_optimizer:
@@ -224,6 +234,13 @@ deepspeed:
     # --- Saving / Checkpointing ---
     # If true, gathers the fragmented ZeRO-3 weights into a single FP16 file when saving
     stage3_gather_16bit_weights_on_model_save: true
+
+  # Disable gradient pre-scaling (both open-instruct and OpenRLHF set this explicitly).
+  prescale_gradients: false
+
+  # Accumulate gradients in fp32 for numerical stability under bf16 training.
+  data_types:
+    grad_accum_dtype: "fp32"
 
   # --- Logging ---
   steps_per_print: 100

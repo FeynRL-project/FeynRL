@@ -87,6 +87,10 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                     "PYTHONPATH": os.getcwd(), # Ensure current directory is in path for all workers
                     "CUBLAS_WORKSPACE_CONFIG": cublas_workspace, # deterministic cuBLAS
                     "PYTHONHASHSEED": str(params.run.seed),
+                    # Disable nccl's internal CUDA memory allocator so all GPU memory
+                    # is managed by pytorch's caching allocator. Prevents allocator
+                    # conflicts that cause cache flushes and param buffer corruption.
+                    "NCCL_CUMEM_ENABLE": "0",
                     }
 
         # NCCL env vars
@@ -150,6 +154,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
         rollout_env_vars = {"PYTHONPATH": os.getcwd(),
                             "CUBLAS_WORKSPACE_CONFIG": cublas_workspace,
                             "PYTHONHASHSEED": str(params.run.seed),
+                            "NCCL_CUMEM_ENABLE": "0",
                            }
         # The goal of batch_invariant is topology-invariance. it means that
         # same prompt → same output regardless of engine count

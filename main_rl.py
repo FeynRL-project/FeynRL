@@ -141,7 +141,6 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               # reward related arguments
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
-              "eps_reward_norm":params.reward.eps_reward_norm,
               "batch_invariant":params.rollout.batch_invariant,
             }
 

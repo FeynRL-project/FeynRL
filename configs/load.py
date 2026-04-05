@@ -234,7 +234,6 @@ class Reward(BaseModel):
     '''
     model_config = ConfigDict(extra='forbid')
     broadcast: bool | None = None
-    eps_reward_norm: float | None = None
     reward_func: str | None = None
 
 class Overlap(BaseModel):

@@ -201,7 +201,6 @@ Controls interleaved rollout generation and training within a single epoch. When
 |:---|:---|:---|:---|
 | `reward_func` | Reward function name in `rewards/` module | String | `"gsm8k_reward_func"` |
 | `broadcast` | Broadcast scalar reward across response tokens | Boolean | `false` |
-| `eps_reward_norm` | Epsilon for reward normalization | Float > 0 | `1e-8` |
 
 ---
 

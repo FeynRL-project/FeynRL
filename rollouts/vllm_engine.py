@@ -32,7 +32,6 @@ class VLLMRolloutEngine(Base):
                  tensor_parallel_size: int,
                  eos_id: int,
                  reward_broadcast: bool,
-                 eps_reward_norm: float,
                  gpu_memory_utilization: float,
                  model_dtype: str,
                  max_seq_len: int,
@@ -89,8 +88,6 @@ class VLLMRolloutEngine(Base):
         self.refresh_model(model_path, 0)
         self.sampling_params = self.make_sampling_params()
 
-        # reward normalization
-        self.eps_reward_norm = float(eps_reward_norm)
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
 
@@ -516,7 +513,6 @@ if __name__ == "__main__":
                                     tensor_parallel_size=1,
                                     eos_id=tokenizer.eos_token_id,
                                     reward_broadcast=True,
-                                    eps_reward_norm=1e-8,
                                     gpu_memory_utilization=0.5,
                                     engine_id=0,
                                     max_seq_len=2048,

@@ -149,7 +149,7 @@ class Base:
             # sample['reward']: [T] where prompt tokens would get 0
             # sample['reward'][-1]: means the last token reward
             zscore = torch.zeros_like(sample['token_rewards'], dtype=torch.float)
-            zscore[-1] = (sample['token_rewards'][-1] - mean_scores) / (std_scores + self.eps_reward_norm)
+            zscore[-1] = (sample['token_rewards'][-1] - mean_scores) / (std_scores + 1e-8)
             sample["token_zscores"] = zscore
             if self.reward_broadcast:
                 sample["token_zscores"][prompt_len:] = zscore[-1]

@@ -114,7 +114,6 @@ train:
 
 reward:
   broadcast: False
-  eps_reward_norm: 1e-8
   reward_func: dummy_reward_func
 
 rollout:

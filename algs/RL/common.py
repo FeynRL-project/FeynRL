@@ -125,7 +125,7 @@ class COMMON:
 
         log_ratio = logprobs - ref_logprobs
         # pi_ref/pi = exp(ref_logprobs - logprobs)
-        exponent = ref_logprobs - logprobs
+        exponent = torch.clamp(ref_logprobs - logprobs, min=-10.0, max=10.0)
         #if exponent.max().item() > 10.0:
         #    print(f"[WARNING] compute_kl_distance: extreme divergence detected, max exponent={exponent.max().item():.1f}")
 
@@ -176,6 +176,49 @@ class COMMON:
         dp_scale   = ga_steps * world_size
 
         return ga_denom, dp_scale
+
+    def compute_per_group_token_denoms(self, micro_batches, ga_steps, device):
+        '''
+            Compute pergradient-accumulation-group global token counts for use with
+            update_after_full_replay=False. Each GA group gets its own
+            denominator so each optimizer step is normalized only by its
+            own group's tokens.
+            micro_batches: list of micro-batch dicts with mask key, shape [B, T].
+            ga_steps: gradient accumulation steps from DeepSpeed config.
+            Returns:
+                (ga_denoms, dp_scale) where:
+                  - ga_denoms is a list of per-GA-group global token counts.
+                    Length = ceil(num_micro / ga_steps).
+                  - dp_scale is ga_steps * world_size.
+        '''
+        num_micro  = len(micro_batches)
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        dp_scale   = ga_steps * world_size
+
+        # Per-micro-batch local token counts.
+        count = [(mb['mask'][:, :-1] > 0.5).sum().item() for mb in micro_batches]
+        local_counts = torch.tensor(count, dtype=torch.float64, device=device)
+
+        # All-reduce so every rank has global per-micro-batch counts.
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local_counts, op=torch.distributed.ReduceOp.SUM)
+
+        # 12 micro-batches (num_micro), ga_steps=3, 5 ranks, batch_size=4
+        # 4 GA groups (micro-batches / ga_steps):
+        # [MB 0-2], [MB 3-5], [MB 6-8], [MB 9-11]
+        # Each group: num_micro=3 x batch_size=4 x 5 ranks = 60 samples
+        # ga_denoms[i] where i in [0,1,2,3] = total valid tokens in MB [...] across all 5 ranks
+        # Optimizer steps at MB 2, 5, 8, 11, each step divides by its own
+        # group's token count, not the full replay buffer's count.
+        # Sum into GA groups. Each group covers ga_steps consecutive micro-batches.
+        # E.g., ga_steps=3, 12 MBs -> groups [0:3], [3:6], [6:9], [9:12] -> 4 denoms.
+        ga_denoms = []
+        for group_start in range(0, num_micro, ga_steps):
+            group_end   = min(group_start + ga_steps, num_micro)
+            group_denom = local_counts[group_start:group_end].sum().item()
+            ga_denoms.append(max(group_denom, 1.0))
+
+        return ga_denoms, dp_scale
 
     def check_logit_health(self, logits):
         '''

@@ -226,4 +226,40 @@ DeepSpeed settings are defined under the `deepspeed` key. Some parameters such a
 A separate `deepspeed_ref` section will be configured automatically for inference-only DeepSpeed for the reference model (RL/CL).
 A separate `deepspeed_value` section will be configured automatically for DeepSpeed for the value model (PPO).
 
+### ZeRO Optimization (`zero_optimization`)
+
+| Parameter | Description | Type / Constraint | Default |
+|:---|:---|:---|:---|
+| `stage` | ZeRO stage | `0` (disabled) \| `1` (optimizer state) \| `2` (optimizer + gradients) \| `3` (optimizer + gradients + parameters) | `3` |
+| `stage3_param_persistence_threshold` | Threshold for keeping small parameters on GPU to avoid transfer thrashing. `"auto"` sets it to `hidden_size * 10`. | Float \| `"auto"` | `"auto"` |
+| `stage3_prefetch_bucket_size` | How much data is pre-fetched from CPU to GPU. `"auto"` sizes based on model `hidden_size`, avoiding excessive VRAM usage. | Float \| `"auto"` | `"auto"` |
+| `stage3_max_live_parameters` | Max parameters live on GPU simultaneously during forward/backward. `"auto"` picks a conservative value (the hardcoded default of 1e9 is often too large). | Float \| `"auto"` | `"auto"` |
+| `stage3_max_reuse_distance` | When to release gathered parameters. `"auto"` releases sooner for memory savings. | Float \| `"auto"` | `"auto"` |
+| `sub_group_size` | Sub-group size for gradient partitioning. `"auto"` lets DeepSpeed optimize. | Float \| `"auto"` | `"auto"` |
+| `reduce_bucket_size` | Chunk size for gradient reduce between GPUs. `"auto"` sizes based on `hidden_size` (~`hidden_size²`), avoiding excessive peak memory that can cause allocator cache flushes. | Float \| `"auto"` | `"auto"` |
+| `allgather_bucket_size` | Chunk size for allgather between GPUs. Same sizing rationale as `reduce_bucket_size`. | Float \| `"auto"` | `"auto"` |
+| `contiguous_gradients` | Copy gradients to a contiguous buffer to reduce fragmentation | Boolean | `true` |
+| `overlap_comm` | Overlap gradient reduction with backward pass computation | Boolean | `true` |
+| `reduce_scatter` | Use reduce-scatter to average and scatter gradients to the responsible GPU | Boolean | `true` |
+| `stage3_gather_16bit_weights_on_model_save` | Gather fragmented ZeRO-3 weights into a single FP16 file when saving | Boolean | `true` |
+
+#### CPU Offloading
+
+| Parameter | Description | Type / Constraint | Default |
+|:---|:---|:---|:---|
+| `offload_optimizer.device` | Offload optimizer state to CPU. Use `"none"` if GPU VRAM suffices. | `"cpu"` \| `"none"` | `"none"` |
+| `offload_optimizer.pin_memory` | Pin CPU memory for faster transfers | Boolean | `true` |
+| `offload_param.device` | Offload parameters to CPU. High performance penalty; use `"none"` if possible. | `"cpu"` \| `"none"` | `"none"` |
+| `offload_param.pin_memory` | Pin CPU memory for faster transfers | Boolean | `true` |
+
+### Top-Level DeepSpeed Settings
+
+| Parameter | Description | Type / Constraint | Default |
+|:---|:---|:---|:---|
+| `prescale_gradients` | Pre-scale loss before backward. Set to `false` to scale after backward instead (matches open-instruct and OpenRLHF). | Boolean | `false` |
+| `data_types.grad_accum_dtype` | Accumulate gradients in this dtype for numerical stability under bf16/fp16 training. | `"fp32"` \| `"fp16"` \| `"bf16"` | `"fp32"` |
+
+
+> **Note on `"auto"` values:** Most ZeRO-3 tuning knobs now default to `"auto"`, which lets DeepSpeed size buffers based on the model's `hidden_size`. This avoids hardcoded values (e.g., 500MB bucket sizes) that can cause excessive peak memory, allocator cache flushes, and corrupt bf16 persistent parameters during the optimizer step.
+
 ---

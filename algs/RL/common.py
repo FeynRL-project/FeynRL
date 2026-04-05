@@ -177,6 +177,101 @@ class COMMON:
 
         return ga_denom, dp_scale
 
+    def check_logit_health(self, logits):
+        '''
+            Check if there is nan or inf in logits.
+            logits: [B, T-1, V]
+
+            NaN in logits with NaN in weights = weight corruption (fatal).
+            NaN/Inf in logits with clean weights = bf16 overflow on specific
+            sequences (non-fatal, masked out downstream by sanitize_logprobs).
+        '''
+        # Reduce along vocab dim in native dtype -> [B, T-1], no extra [B,T,V] alloc.
+        with torch.no_grad():
+            row_max = logits.max(dim=-1).values   # [B, T-1]
+            all_finite = torch.isfinite(row_max).all().item()
+
+        if not all_finite:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            num_bad = (~torch.isfinite(row_max)).sum().item()
+            total = row_max.numel()
+
+            # Check if weights themselves are corrupted
+            bad_param = None
+            for pname, p in self.policy_engine.module.named_parameters():
+                if p.numel() > 0 and torch.isnan(p).any():
+                    bad_param = pname
+                    break
+
+            if bad_param is not None:
+                # Weights are corrupted — fatal, no recovery possible
+                raise RuntimeError(f"[Rank {rank}] NaN in logits AND weights: "
+                                   f"logits shape={list(logits.shape)}, dtype={logits.dtype}, "
+                                   f"first NaN param='{bad_param}'. "
+                                   f"Model weights are corrupted — check optimizer step or weight sync.")
+
+            # Weights are clean — bf16 overflow on specific tokens.
+            # Log warning but don't crash. The affected positions will produce
+            # NaN logprobs which sanitize_logprobs masks out of the loss.
+            print(f"[Rank {rank}] WARNING: {num_bad}/{total} non-finite logit rows "
+                  f"(bf16 overflow), logits shape={list(logits.shape)}. "
+                  f"Weights are clean — affected tokens will be masked from loss.",
+                  flush=True)
+
+    def check_weights_health(self, engine_id, location):
+        '''
+            Pre-training-step guard: exit immediately if weights are already nan.
+            Catches corruption carried over from a previous epoch or weight sync.
+        '''
+        nan_params = [name for name, p in self.policy_engine.module.named_parameters()
+                      if p.requires_grad and p.numel() > 0 and torch.isnan(p).any()
+                      ]
+        if nan_params:
+            raise RuntimeError(f"[Alg:{self.alg_name}][Engine {engine_id}] {len(nan_params)} params "
+                               f"contain NaN {location}: {nan_params[:10]}. "
+                               f"Model is corrupted — restart from a known-good checkpoint.")
+
+    def check_weights_per_microbatch_update(self, engine_id, step, num_micro, pi_loss, loss_total_sum, local_denom, ga_denom):
+        '''
+            Post-optimizer-step guard: detect NaN introduced by DeepSpeed's step().
+            Lightweight — iterates params without cloning or accessing DS internals.
+        '''
+        bad = [name for name, p in self.policy_engine.module.named_parameters()
+               if p.requires_grad and p.numel() > 0 and torch.isnan(p).any()
+               ]
+        if bad:
+            raise RuntimeError(f"[Alg:{self.alg_name}][Engine {engine_id}] NaN in weights "
+                               f"after optimizer step at micro-batch {step}/{num_micro}. "
+                               f"pi_loss={pi_loss.item():.6f}, "
+                               f"loss_total_sum={loss_total_sum.item():.6f}, "
+                               f"local_denom={local_denom.item():.0f}, "
+                               f"ga_denom={ga_denom}. "
+                               f"Corrupted params ({len(bad)}): {bad[:10]}")
+
+    def check_all_masked(self, engine_id, step, num_micro, local_denom,
+                         consecutive_nan_steps, nan_abort_threshold=20):
+        '''
+            Guard against sustained all-masked micro-batches which produce zero
+            gradients and can cause ZeRO-3 NCCL hangs.
+            Returns updated consecutive_nan_steps count.
+        '''
+        if local_denom.item() == 0:
+            consecutive_nan_steps += 1
+            if engine_id == 0:
+                print(f"[Alg:{self.alg_name}][Engine {engine_id}] WARNING: all tokens "
+                      f"masked at micro-batch {step}/{num_micro} "
+                      f"({consecutive_nan_steps}/{nan_abort_threshold} consecutive), "
+                      f"loss is zero — model is not learning.",
+                      flush=True)
+            if consecutive_nan_steps >= nan_abort_threshold:
+                raise RuntimeError(f"[Alg:{self.alg_name}][Engine {engine_id}] Aborting: "
+                                   f"{nan_abort_threshold} consecutive micro-batches had all "
+                                   f"tokens masked by NaN/Inf. The model has collapsed — "
+                                   f"restart from a known-good checkpoint.")
+        else:
+            consecutive_nan_steps = 0
+        return consecutive_nan_steps
+
     def load_single_model(self, model_path: str, dtype: torch.dtype, model_name: str):
         '''
             Helper to load a single model from HuggingFace.
@@ -762,11 +857,35 @@ class COMMON:
         device = self.policy_engine.device
         torch.cuda.set_device(device)
 
+        # Free cached memory before ZeRO-3 gather. GatheredParameters does
+        # all-gather ops that need temporary buffers; a fragmented allocator
+        # can cause cache flushes that corrupt persistent param buffers.
+        torch.cuda.empty_cache()
+
         state_dict = self.gather_state_dict()
+
+        # Check live model params after ZeRO-3 gather.
+        # GatheredParameters temporarily all-gathers into p.data and reverts on exit.
+        # If the all-gather corrupts the buffer (e.g. CUDA stream race), the live
+        # model params now have NaN even though the CPU copies might be clean.
+        nan_live = [name for name, p in self.policy_engine.module.named_parameters()
+                    if p.requires_grad and p.numel() > 0 and torch.isnan(p).any()]
+        if nan_live:
+            raise RuntimeError(f"[Alg:{self.alg_name}][Rank {rank}] NaN in {len(nan_live)} live model "
+                               f"params after ZeRO-3 gather: {nan_live[:10]}. "
+                               f"GatheredParameters corrupted the model.")
 
         if rank == 0 and state_dict:
             self._pending_nccl_state_dict = state_dict
             metadata = [(name, str(param.dtype), tuple(param.shape)) for name, param in state_dict.items()]
+
+            # Check gathered state_dict (CPU copies) for NaN before broadcasting.
+            nan_in_sync = [name for name, param in state_dict.items()
+                           if param.numel() > 0 and torch.isnan(param).any()]
+            if nan_in_sync:
+                raise RuntimeError(f"[Alg:{self.alg_name}][Rank 0] NaN in {len(nan_in_sync)} params "
+                                   f"gathered for weight sync: {nan_in_sync[:10]}. "
+                                   f"Aborting broadcast to prevent corrupting rollout engines.")
 
             print(f"[Alg:{self.alg_name}][Rank 0] Gathered {len(metadata)} params for NCCL broadcast", flush=True)
             return metadata

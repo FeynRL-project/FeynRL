@@ -773,10 +773,10 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 alg_name = config.train.alg_name.lower() if config.train.alg_name else ""
                 fixed_interval = config.overlap.fixed_sync_interval
                 if alg_name != "p3o" and (fixed_interval is None or fixed_interval <= 0):
-                    if rank == 0:
-                        print(f"[Config] WARNING: overlap is enabled with algorithm '{config.train.alg_name}' "
-                              f"Set overlap.fixed_sync_interval > 0 for mid-epoch weight sync, "
-                              f"otherwise sync only happens at end-of-epoch boundaries as it does not compute ess_factor")
+                    raise ValueError(f"overlap.fixed_sync_interval must be > 0 when overlap is enabled "
+                                     f"with algorithm '{config.train.alg_name}' (only P3O supports ESS-driven sync). "
+                                     f"Set it to train_steps_per_epoch ({config.train.train_steps_per_epoch}) "
+                                     f"for one sync per epoch, or a smaller value for more frequent syncs.")
 
                 steps_per_epoch = config.train.train_steps_per_epoch
                 if fixed_interval is not None and fixed_interval > 0 and fixed_interval < steps_per_epoch:

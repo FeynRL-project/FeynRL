@@ -235,6 +235,7 @@ A separate `deepspeed_value` section will be configured automatically for DeepSp
 | `stage3_max_live_parameters` | Max parameters live on GPU simultaneously during forward/backward. `"auto"` picks a conservative value (the hardcoded default of 1e9 is often too large). | Float \| `"auto"` | `"auto"` |
 | `stage3_max_reuse_distance` | When to release gathered parameters. `"auto"` releases sooner for memory savings. | Float \| `"auto"` | `"auto"` |
 | `sub_group_size` | Sub-group size for gradient partitioning. `"auto"` lets DeepSpeed optimize. | Float \| `"auto"` | `"auto"` |
+| `zero_hpz_partition_size` | **ZeRO++ (multi-node only).** Hierarchical partitioning: keeps a full parameter copy within each node so all-gather stays intra-node (fast NVLink) instead of crossing the network. Set to the number of GPUs per node. No effect on single-node setups. | Int | Not set |
 | `reduce_bucket_size` | Chunk size for gradient reduce between GPUs. `"auto"` sizes based on `hidden_size` (~`hidden_size²`), avoiding excessive peak memory that can cause allocator cache flushes. | Float \| `"auto"` | `"auto"` |
 | `allgather_bucket_size` | Chunk size for allgather between GPUs. Same sizing rationale as `reduce_bucket_size`. | Float \| `"auto"` | `"auto"` |
 | `contiguous_gradients` | Copy gradients to a contiguous buffer to reduce fragmentation | Boolean | `true` |

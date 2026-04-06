@@ -135,6 +135,12 @@ deepspeed:
     # to the specific GPU responsible for updating that specific weight.
     reduce_scatter: true
 
+    # --- ZeRO++ (multi-node only) ---
+    # Hierarchical partitioning: keeps a full parameter copy within each node
+    # so all-gather stays intra-node (fast NVLink) instead of crossing the network.
+    # Set to the number of GPUs per node. No effect on single-node setups.
+    # zero_hpz_partition_size: 8
+
     # --- Tuning Knobs ---
     # Controls the size of the chunks of data sent between GPUs.
     # "auto" lets DeepSpeed size based on model hidden_size (~hidden_size^2),

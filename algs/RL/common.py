@@ -980,9 +980,19 @@ class COMMON:
 
     def close_weight_nccl_group(self):
         '''
-            Destroy the weight sync group. Called during shutdown.
+            Destroy the weight sync group. Called during:
+            - Initial setup (reinit before first epoch)
+            - Between epochs when NCCL sync fails and rollout engines are refreshed
+            - Final shutdown when the Ray actor is torn down
         '''
         if hasattr(self, 'weight_sync_pynccl') and self.weight_sync_pynccl is not None:
+            # Ensure all in-flight NCCL ops complete before destroying the communicator.
+            # Without this, ncclCommInitRank on reinit can fail with "unhandled cuda error"
+            # because the old communicator's GPU resources are still in use.
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
             del self.weight_sync_pynccl
             self.weight_sync_pynccl = None
 

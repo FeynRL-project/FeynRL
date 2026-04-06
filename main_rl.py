@@ -733,7 +733,7 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
         raise
 
     # Phase 3: Finalize — fire but don't block.
-    finalize_refs = [eng.finalize_weight_nccl.remote(version) for eng in rollout_engines]
+    finalize_refs = [eng.finalize_weight_nccl.remote(version, num_params) for eng in rollout_engines]
 
     elapsed = time.time() - start_time
     logger.info(f"[sync_weights_nccl] Broadcast complete in {elapsed:.2f}s, finalize dispatched ({mode})")

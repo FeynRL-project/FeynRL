@@ -653,7 +653,7 @@ class VLLMRolloutEngineAsync(Base):
                 args=(param_name, dtype_str, tuple(shape), empty_cache)))
             return results
 
-    def finalize_weight_nccl(self, version):
+    def finalize_weight_nccl(self, version, expected_params=0):
         '''
             After all NCCL parameters have been received, load them into vLLM.
             For TP=1 + gloo (actor-side): loads the accumulated _nccl_state_dict
@@ -661,10 +661,21 @@ class VLLMRolloutEngineAsync(Base):
             /dev/shm → collective_rpc("update_weights_from_state")).
             For TP>1 or nccl backend: weights were already loaded per-parameter
             in EngineCore via load_weights, so just update the version.
+            expected_params: total params the sender broadcast. If the received
+            count doesn't match, the load was partial and the version is NOT
+            updated to prevent generating with a corrupted model.
         '''
         if getattr(self, '_nccl_in_actor', False) and \
            hasattr(self, '_nccl_state_dict') and self._nccl_state_dict:
             num_params = len(self._nccl_state_dict)
+            if expected_params > 0 and num_params != expected_params:
+                print(f"[VLLMEngineAsync][Engine {self.engine_id}] finalize_weight_nccl: "
+                      f"PARTIAL LOAD — received {num_params}/{expected_params} params, "
+                      f"not updating loaded_version to prevent corrupted generation", flush=True)
+                self._nccl_state_dict = {}
+
+                return False
+
             print(f"[VLLMEngineAsync][Engine {self.engine_id}] finalize_weight_nccl: "
                   f"loading {num_params} params via update_weights_direct", flush=True)
             success = self.update_weights_direct(self._nccl_state_dict, version)
@@ -673,16 +684,23 @@ class VLLMRolloutEngineAsync(Base):
 
         # TP>1: weights were loaded per-parameter in receive_all_weights_nccl.
         # Verify that all parameters were received before updating the version.
-        expected = getattr(self, '_nccl_tp_params_received', 0)
-        if expected <= 0:
+        received = getattr(self, '_nccl_tp_params_received', 0)
+        if received <= 0:
             print(f"[VLLMEngineAsync][Engine {self.engine_id}] finalize_weight_nccl: "
                   f"WARNING: no params received via NCCL for version {version}, "
                   f"not updating loaded_version", flush=True)
             return False
 
+        if expected_params > 0 and received != expected_params:
+            print(f"[VLLMEngineAsync][Engine {self.engine_id}] finalize_weight_nccl: "
+                  f"PARTIAL LOAD — received {received}/{expected_params} params, "
+                  f"not updating loaded_version to prevent corrupted generation", flush=True)
+            self._nccl_tp_params_received = 0
+            return False
+
         self._nccl_tp_params_received = 0
         self.loaded_version = version
-        self.log(f"NCCL weight sync finalized to version {version} ({expected} params)")
+        self.log(f"NCCL weight sync finalized to version {version} ({received} params)")
         return True
 
     def close_nccl_group(self):

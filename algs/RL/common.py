@@ -919,7 +919,7 @@ class COMMON:
                                f"GatheredParameters corrupted the model.")
 
         if rank == 0 and state_dict:
-            self._pending_nccl_state_dict = state_dict
+            self.pending_nccl_state_dict = state_dict
             metadata = [(name, str(param.dtype), tuple(param.shape)) for name, param in state_dict.items()]
 
             # Check gathered state_dict (CPU copies) for NaN before broadcasting.
@@ -943,7 +943,7 @@ class COMMON:
             For gloo: uses torch.distributed.broadcast with CPU tensors.
             For nccl: uses PyNcclCommunicator.broadcast with GPU tensors.
         '''
-        state_dict = getattr(self, '_pending_nccl_state_dict', None)
+        state_dict = getattr(self, 'pending_nccl_state_dict', None)
         if not state_dict:
             return 0
 
@@ -975,7 +975,9 @@ class COMMON:
         elapsed = time.time() - start
         print(f"[Alg:{self.alg_name}][Rank 0] Weight broadcast {num_params} params in {elapsed:.2f}s", flush=True)
 
-        del self._pending_nccl_state_dict
+        # Release the gathered state dict to free ~28GB CPU memory.
+        # Also cleans up if gather was called but broadcast was never reached.
+        self.pending_nccl_state_dict = None
         return num_params
 
     def close_weight_nccl_group(self):

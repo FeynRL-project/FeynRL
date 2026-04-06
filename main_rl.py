@@ -1059,6 +1059,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
         iter_train_start = time.time()
         if not training_done and shard_refs is not None:
             while train_step_count < steps_per_epoch:
+                # dict[str, float]: averaged metrics across engines
                 train_metrics = run_training_step(engines=training_engines,
                                                   shard_refs=shard_refs,
                                                   logger=logger,
@@ -1079,6 +1080,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                        step=global_step)
 
                 # ESS-driven early stop
+                # (bool, float): ess_value can be None for non-P3O algorithms
                 should_stop, ess = check_ess_sync(train_metrics, train_step_count,
                                                   ess_sync_threshold, fixed_sync_interval,
                                                   sync_triggered_this_epoch)
@@ -1108,10 +1110,12 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                 # Mid-training chunk cycling: if the in-flight chunk finished
                 # while we were training, finalize it now and dispatch the next
                 # one so rollout engines stay busy instead of idling.
+                # chunk_is_ready: True if all futures in chunk are resolved
                 if pending_chunk is not None and chunk_is_ready(pending_chunk):
                     logger.info(f"[Epoch {epoch+1}] Chunk {pending_chunk.chunk_idx + 1}/{total_chunks} "
                                 f"finalized mid-training, replay buffer: {len(replay_buffer)} samples")
 
+                    # (ChunkFuture|None, int): (next pending chunk, updated chunk_idx)
                     pending_chunk, chunk_idx = cycle_chunk(pending_chunk=pending_chunk,
                                                            replay_buffer=replay_buffer,
                                                            dataloader_iter=dataloader_iter,
@@ -1124,6 +1128,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                                            logger=logger,
                                                            rollout_timeout=rollout_timeout)
 
+                    # (shard_refs, buf_len, rebuild_count, batches) or None if skipped
                     result = try_rebuild_shards(replay_buffer=replay_buffer,
                                                 train_batch_size=train_batch_size,
                                                 num_engines=num_engines,
@@ -1154,6 +1159,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                             f"on {len(replay_buffer)} replay samples")
 
                 while drain_steps_taken < drain_step_limit:
+                    # dict[str, float]: averaged metrics across engines
                     train_metrics = run_training_step(engines=training_engines,
                                                       shard_refs=shard_refs,
                                                       logger=logger,
@@ -1175,6 +1181,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                            step=global_step)
 
                     # ESS/fixed_sync check
+                    # (bool, float): ess_value can be None for non-P3O algorithms
                     should_stop, ess = check_ess_sync(train_metrics,
                                                       train_step_count,
                                                       ess_sync_threshold,
@@ -1194,6 +1201,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                         break
 
                     # Mid-drain chunk cycling: finalize ready chunks and dispatch next
+                    # chunk_is_ready returns bool, cycle_chunk returns (ChunkFuture|None, int)
                     if pending_chunk is not None and chunk_is_ready(pending_chunk):
                         logger.info(f"[Epoch {epoch+1}] Chunk finalized mid-drain, "
                                     f"replay buffer: {len(replay_buffer)} samples")
@@ -1209,6 +1217,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                                                logger=logger,
                                                                rollout_timeout=rollout_timeout)
 
+                        # (shard_refs, buf_len, rebuild_count, batches) or None if skipped
                         result = try_rebuild_shards(replay_buffer=replay_buffer,
                                                     train_batch_size=train_batch_size,
                                                     num_engines=num_engines,
@@ -1230,6 +1239,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
         # In training mode (training_done=False), we dispatch at the bottom
         # of the loop (step 3.5) so training overlaps in the next iteration.
         if training_done and not ess_break:
+            # ChunkFuture or None if dataloader exhausted
             lookahead = dispatch_one_chunk(dataloader_iter=dataloader_iter,
                                            rollout_engines=rollout_engines,
                                            epoch=epoch,
@@ -1251,6 +1261,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
             is_ready = chunk_is_ready(pending_chunk)
             logger.info(f"[Epoch {epoch+1}] Step 3.2: finalizing chunk {pending_chunk.chunk_idx}, "
                         f"ready={is_ready}, dispatched {time.time() - pending_chunk.dispatch_time:.1f}s ago")
+            # dict: accumulated rollout stats for this chunk
             cs = finalize_chunk(chunk=pending_chunk,
                                 replay_buffer=replay_buffer,
                                 logger=logger,
@@ -1265,6 +1276,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                         f"replay buffer: {len(replay_buffer)} samples")
 
             # Rebuild training shards when new data arrives (force=True at loop boundary).
+            # (shard_refs, buf_len, rebuild_count, batches) or None if skipped
             result = try_rebuild_shards(replay_buffer=replay_buffer,
                                         train_batch_size=train_batch_size,
                                         num_engines=num_engines,
@@ -1300,6 +1312,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
             try:
                 logger.info(f"[Epoch {epoch+1}] NCCL sync at chunk boundary "
                             f"(v{rollout_policy_version} -> v{policy_version})")
+                # (bool, finalize futures which is list[ObjectRef])
                 _, finalize_refs = sync_weights_nccl(training_engines=training_engines,
                                                      rollout_engines=rollout_engines,
                                                      version=policy_version,
@@ -1331,6 +1344,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
         elif not training_done:
             # Training mode: dispatch now. Training will overlap with this
             # chunk's generation in the next loop iteration.
+            # ChunkFuture or None if dataloader exhausted
             pending_chunk = dispatch_one_chunk(dataloader_iter=dataloader_iter,
                                                rollout_engines=rollout_engines,
                                                epoch=epoch,
@@ -1351,6 +1365,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
     # prompts, few chunks). The interleaved loop above consumed as many steps
     # as it could; this block handles the remainder up to steps_per_epoch.
     if not training_done and len(replay_buffer) >= train_batch_size:
+        # (shard_refs, buf_len, rebuild_count, batches) or None if skipped
         result = try_rebuild_shards(replay_buffer, train_batch_size, num_engines, seed,
                                     epoch * total_chunks, shard_buffer_size, shard_rebuild_count,
                                     force=(shard_refs is None))
@@ -1366,6 +1381,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
 
         # run training steps
         while train_step_count < steps_per_epoch:
+            # dict[str, float]: averaged metrics across engines
             train_metrics = run_training_step(training_engines, shard_refs,
                                                logger=logger,
                                                train_step_timeout=train_step_timeout)
@@ -1385,6 +1401,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                    step=global_step)
 
             # ESS check in bulk mode, as all chunks finalized, engines idle
+            # (bool, float): ess_value can be None for non-P3O algorithms
             should_break, ess = check_ess_sync(train_metrics, train_step_count,
                                                 ess_sync_threshold, fixed_sync_interval,
                                                 sync_triggered_this_epoch)
@@ -1395,6 +1412,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                     version_bumped_early = True
 
                 try:
+                    # (bool, list[ObjectRef])
                     _, finalize_refs = sync_weights_nccl(training_engines=training_engines,
                                                          rollout_engines=rollout_engines,
                                                          version=policy_version,

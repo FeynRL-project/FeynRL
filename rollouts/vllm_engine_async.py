@@ -15,7 +15,7 @@ from misc.metrics import compute_pass_metrics
 from misc.nccl_utils import create_nccl_process_group
 from rollouts.base import Base
 
-@ray.remote
+@ray.remote(concurrency_groups={"health": 1})
 class VLLMRolloutEngineAsync(Base):
     def __init__(self,
                  seed: int,
@@ -238,187 +238,297 @@ class VLLMRolloutEngineAsync(Base):
                 generated_outputs = self.run_async(self.generate_all(prompts, self.sampling_params))
                 self.log(f"Generation complete for {len(prompts)} prompts with policy version {policy_version}")
 
-                # generated_outputs has prompt_ids and other outputs
-                # this works even if n_samples >= 1
-                rollout_samples = []
-                batch_num_prompts = 0
-                batch_num_passes_at_ks = {i: 0.0 for i in range(1, self.n_samples + 1)}
-                batch_num_passes_caret_k = 0.0
-                batch_pass_rate_sum = 0.0
-                batch_prompt_reward_sum = 0.0
-                batch_best_of_k_reward_sum = 0.0
-                batch_reward_std_sum = 0.0
+                return self.postprocess_outputs(prompts=prompts,
+                                                 generated_outputs=generated_outputs,
+                                                 current_iter=current_iter,
+                                                 policy_version=policy_version,
+                                                 log_batch_metrics=log_batch_metrics)
 
-                # If the reward function exposes a batch interface, score all
-                # (prompt, response) pairs in one call so the reward function
-                # can submit all work to its process pool before blocking.
-                # This lets e.g. math_verify run 8 verifications concurrently
-                # instead of sequentially submitting and waiting one at a time.
-                all_pairs = [(pd, resp) for pd, data_item in zip(prompts, generated_outputs)
-                             for resp in data_item.outputs]
-                if hasattr(self.reward_func, 'batch'):
-                    all_rewards = self.score_responses_batch(all_pairs)
-                else:
-                    all_rewards = [self.score_response(p, r) for p, r in all_pairs]
-                reward_idx = 0
+    def submit_generation(self, prompts, current_iter, policy_version):
+        '''
+            Schedule generation on the background event loop and return a
+            concurrent.futures.Future immediately. The prompts are submitted
+            to vLLM's AsyncLLM right away — they join the running continuous
+            batch as soon as the loop scheduler picks them up. This is the
+            pipeline path used by run_pull_loop to overlap shard N+1's
+            generation with shard N's await + post-processing.
 
-                for prompt_data, data in zip(prompts, generated_outputs):
-                    group_samples = []
-                    group_stats   = {'rewards': [], 'lengths': [], 'correct_threshold': []}
-                    prompt_ids = list(data.prompt_token_ids or [])
-                    prompt_len = len(prompt_ids)
-                    if prompt_len == 0:
-                        raise ValueError(f"No prompt token ids found in generated output: {data}")
+            All validation, version checks, and seed rotation happen here so
+            failures surface at submit time, not when complete_generation is
+            called.
+        '''
+        if not isinstance(prompts, list) or len(prompts) == 0:
+            raise TypeError(f"prompts must be a non-empty list, got {type(prompts)}")
 
-                    # process generated responses
-                    for response in data.outputs:
-                        response_ids = list(response.token_ids)
-                        response_len = len(response_ids)
-                        finish_reason = getattr(response, "finish_reason", None)
-                        stop_reason   = getattr(response, "stop_reason", None)
+        if self.force_strict_on_policy and abs(int(policy_version) - int(self.loaded_version)) > 1:
+            raise ValueError(f"Off-policy rollout: policy_version={int(policy_version)} "
+                             f"but loaded_version={int(self.loaded_version)} (lag > 1). ")
 
-                        # all have length [T] and token_aligned as described above
-                        seq_len = prompt_len + response_len
-                        input_ids = torch.tensor(prompt_ids + response_ids, dtype=torch.int64, device='cpu')
+        assert self.async_engine is not None, f"{self.model_path} not loaded."
 
-                        token_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        token_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        token_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
+        epoch_offset = (current_iter + 1) * 1000000000
+        if self.batch_invariant:
+            self.sampling_params.seed = self.seed + epoch_offset
+        else:
+            self.sampling_params.seed = self.seed + self.engine_id * 1000 + epoch_offset
 
-                        # prediction-level
-                        pred_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        pred_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        pred_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
+        # Schedule on the background event loop and return immediately. The
+        # AsyncLLM.generate calls inside generate_all start running as soon
+        # as the loop picks them up — they don't wait for us to call
+        # future.result(). This is what enables shard-boundary pipelining.
+        future = asyncio.run_coroutine_threadsafe(self.generate_all(prompts, self.sampling_params), self._loop)
+        return future
 
-                        rewards       = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
-                        pred_rewards  = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
+    def complete_generation(self, future, prompts, current_iter, policy_version, log_batch_metrics=False):
+        '''
+            Wait on a Future returned by submit_generation, then run the full
+            post-processing pipeline as logprob extraction, etc. Returns rollout_samples ready
+            for results_queue.
+        '''
+        generated_outputs = future.result()
+        return self.postprocess_outputs(prompts=prompts,
+                                        generated_outputs=generated_outputs,
+                                        current_iter=current_iter,
+                                        policy_version=policy_version,
+                                        log_batch_metrics=log_batch_metrics)
 
-                        rewards_resp, is_per_token, correct_threshold = all_rewards[reward_idx]
-                        reward_idx += 1
-                        rewards[prompt_len:] = rewards_resp
-                        # correct_threshold must be collected from all responses, including empty
-                        # correct_threshold is required in pass@k calculation
-                        group_stats['correct_threshold'].append(correct_threshold)
+    def postprocess_outputs(self, prompts, generated_outputs, current_iter, policy_version, log_batch_metrics=False):
+        '''
+            Post-process raw outputs into rollout samples: build
+            token-aligned and prediction-aligned tensors, score rewards,
+            normalize, and compute pass@k metrics.
+        '''
+        # generated_outputs has prompt_ids and other outputs
+        # this works even if n_samples >= 1
+        rollout_samples = []
+        batch_num_prompts = 0
+        batch_num_passes_at_ks = {i: 0.0 for i in range(1, self.n_samples + 1)}
+        batch_num_passes_caret_k = 0.0
+        batch_pass_rate_sum = 0.0
+        batch_prompt_reward_sum = 0.0
+        batch_best_of_k_reward_sum = 0.0
+        batch_reward_std_sum = 0.0
 
-                        if response_len > 0:
-                            # is_per_token is False, then rewards_resp will only have value for the last element
-                            group_stats['rewards'].append(rewards_resp.sum().item())
-                            group_stats['lengths'].append(len(response_ids))
-                            if response.logprobs is None:
-                                raise ValueError("response.logprobs is None. Check if SamplingParams(logprobs=1) is set.")
+        # If the reward function exposes a batch interface, score all
+        # (prompt, response) pairs in one call so the reward function
+        # can submit all work to its process pool before blocking.
+        # This lets e.g. math_verify run 8 verifications concurrently
+        # instead of sequentially submitting and waiting one at a time.
+        all_pairs = [(pd, resp) for pd, data_item in zip(prompts, generated_outputs) for resp in data_item.outputs]
+        if hasattr(self.reward_func, 'batch'):
+            all_rewards = self.score_responses_batch(all_pairs)
 
-                            #####
-                            # token-aligned
-                            #####
-                            token_masks[prompt_len:] = 1 # 1 if valid token which we want to update.
-                            response_logprobs, nan_mask = self.extract_logprobs(response_ids, response.logprobs)
-                            token_old_logprobs[prompt_len:] = response_logprobs
-                            token_masks[prompt_len:] = token_masks[prompt_len:] * (~nan_mask).to(token_masks.dtype)
-                            #####
-                            # pred-aligned
-                            #####
-                            # To recall how autoregressive models work:
-                            # - response token j is at token index prompt_len + j in input_ids
-                            # - and this is predicted by logits index prompt_len + j - 1
-                            # pred_aligned which would be one we will use in policy update
-                            # and to avoid any weired indexing later in the training loop.
-                            pred_start = prompt_len - 1
-                            pred_end   = seq_len - 1
-                            pred_masks[pred_start:pred_end] = 1
-                            pred_masks[pred_start:pred_end] = pred_masks[pred_start:pred_end] * (~nan_mask).to(pred_masks.dtype)
-                            pred_old_logprobs[pred_start:pred_end] = response_logprobs
-                            pred_rewards[pred_start:pred_end] = rewards[prompt_len:]
+        else:
+            all_rewards = [self.score_response(p, r) for p, r in all_pairs]
+        reward_idx = 0
 
-                            # Terminal handling:
-                            #  1. stop: ended due to EOS or a stop condition so done should be 1.
-                            #  2. length: truncated which should not be done=1 and we need to bootstrap
-                            if finish_reason == "stop":
-                                token_dones[seq_len - 1] = 1
+        for prompt_data, data in zip(prompts, generated_outputs):
+            group_samples = []
+            group_stats   = {'rewards': [], 'lengths': [], 'correct_threshold': []}
+            prompt_ids = list(data.prompt_token_ids or [])
+            prompt_len = len(prompt_ids)
+            if prompt_len == 0:
+                raise ValueError(f"No prompt token ids found in generated output: {data}")
 
-                                # pred-aligned terminal is at the logit index that predicts last token
-                                # seq_len >= 2 is guaranteed since prompt_len >= 1 and response_len >= 1
-                                pred_dones[seq_len - 2] = 1
+            # process generated responses
+            for response in data.outputs:
+                response_ids = list(response.token_ids)
+                response_len = len(response_ids)
+                finish_reason = getattr(response, "finish_reason", None)
+                stop_reason   = getattr(response, "stop_reason", None)
 
-                            # if stop_reason is None, it means it ended on eos
-                            # see here https://docs.vllm.ai/en/stable/api/vllm/outputs/#vllm.outputs.CompletionOutput
-                            eos_in_tokens = (response_ids[-1] == self.eos_id)
-                            ended_on_eos  = (finish_reason == "stop" and stop_reason is None and eos_in_tokens)
+                # all have length [T] and token_aligned as described above
+                seq_len = prompt_len + response_len
+                input_ids = torch.tensor(prompt_ids + response_ids, dtype=torch.int64, device='cpu')
 
-                            group_samples.append({ "iter": int(current_iter),
-                                                "policy_version": int(policy_version),
-                                                "loaded_version": int(self.loaded_version),
+                token_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                token_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                token_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
-                                                # token-aligned
-                                                "input_ids": input_ids, #[T]
-                                                "token_rewards": rewards, #[T]
-                                                "token_zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
-                                                "token_masks": token_masks, #[T] 1 on response/valid tokens
-                                                "token_dones": token_dones, #[T] 1 on last token if terminal
-                                                "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
+                # prediction-level
+                pred_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                pred_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
+                pred_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
-                                                # pred-aligned
-                                                "pred_rewards": pred_rewards, #[T]
-                                                "pred_masks": pred_masks, #[T]
-                                                "pred_dones": pred_dones, #[T]
-                                                "pred_old_logprobs": pred_old_logprobs, #[T]
-                                                "pred_zscores": pred_rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
+                rewards       = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
+                pred_rewards  = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
-                                                "finish_reason": finish_reason,
-                                                "stop_reason": stop_reason,
-                                                "ended_on_eos": ended_on_eos,
+                rewards_resp, is_per_token, correct_threshold = all_rewards[reward_idx]
+                reward_idx += 1
+                rewards[prompt_len:] = rewards_resp
+                # correct_threshold must be collected from all responses, including empty
+                # correct_threshold is required in pass@k calculation
+                group_stats['correct_threshold'].append(correct_threshold)
 
-                                                "response_ids": response_ids, # list[int]
-                                                "prompt_ids": prompt_ids, # list[int]
-                                                "response_text": getattr(response, "text", ""),
-                                                "response_len": response_len,
-                                                "truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
-                                                    })
-                    self.normalize_rewards(samples=group_samples,
-                                           stats=group_stats,
-                                           prompt_len=prompt_len,
-                                           is_per_token=is_per_token)
+                if response_len > 0:
+                    # is_per_token is False, then rewards_resp will only have value for the last element
+                    group_stats['rewards'].append(rewards_resp.sum().item())
+                    group_stats['lengths'].append(len(response_ids))
+                    if response.logprobs is None:
+                        raise ValueError("response.logprobs is None. Check if SamplingParams(logprobs=1) is set.")
 
-                    # compute pass@k metrics and update related variables
-                    assert len(set(group_stats['correct_threshold'])) == 1, 'all correct_thresholds should be the same from a reward function'
-                    correct_threshold = group_stats['correct_threshold'][0]
-                    pass_at_k_metrics = compute_pass_metrics(group_stats['rewards'], n_total=self.n_samples,
-                                                             correct_threshold=correct_threshold)
+                    #####
+                    # token-aligned
+                    #####
+                    token_masks[prompt_len:] = 1 # 1 if valid token which we want to update.
+                    response_logprobs, nan_mask = self.extract_logprobs(response_ids, response.logprobs)
+                    token_old_logprobs[prompt_len:] = response_logprobs
+                    token_masks[prompt_len:] = token_masks[prompt_len:] * (~nan_mask).to(token_masks.dtype)
+                    #####
+                    # pred-aligned
+                    #####
+                    # To recall how autoregressive models work:
+                    # - response token j is at token index prompt_len + j in input_ids
+                    # - and this is predicted by logits index prompt_len + j - 1
+                    # pred_aligned which would be one we will use in policy update
+                    # and to avoid any weired indexing later in the training loop.
+                    pred_start = prompt_len - 1
+                    pred_end   = seq_len - 1
+                    pred_masks[pred_start:pred_end] = 1
+                    pred_masks[pred_start:pred_end] = pred_masks[pred_start:pred_end] * (~nan_mask).to(pred_masks.dtype)
+                    pred_old_logprobs[pred_start:pred_end] = response_logprobs
+                    pred_rewards[pred_start:pred_end] = rewards[prompt_len:]
 
-                    batch_num_prompts += 1
-                    for i in range(1, self.n_samples + 1):
-                        batch_num_passes_at_ks[i] += pass_at_k_metrics['pass_at_ks'].get(i, 0.0)
+                    # Terminal handling:
+                    #  1. stop: ended due to EOS or a stop condition so done should be 1.
+                    #  2. length: truncated which should not be done=1 and we need to bootstrap
+                    if finish_reason == "stop":
+                        token_dones[seq_len - 1] = 1
 
-                    batch_num_passes_caret_k += pass_at_k_metrics['pass_caret_k']
-                    batch_pass_rate_sum += pass_at_k_metrics['pass_rate']
-                    batch_prompt_reward_sum += pass_at_k_metrics['group_mean_reward']
-                    batch_best_of_k_reward_sum += pass_at_k_metrics['best_of_k_reward']
-                    batch_reward_std_sum += pass_at_k_metrics['reward_std_per_prompt']
+                        # pred-aligned terminal is at the logit index that predicts last token
+                        # seq_len >= 2 is guaranteed since prompt_len >= 1 and response_len >= 1
+                        pred_dones[seq_len - 2] = 1
 
-                    for s in group_samples:
-                        s["pass_at_ks"] = pass_at_k_metrics['pass_at_ks']
-                        s["pass_caret_k"] = pass_at_k_metrics['pass_caret_k']
-                        s["pass_rate"] = pass_at_k_metrics['pass_rate']
-                        s["k"] = pass_at_k_metrics['k']
-                        s["group_mean_reward"] = pass_at_k_metrics['group_mean_reward']
-                        s["best_of_k_reward"] = pass_at_k_metrics['best_of_k_reward']
-                        s["reward_std_per_prompt"] = pass_at_k_metrics['reward_std_per_prompt']
+                    # if stop_reason is None, it means it ended on eos
+                    # see here https://docs.vllm.ai/en/stable/api/vllm/outputs/#vllm.outputs.CompletionOutput
+                    eos_in_tokens = (response_ids[-1] == self.eos_id)
+                    ended_on_eos  = (finish_reason == "stop" and stop_reason is None and eos_in_tokens)
 
-                    rollout_samples.extend(group_samples)
+                    group_samples.append({ "iter": int(current_iter),
+                                        "policy_version": int(policy_version),
+                                        "loaded_version": int(self.loaded_version),
 
-                if log_batch_metrics and batch_num_prompts > 0:
-                    pass_at_k_items = ", ".join(
-                        f"avg_pass@{i}={batch_num_passes_at_ks[i] / batch_num_prompts:.4f}"
-                        for i in range(1, self.n_samples + 1)
-                    )
-                    self.log(f"Batch metrics: prompts={batch_num_prompts}, "
-                             f"{pass_at_k_items}, "
-                             f"avg_pass^k={batch_num_passes_caret_k / batch_num_prompts:.4f}, "
-                             f"avg_pass_rate={batch_pass_rate_sum / batch_num_prompts:.4f}, "
-                             f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
-                             f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
-                             f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}")
+                                        # token-aligned
+                                        "input_ids": input_ids, #[T]
+                                        "token_rewards": rewards, #[T]
+                                        "token_zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
+                                        "token_masks": token_masks, #[T] 1 on response/valid tokens
+                                        "token_dones": token_dones, #[T] 1 on last token if terminal
+                                        "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
 
-                return rollout_samples
+                                        # pred-aligned
+                                        "pred_rewards": pred_rewards, #[T]
+                                        "pred_masks": pred_masks, #[T]
+                                        "pred_dones": pred_dones, #[T]
+                                        "pred_old_logprobs": pred_old_logprobs, #[T]
+                                        "pred_zscores": pred_rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
+
+                                        "finish_reason": finish_reason,
+                                        "stop_reason": stop_reason,
+                                        "ended_on_eos": ended_on_eos,
+
+                                        "response_ids": response_ids, # list[int]
+                                        "prompt_ids": prompt_ids, # list[int]
+                                        "response_text": getattr(response, "text", ""),
+                                        "response_len": response_len,
+                                        "truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                            })
+
+            self.normalize_rewards(samples=group_samples, stats=group_stats, prompt_len=prompt_len, is_per_token=is_per_token)
+
+            # compute pass@k metrics and update related variables
+            assert len(set(group_stats['correct_threshold'])) == 1, 'all correct_thresholds should be the same from a reward function'
+            correct_threshold = group_stats['correct_threshold'][0]
+            pass_at_k_metrics = compute_pass_metrics(group_stats['rewards'], n_total=self.n_samples, correct_threshold=correct_threshold)
+
+            batch_num_prompts += 1
+            for i in range(1, self.n_samples + 1):
+                batch_num_passes_at_ks[i] += pass_at_k_metrics['pass_at_ks'].get(i, 0.0)
+
+            batch_num_passes_caret_k += pass_at_k_metrics['pass_caret_k']
+            batch_pass_rate_sum      += pass_at_k_metrics['pass_rate']
+            batch_prompt_reward_sum  += pass_at_k_metrics['group_mean_reward']
+            batch_best_of_k_reward_sum += pass_at_k_metrics['best_of_k_reward']
+            batch_reward_std_sum       += pass_at_k_metrics['reward_std_per_prompt']
+
+            for s in group_samples:
+                s["pass_at_ks"]   = pass_at_k_metrics['pass_at_ks']
+                s["pass_caret_k"] = pass_at_k_metrics['pass_caret_k']
+                s["pass_rate"] = pass_at_k_metrics['pass_rate']
+                s["k"] = pass_at_k_metrics['k']
+                s["group_mean_reward"] = pass_at_k_metrics['group_mean_reward']
+                s["best_of_k_reward"]  = pass_at_k_metrics['best_of_k_reward']
+                s["reward_std_per_prompt"] = pass_at_k_metrics['reward_std_per_prompt']
+
+            rollout_samples.extend(group_samples)
+
+        if log_batch_metrics and batch_num_prompts > 0:
+            pass_at_k_items = ", ".join(f"avg_pass@{i}={batch_num_passes_at_ks[i] / batch_num_prompts:.4f}" for i in range(1, self.n_samples + 1))
+            self.log(f"Batch metrics: prompts={batch_num_prompts}, "
+                     f"{pass_at_k_items}, "
+                     f"avg_pass^k={batch_num_passes_caret_k / batch_num_prompts:.4f}, "
+                     f"avg_pass_rate={batch_pass_rate_sum / batch_num_prompts:.4f}, "
+                     f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
+                     f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
+                     f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}")
+
+        return rollout_samples
+
+    def run_pull_loop(self, prompt_queue, results_queue, epoch, policy_version):
+        '''
+            Pull shards from prompt_queue, generate completions, push results
+            to results_queue. Exits when it pulls a POISON_PILL sentinel.
+
+            Pipelined: one shard is always in-flight on vllm. Each iteration
+            pulls a new shard, submits it (its requests join the running
+            continuous batch immediately), then awaits + post-processes the
+            PREVIOUS shard. The batch never drains down to long-tail prompts
+            between shards — eliminates the shard-boundary throughput gap.
+
+            Stop protocol: the driver pushes exactly num_engines POISON_PILL
+            sentinels via fill_prompt_queue (end-of-epoch) or
+            stop_engines_and_drain (inline sync). Each engine consumes one
+            pill, drains its pending shard, and exits. The try/finally
+            guarantees the pending shard is flushed even on exception or
+            unexpected exit, so no work is lost.
+        '''
+        POISON = "__STOP__"
+        batches_done = 0
+        pending = None  # (future, prompts) or None
+
+        def flush(p):
+            '''
+                Await + post-process one pending shard, push to results_queue.
+            '''
+            nonlocal batches_done
+            if p is None:
+                return
+            results = self.complete_generation(future=p[0], prompts=p[1], current_iter=epoch, policy_version=policy_version)
+            results_queue.put(results)
+            batches_done += 1
+
+        try:
+            while True:
+                shard = prompt_queue.get(block=True)
+                if isinstance(shard, str) and shard == POISON:
+                    break
+                # Submit the new shard FIRST (its requests join the running
+                # batch immediately), then flush the previous shard while
+                # the new one is generating in the background. Clear
+                # pending BEFORE flush so a flush failure doesn't leave
+                # the same bad shard for finally to retry.
+                new_future = self.submit_generation(prompts=shard, current_iter=epoch, policy_version=policy_version)
+                to_flush, pending = pending, None
+                flush(to_flush)
+                pending = (new_future, shard)
+        finally:
+            # Flush the trailing pending shard. We let exceptions propagate so
+            # the driver's ray.get(pull_refs) sees real failures instead of
+            # silently losing the last shard. If the loop body already
+            # raised, Python's exception chaining will surface both.
+            flush(pending)
+
+        return batches_done
 
     async def generate_all(self, prompts, sampling_params):
         '''
@@ -503,9 +613,31 @@ class VLLMRolloutEngineAsync(Base):
         self.log(f"Weights updated to version {version}")
         return True
 
+    @ray.method(concurrency_group="health")
     def ping(self):
         '''
-            Lightweight readiness check. Returns True if the actor can process calls.
+            Runs in the health concurrency group so it can answer even when the default mailbox is blocked
+            on a long-running run_pull_loop or complete_generation. Without this group, ping would queue behind
+            a slow generate() call and time out, causing the driver to falsely flag a busy-but-alive engine
+            as dead and hard-crash the job.
+
+            Returns True if the actor process is alive and Python is responsive.
+            Does NOT verify that vllm is making progress, only that the actor is reachable.
+        '''
+        return True
+
+    def ping_mailbox(self):
+        '''
+            Unlike ping(), which runs in the health concurrency group and bypasses the mailbox FIFO, this
+            method runs in the default group and queues behind any in-flight run_pull_loop or generate() call.
+            If the actor's main thread is wedged in a vllm internal hang or a permanently stuck generate,
+            this call will time out, letting the driver distinguish
+            "actor process alive but mailbox stuck" from "actor process
+            dead" and from "actor process alive and responsive".
+            Combined with ping(), the driver classifies engines as:
+              ping=ok, ping_mailbox=ok       -> fully alive
+              ping=ok, ping_mailbox=timeout  -> mailbox wedged (treat as dead)
+              ping=timeout                   -> process dead
         '''
         return True
 
@@ -560,7 +692,7 @@ class VLLMRolloutEngineAsync(Base):
             self.log(f"Rollout weight sync initialized in EngineCore subprocess (backend={backend}, mechanism={mechanism})")
             return all(r for r in results if r is not None)
 
-    def receive_all_weights_nccl(self, param_metadata, barrier=None):
+    def receive_all_weights_nccl(self, param_metadata):
         '''
             Receive ALL weight tensors via NCCL broadcast in a single method call.
             This avoids firing 340 separate .remote() calls per engine.
@@ -568,9 +700,6 @@ class VLLMRolloutEngineAsync(Base):
             calling NCCL broadcast for each param in lockstep with the sender.
             param_metadata: list of (name, dtype_str, shape) tuples from
                             gather_weights_for_nccl on training rank 0.
-            barrier: optional NCCLBarrier actor handle. If provided, the engine
-                     signals readiness before entering the NCCL loop, so the
-                     driver knows when it's safe to start the training broadcast.
         '''
         if getattr(self, '_nccl_in_actor', False):
             dtype_map = { "torch.float16": torch.float16,
@@ -583,11 +712,6 @@ class VLLMRolloutEngineAsync(Base):
             num_params = len(param_metadata)
             backend = self.weight_sync_backend
             buf_device = "cuda" if backend == "nccl" else "cpu"
-
-            # Signal the barrier so the driver knows this engine is ready
-            # before entering the broadcast loop.
-            if barrier is not None:
-                ray.get(barrier.signal_ready.remote())
 
             for i, (name, dtype_str, shape) in enumerate(param_metadata):
                 target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
@@ -605,11 +729,6 @@ class VLLMRolloutEngineAsync(Base):
             # collective_rpc round-trip that can deadlock when ZMQ message delivery
             # serializes the NCCL collectives across 398+ params.
             num_params = len(param_metadata)
-
-            # Signal the barrier so the driver knows this engine is ready
-            # before entering the broadcast loop.
-            if barrier is not None:
-                ray.get(barrier.signal_ready.remote())
 
             # Convert tuples to ensure serializable metadata
             serializable_metadata = [(name, dtype_str, tuple(shape)) for name, dtype_str, shape in param_metadata]

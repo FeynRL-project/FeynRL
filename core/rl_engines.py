@@ -16,6 +16,7 @@ import time
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from data_feeds.mixed_sampler import create_prompt_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, ray_get_with_timeout, set_random_seeds, get_determinism_env_vars
+from misc.nccl_env import nccl_watchdog_env_vars
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.vllm_engine_async import VLLMRolloutEngineAsync
 import misc.rollout_stats as rollout_stats
@@ -84,6 +85,9 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                     # is managed by pytorch's caching allocator. Prevents allocator
                     # conflicts that cause cache flushes and param buffer corruption.
                     "NCCL_CUMEM_ENABLE": "0",
+                    # NCCL watchdog: abort wedged collectives after timeout
+                    # so the job fails fast instead of hanging the GPU stream.
+                    **nccl_watchdog_env_vars(),
                     }
 
         # NCCL env vars
@@ -147,6 +151,9 @@ def create_rollout_engines(params, reward_fnc, eos_id):
                             "CUBLAS_WORKSPACE_CONFIG": cublas_workspace,
                             "PYTHONHASHSEED": str(params.run.seed),
                             "NCCL_CUMEM_ENABLE": "0",
+                            # NCCL watchdog: abort wedged collectives after
+                            # timeout so the job fails fast instead of hanging.
+                            **nccl_watchdog_env_vars(),
                            }
         # The goal of batch_invariant is topology-invariance. it means that
         # same prompt → same output regardless of engine count

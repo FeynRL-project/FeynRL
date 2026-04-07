@@ -3,7 +3,52 @@ Backend, PrefixStore, _new_process_group_helper, _world
     )
 from torch.distributed import TCPStore
 from datetime import timedelta
-import ray
+
+
+def is_nccl_fatal_error(exc):
+    '''
+        Pattern-match an exception to detect NCCL communicator destruction.
+        Returns True if the comm is no longer usable and any retry will
+        immediately re-raise — i.e. the job must fail fast rather than
+        looping over a dead pg.
+        Used by the async engine's sync_weights_nccl callers to distinguish
+        recoverable failures (partial load on one engine, transient network
+        blip during gather) from fatal ones (watchdog-induced ncclCommAbort,
+        hardware/network errors that destroyed the communicator).
+        Async mode has no reinit_nccl_weight_sync_group runtime path, so a
+        fatal error means the job must fail. Caller is expected to re-raise
+        when this returns True.
+    '''
+    # Substrings that indicate the NCCL communicator was destroyed by the
+    # watchdog (TORCH_NCCL_ASYNC_ERROR_HANDLING) or otherwise made unusable.
+    # Kept inside the function so the constant is colocated with its only
+    # use site.
+    fatal_patterns = ("communicator was aborted",
+                      "communicator is aborted",
+                      "ncclcommabort",
+                      "communicator is destroyed",
+                      "nccl error",
+                      "internal error",
+                      "nccl unhandled cuda error",
+                      "watchdog caught collective operation timeout",
+                      # ray_get_with_timeout wraps GetTimeoutError as
+                      # "<description> timed out after Xs. Check actor logs for OOM,
+                      # GPU faults, or NCCL hangs." A Ray-side timeout on a nccl
+                      # collective means the collective is wedged on the worker's CUDA
+                      # stream, we cannot reuse the comm even if NCCL_TIMEOUT hasn't
+                      # fired yet. Treat as fatal so the job exits cleanly instead of
+                      # waiting another ~30 minutes for NCCL_TIMEOUT to abort the comm.
+                      "timed out after",
+                      # ray_get_with_timeout also wraps RayActorError as
+                      # "<description> failed because a Ray actor died: ...". A dead
+                      # actor mid-sync means the NCCL group has lost a rank, which is
+                      # unrecoverable in async mode (no reinit_nccl_weight_sync_group
+                      # path).
+                      "ray actor died",
+                      "actor died",
+                      )
+    msg = str(exc).lower()
+    return any(p in msg for p in fatal_patterns)
 
 def create_nccl_process_group(init_method, rank, world_size, group_name, timeout_seconds, backend="nccl"):
     '''
@@ -58,23 +103,3 @@ def create_nccl_process_group(init_method, rank, world_size, group_name, timeout
     # resolve rank numbers within this group
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
     return pg
-
-@ray.remote
-class NCCLBarrier:
-    '''
-        Lightweight barrier for synchronizing nccl broadcast participants.
-        Each rollout engine signals ready from inside receive_all_weights_nccl
-        BEFORE entering the NCCL broadcast loop. The driver polls get_count()
-        and only fires the training broadcast once all engines have signaled.
-        This replaces the unreliable time.sleep() approach.
-    '''
-    def __init__(self, expected):
-        self.expected = expected
-        self.count = 0
-
-    def signal_ready(self):
-        self.count += 1
-        return self.count
-
-    def get_count(self):
-        return self.count

@@ -56,7 +56,11 @@ def _collect_module_level_names(tree):
 def _collect_assigned_names(node):
     '''
         All names written (Store context) anywhere inside an AST subtree,
-        including function params and exception handler names.
+        including function params, exception handler names, and names
+        introduced by `import X` / `from X import Y` statements that
+        appear inside the subtree (e.g. conditional imports inside an
+        `if` block — used by main_rl.py to dispatch to the async/sync
+        engine).
     '''
     names = set()
     for child in ast.walk(node):
@@ -72,6 +76,12 @@ def _collect_assigned_names(node):
                 names.add(child.args.kwarg.arg)
         elif isinstance(child, ast.ExceptHandler) and child.name:
             names.add(child.name)
+        elif isinstance(child, ast.Import):
+            for alias in child.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(child, ast.ImportFrom):
+            for alias in child.names:
+                names.add(alias.asname or alias.name)
     return names
 
 

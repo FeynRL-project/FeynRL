@@ -15,7 +15,7 @@ from misc.metrics import compute_pass_metrics
 from misc.nccl_utils import create_nccl_process_group
 from rollouts.base import Base
 
-@ray.remote(concurrency_groups={"health": 1})
+@ray.remote(concurrency_groups={"health": 1, "pull": 1})
 class VLLMRolloutEngineAsync(Base):
     def __init__(self,
                  seed: int,
@@ -474,6 +474,7 @@ class VLLMRolloutEngineAsync(Base):
 
         return rollout_samples
 
+    @ray.method(concurrency_group="pull")
     def run_pull_loop(self, prompt_queue, results_queue, epoch, policy_version):
         '''
             Pull shards from prompt_queue, generate completions, push results
@@ -626,18 +627,30 @@ class VLLMRolloutEngineAsync(Base):
         '''
         return True
 
+    @ray.method(concurrency_group="pull")
     def ping_mailbox(self):
         '''
-            Unlike ping(), which runs in the health concurrency group and bypasses the mailbox FIFO, this
-            method runs in the default group and queues behind any in-flight run_pull_loop or generate() call.
-            If the actor's main thread is wedged in a vllm internal hang or a permanently stuck generate,
-            this call will time out, letting the driver distinguish
-            "actor process alive but mailbox stuck" from "actor process
-            dead" and from "actor process alive and responsive".
-            Combined with ping(), the driver classifies engines as:
+            Runs in the "pull" concurrency_group (max_concurrency=1) so it
+            queues behind any in-flight run_pull_loop. If the pull thread
+            is wedged (vllm internal hang inside complete_generation,
+            permanently stuck generate, etc.), this call times out, letting
+            the driver detect the wedge.
+            Without this group decorator, ping_mailbox would run on the
+            default actor thread which is independent of the pull thread,
+            and it would always return True even when the pull loop is
+            stuck, leading the driver to relaunch run_pull_loop behind
+            the wedged call and hang forever.
+            Combined with ping() (which runs in the "health" group and
+            bypasses all mailboxes), the driver classifies engines as:
               ping=ok, ping_mailbox=ok       -> fully alive
-              ping=ok, ping_mailbox=timeout  -> mailbox wedged (treat as dead)
+              ping=ok, ping_mailbox=timeout  -> pull thread wedged (treat as dead)
               ping=timeout                   -> process dead
+
+            Driver-side timeout for this call (see check_rollout_engines_health
+            in run_rl_async.py) must exceed the longest legitimate
+            single-shard processing time, including the reward function's
+            worst-case wall-clock cap, otherwise false positives fire on
+            slow reward functions like math_verify.
         '''
         return True
 
@@ -717,6 +730,18 @@ class VLLMRolloutEngineAsync(Base):
                 target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
                 buffer = torch.empty(tuple(shape), dtype=target_dtype, device=buf_device)
                 torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
+                # Receiver-side nan/inf check. Must NOT raise mid-loop or the
+                # collective wedges the sender, skip the tensor instead and we let
+                # finalize_weight_nccl detect the count mismatch as a partial load.
+                if not torch.isfinite(buffer).all():
+                    num_bad = (~torch.isfinite(buffer)).sum().item()
+                    print(f"[VLLMEngineAsync][Engine {self.engine_id}] "
+                          f"receive_all_weights_nccl: NaN/Inf in '{name}' "
+                          f"(dtype={dtype_str} shape={tuple(shape)}, "
+                          f"{num_bad} bad elements). Skipping load — "
+                          f"finalize will report partial load.", flush=True)
+                    del buffer
+                    continue
                 # Move to CPU for later loading via update_weights_direct
                 self._nccl_state_dict[name] = buffer.cpu() if buffer.is_cuda else buffer
                 del buffer
@@ -756,6 +781,19 @@ class VLLMRolloutEngineAsync(Base):
             buf_device = "cuda" if self.weight_sync_backend == "nccl" else "cpu"
             buffer = torch.empty(tuple(shape), dtype=target_dtype, device=buf_device)
             torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
+
+            # Receiver-side nan/inf check. Skip-and-continue rather than raise so the
+            # collective stays consistent; finalize will detect the count
+            # mismatch as a partial load.
+            if not torch.isfinite(buffer).all():
+                num_bad = (~torch.isfinite(buffer)).sum().item()
+                print(f"[VLLMEngineAsync][Engine {self.engine_id}] "
+                      f"update_weights_nccl: NaN/Inf in '{param_name}' "
+                      f"(dtype={dtype_str} shape={tuple(shape)}, "
+                      f"{num_bad} bad elements). Skipping.", flush=True)
+                del buffer
+
+                return [0]
 
             # Accumulate for bulk loading in finalize_weight_nccl.
             # Move to CPU since update_weights_direct expects CPU tensors.

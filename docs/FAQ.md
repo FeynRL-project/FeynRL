@@ -30,7 +30,7 @@ That said, FeynRL includes an **overlap engine** that provides a practical middl
 
 ## How does the overlap engine work, and when should I use it?
 
-The overlap engine (`run_epoch_overlap` in `main_rl.py`) interleaves rollout generation and training within a single epoch, dispatching generation in small chunks while training runs concurrently on already-collected data. It uses ESS (Effective Sample Size) to adaptively trigger weight syncs only when the policy has diverged enough, rather than on a fixed schedule. For a full description of the mechanisms (chunk-based dispatch, ESS-driven sync, staleness control, fallback chain) and guidance on when to use each mode, see the [Architecture Overview](./ARCHITECTURE.md#-trainingrollout-scheduling).
+The overlap engine runs rollout generation and training concurrently within a single epoch. It uses a queue-pull architecture: the driver fills a shared Ray prompt queue at the start of each epoch and rollout engines self-schedule by pulling from it, while the driver drains results between training steps. Mid-epoch weight sync is triggered by ESS (for P3O) or a fixed step interval (for PPO/GRPO/CISPO). For a full description of the mechanisms (queue-pull, pipelined generation, mid-epoch NCCL sync, staleness control, pre-launched next epoch) and guidance on when to use each mode, see the [Architecture Overview](./ARCHITECTURE.md#-trainingrollout-scheduling).
 
 ## Other frameworks include many system improvements. Why don't you include them?
 

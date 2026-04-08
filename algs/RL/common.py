@@ -836,6 +836,19 @@ class COMMON:
         if rank == 0 and self.peft_config.use_peft:
             try:
                 state_dict = self.merge_peft_state_dict(state_dict)
+                # Post-merge guard: every peft-prefixed name must be gone.
+                # If any lora_A/lora_B/base_layer/base_model.* keys survive,
+                # vllm's load_weights will silently skip them, sync would
+                # complete with adapter weights stranded on the trainer.
+                residual = [k for k in state_dict
+                            if 'lora_A' in k or 'lora_B' in k
+                            or '.base_layer.' in k or k.startswith('base_model.')]
+                if residual:
+                    ok = False
+                    print(f"[Alg:{self.alg_name}][Rank {rank}] PEFT merge left "
+                          f"{len(residual)} unmerged keys (sample: {residual[:5]}). "
+                          f"vLLM would silently drop these — aborting sync.")
+
             except Exception as e:
                 ok = False
                 print(f"[Alg:{self.alg_name}][Rank {rank}] Error merging PEFT state_dict: {e}")
@@ -919,16 +932,21 @@ class COMMON:
                                f"GatheredParameters corrupted the model.")
 
         if rank == 0 and state_dict:
-            self.pending_nccl_state_dict = state_dict
-            metadata = [(name, str(param.dtype), tuple(param.shape)) for name, param in state_dict.items()]
-
-            # Check gathered state_dict (CPU copies) for NaN before broadcasting.
+            # Check gathered state_dict (CPU copies) for NaN BEFORE storing it as
+            # pending_nccl_state_dict. If we stored first and then raised, the
+            # huge dict would leak on rank 0 because the driver-issued
+            # clear_pending_nccl_state_dict may itself time out.
             nan_in_sync = [name for name, param in state_dict.items()
                            if param.numel() > 0 and torch.isnan(param).any()]
             if nan_in_sync:
+                # Drop the local reference.
+                del state_dict
                 raise RuntimeError(f"[Alg:{self.alg_name}][Rank 0] NaN in {len(nan_in_sync)} params "
                                    f"gathered for weight sync: {nan_in_sync[:10]}. "
                                    f"Aborting broadcast to prevent corrupting rollout engines.")
+
+            self.pending_nccl_state_dict = state_dict
+            metadata = [(name, str(param.dtype), tuple(param.shape)) for name, param in state_dict.items()]
 
             print(f"[Alg:{self.alg_name}][Rank 0] Gathered {len(metadata)} params for NCCL broadcast", flush=True)
             return metadata
@@ -957,35 +975,36 @@ class COMMON:
         backend = self.weight_sync_backend
         use_pynccl = (backend == "nccl")
 
-        # Drain rank 0's queued cuda kernels (gather, nan check) before issuing
-        # on the weight-sync pg, otherwise they could interleave with the
-        # broadcast on the same stream and hit a cross-pg ordering hazard.
-        # Do NOT use dist.barrier(), this runs only on rank 0.
-        if use_pynccl:
-            torch.cuda.synchronize()
-
-        for i, name in enumerate(param_names):
-            param = state_dict[name]
+        # this guarantees release of the huge CPU state dict on raise
+        # (NCCL timeout, network glitch, etc), driver-issued cleanup
+        # can itself time out, leaking huge memory per failed sync.
+        try:
+            # Do NOT use dist.barrier(), this runs only on rank 0.
             if use_pynccl:
-                send_buf = param.to(device=device, non_blocking=True) if not param.is_cuda else param.contiguous()
-                self.weight_sync_pynccl.broadcast(send_buf, src=0, stream=torch.cuda.current_stream())
+                torch.cuda.synchronize()
 
-            else:
-                send_buf = param.cpu() if param.is_cuda else param.contiguous()
-                torch.distributed.broadcast(send_buf, src=0, group=self.weight_sync_group)
-            del send_buf
+            for i, name in enumerate(param_names):
+                param = state_dict[name]
+                if use_pynccl:
+                    send_buf = param.to(device=device, non_blocking=True) if not param.is_cuda else param.contiguous()
+                    self.weight_sync_pynccl.broadcast(send_buf, src=0, stream=torch.cuda.current_stream())
 
-        # Ensure all NCCL broadcasts complete before releasing state dict
-        if use_pynccl:
-            torch.cuda.synchronize()
+                else:
+                    send_buf = param.cpu() if param.is_cuda else param.contiguous()
+                    torch.distributed.broadcast(send_buf, src=0, group=self.weight_sync_group)
+                del send_buf
 
-        elapsed = time.time() - start
-        print(f"[Alg:{self.alg_name}][Rank 0] Weight broadcast {num_params} params in {elapsed:.2f}s", flush=True)
+            # Ensure all NCCL broadcasts complete before releasing state dict
+            if use_pynccl:
+                torch.cuda.synchronize()
 
-        # Release the gathered state dict to free ~28GB CPU memory.
-        # Also cleans up if gather was called but broadcast was never reached.
-        self.pending_nccl_state_dict = None
-        return num_params
+            elapsed = time.time() - start
+            print(f"[Alg:{self.alg_name}][Rank 0] Weight broadcast {num_params} params in {elapsed:.2f}s", flush=True)
+            return num_params
+
+        finally:
+            self.pending_nccl_state_dict = None
+            state_dict = None
 
     def clear_pending_nccl_state_dict(self):
         '''
@@ -1055,13 +1074,17 @@ class COMMON:
         '''
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
-        # Create the directory from inside the actor (rank 0) rather than from the driver
-        # to avoid NFS metadata propagation races on multi-node clusters.
+        # Create dir on rank 0 to avoid NFS metadata propagation races.
+        mkdir_ok = True
         if rank == 0:
-            os.makedirs(engine_state_dir, exist_ok=True)
+            try:
+                os.makedirs(engine_state_dir, exist_ok=True)
 
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+            except Exception as e:
+                print(f"[Alg:{self.alg_name}][Rank 0] Failed to create engine_state_dir "
+                      f"{engine_state_dir}: {e}", flush=True)
+                mkdir_ok = False
+        self.barrier_with_error_check(mkdir_ok)
 
         client_state = {'rng_python': random.getstate(),
                         'rng_numpy': np.random.get_state(),

@@ -194,7 +194,8 @@ def drain_results_blocking(results_queue, replay_buffer, remaining, logger, time
         Blocking drain: wait for remaining results after pull loops finish.
         Uses a single wall-clock deadline (not a per-item timeout) so a stuck
         queue fails fast instead of waiting timeout * remaining seconds.
-        Returns accumulated stats.
+        Returns (drained_count, accumulated stats). drained_count <= remaining
+        on timeout.
     '''
     acc = rollout_stats.new_accumulator()
     deadline = time.time() + timeout
@@ -222,10 +223,11 @@ def drain_results_blocking(results_queue, replay_buffer, remaining, logger, time
         replay_buffer.add_batch_seqs(merged)
         rollout_stats.accumulate(acc, stats)
         drained_here += 1
-    return acc
+    return drained_here, acc
 
 def wait_for_first_rollouts(results_queue, replay_buffer, rollout_acc,
-                             generation_start_time, rollout_timeout, epoch, logger):
+                             generation_start_time, rollout_timeout, epoch,
+                             logger, pull_refs):
     '''
         Cold-start: block on results_queue until first result arrives,
         then drain any extras. Bounded by remaining rollout_timeout.
@@ -236,14 +238,24 @@ def wait_for_first_rollouts(results_queue, replay_buffer, rollout_acc,
     deadline = generation_start_time + rollout_timeout
     last_log = time.time()
     first = None
-    # Cap each get at 30s so we wake periodically to log progress —
-    # otherwise long cold-start waits look like silent hangs.
+    # Cap each get at 30s so we wake periodically to log progress and
+    # check pull_refs for early engine deaths, otherwise a cold-start
+    # crash would silently wait the full rollout_timeout.
     while first is None:
         time_left = deadline - time.time()
         if time_left <= 0:
             raise TimeoutError(f"[Epoch {epoch+1}] No training data after "
                                f"{rollout_timeout}s — empty dataloader, "
                                f"buffer below train_batch_size, or stuck engines")
+        # Early-detect dead engines: if any pull_ref has resolved before
+        # producing a result, ray.get propagates RayActorError immediately.
+        # If it returned cleanly, the engine exited without producing
+        # data (empty dataloader edge case), we keep waiting for the
+        # rollout_timeout to fire with the proper error.
+        if pull_refs:
+            ready, _ = ray.wait(pull_refs, num_returns=len(pull_refs), timeout=0)
+            if ready:
+                ray.get(ready)
         try:
             first = results_queue.get(block=True, timeout=min(time_left, 30.0))
         except RayQueueEmpty:
@@ -321,10 +333,10 @@ def compute_results_queue_maxsize(num_rollout_engines, max_lag):
         Bounded results_queue size: roughly max_lag epochs of unread results
         across all engines. When full, engines back-pressure on put().
     '''
-    # 8 is arbitrary slack at this moment. Will examine this further, but not sure if i need to add
-    # as config param at this moment. 8 means each engine has enough room for one full complete_generation
+    # 32 is arbitrary at this moment. Will examine this further, but not sure if i need to add
+    # as config param at this moment. 32 means each engine has enough room for one full complete_generation
     # worth of results plus several more in flight.
-    return max(num_rollout_engines * max(2, max_lag) * 8, num_rollout_engines * 8)
+    return max(num_rollout_engines * max(2, max_lag) * 32, num_rollout_engines * 32)
 
 def prelaunch_next_epoch(epoch, number_of_epochs, num_rollout_engines, max_lag,
                           rollout_dataloader, rollout_engines,
@@ -347,6 +359,13 @@ def prelaunch_next_epoch(epoch, number_of_epochs, num_rollout_engines, max_lag,
     if epoch + 1 >= number_of_epochs:
         return None
 
+    # Track partial state so a failure mid-setup can be cleanly torn down.
+    # Without this, an exception in fill_prompt_queue or run_pull_loop.remote
+    # would leak the queue actors and any already-dispatched pull loops,
+    # leaving engines blocked on get() forever.
+    next_prompt_queue = None
+    next_results_queue = None
+    next_pull_refs = []
     try:
         next_results_queue_maxsize = compute_results_queue_maxsize(num_rollout_engines, max_lag)
         next_prompt_queue = RayQueue(maxsize=0)
@@ -354,9 +373,9 @@ def prelaunch_next_epoch(epoch, number_of_epochs, num_rollout_engines, max_lag,
         rollout_dataloader.batch_sampler.set_epoch(epoch + 1)
 
         next_total_shards = fill_prompt_queue(rollout_dataloader, rollout_engines, next_prompt_queue, logger)
-        next_pull_refs = [eng.run_pull_loop.remote(next_prompt_queue, next_results_queue, epoch + 1, rollout_policy_version) 
+        next_pull_refs = [eng.run_pull_loop.remote(next_prompt_queue, next_results_queue, epoch + 1, rollout_policy_version)
                                                    for eng in rollout_engines]
-        
+
         logger.info(f"[Epoch {epoch+1}] Pre-launched epoch {epoch+2}: "
                     f"{next_total_shards} shards enqueued, "
                     f"{num_rollout_engines} pull loops running in background "
@@ -369,6 +388,13 @@ def prelaunch_next_epoch(epoch, number_of_epochs, num_rollout_engines, max_lag,
 
     except Exception as e:
         logger.warning(f"[Epoch {epoch+1}] Pre-launch of epoch {epoch+2} failed: {e}. Next epoch will cold-start as usual.")
+        # Tear down any partially-created state so we don't leak queue
+        # actors or orphan pull loops blocked on the queue forever.
+        if next_prompt_queue is not None or next_pull_refs:
+            partial_state = {'prefilled_prompt_queue':  next_prompt_queue,
+                             'prefilled_results_queue': next_results_queue,
+                             'prefilled_pull_refs':     next_pull_refs}
+            teardown_prelaunched(partial_state, num_rollout_engines, logger)
         return None
 
 def teardown_prelaunched(prelaunched_state, num_rollout_engines, logger):
@@ -410,10 +436,13 @@ def teardown_prelaunched(prelaunched_state, num_rollout_engines, logger):
 
 def check_rollout_engines_health(rollout_engines):
     '''
-        Two-stage ping: process alive (concurrency_group) + mailbox
-        responsive (default group). Returns list of (idx, reason) for
-        dead engines, empty list if all healthy.
+        Two-stage ping: process alive (health) + pull thread responsive
+        (pull concurrency_group, queues behind run_pull_loop). Returns list
+        of (idx, reason) for dead engines.
+        ping_mailbox timeout must exceed worst-case shard processing time
+        such as reward function wall-clock to avoid false positives.
     '''
+
     dead = []
     for i, eng in enumerate(rollout_engines):
         try:
@@ -422,7 +451,7 @@ def check_rollout_engines_health(rollout_engines):
             dead.append((i, f"health: {e}"))
             continue
         try:
-            ray.get(eng.ping_mailbox.remote(), timeout=30)
+            ray.get(eng.ping_mailbox.remote(), timeout=120)
         except Exception as e:
             dead.append((i, f"mailbox wedged: {e}"))
 
@@ -530,6 +559,9 @@ def perform_inline_sync(epoch, train_step_count, steps_per_epoch, ess,
         rollout_stats.accumulate(rollout_acc, drain_acc)
 
         # Bump version and sync.
+        # training never lags rollout, so if this fails, it's a problem!
+        assert policy_version >= rollout_policy_version, (f"Policy version invariant violated: policy_version={policy_version} "
+                                                          f"< rollout_policy_version={rollout_policy_version}")
         if policy_version == rollout_policy_version:
             policy_version += 1
             version_bumped_early = True
@@ -539,10 +571,10 @@ def perform_inline_sync(epoch, train_step_count, steps_per_epoch, ess,
         try:
             logger.info(f"[Epoch {epoch+1}] NCCL sync (v{rollout_policy_version} -> v{policy_version})")
             sync_weights_nccl(training_engines=training_engines,
-                            rollout_engines=rollout_engines,
-                            version=policy_version,
-                            logger=logger,
-                            sync_timeout=sync_timeout)
+                              rollout_engines=rollout_engines,
+                              version=policy_version,
+                              logger=logger,
+                              sync_timeout=sync_timeout)
 
             rollout_policy_version = policy_version
             sync_triggered_this_epoch = True
@@ -561,6 +593,16 @@ def perform_inline_sync(epoch, train_step_count, steps_per_epoch, ess,
                             f"FATAL communicator error: {e}. No runtime reinit "
                             f"path in async mode — aborting.")
                 raise
+            # Non-fatal sync error to verify engines responsive before continuing.
+            # A wedged engine would otherwise queue the next run_pull_loop behind
+            # the broken broadcast and hang until NCCL_TIMEOUT.
+            dead_engines = check_rollout_engines_health(rollout_engines)
+            if dead_engines:
+                raise RuntimeError(f"[Epoch {epoch+1}] Inline NCCL sync failed "
+                                   f"AND engines unresponsive: {dead_engines}. "
+                                   f"Aborting to avoid silent hang on the next "
+                                   f"sync attempt.")
+
             logger.warning(f"[Epoch {epoch+1}] Inline NCCL sync failed: {e}. "
                         f"Engines will resume with stale weights; end-of-epoch "
                         f"sync will retry.")
@@ -650,6 +692,10 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
     epoch_metrics    = {}
     train_step_count = 0
     sync_triggered_this_epoch = False
+    # train_step_count when the latest inline sync fired, none if no sync
+    # this epoch. This is to detect post-sync drift: if more steps
+    # ran after the inline sync, end-of-epoch sync is still needed.
+    last_sync_step = None
     version_bumped_early = False
     shard_refs           = None
     shard_buffer_size    = 0
@@ -660,14 +706,22 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
 
     while train_step_count < steps_per_epoch:
         # 4a. Drain available results non-blocking
-        # (int, RolloutStats)
+        logger.info(f"[DEBUG][Epoch {epoch+1}] iter start: train_step={train_step_count}/"
+                    f"{steps_per_epoch}, buffer={len(replay_buffer)}, "
+                    f"shard_refs={'set' if shard_refs is not None else 'None'}")
+        t0 = time.time()
         drained, drain_acc = drain_results(results_queue, replay_buffer)
         total_drained     += drained
         rollout_stats.accumulate(rollout_acc, drain_acc)
+        logger.info(f"[DEBUG][Epoch {epoch+1}] 4a drain_results done in {time.time()-t0:.2f}s, "
+                    f"drained={drained}, total_drained={total_drained}")
 
         # 4b. Rebuild shards if buffer grew enough or first time after data arrives.
         # try_rebuild_shards adds shard_rebuild_count internally as the per-rebuild offset.
         if drained > 0 or shard_refs is None:
+            t0 = time.time()
+            logger.info(f"[DEBUG][Epoch {epoch+1}] 4b try_rebuild_shards START "
+                        f"(buffer={len(replay_buffer)})")
             # this is training shards
             result = try_rebuild_shards(replay_buffer=replay_buffer,
                                         train_batch_size=train_batch_size,
@@ -678,6 +732,8 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                         shard_rebuild_count=shard_rebuild_count,
                                         min_new_samples=train_batch_size * num_train_engines,
                                         force=(shard_refs is None and len(replay_buffer) >= train_batch_size))
+            logger.info(f"[DEBUG][Epoch {epoch+1}] 4b try_rebuild_shards done in "
+                        f"{time.time()-t0:.2f}s, result={'shards built' if result else 'None'}")
             if result:
                 shard_refs, shard_buffer_size, shard_rebuild_count, _, rebuild_ms = result
                 if tracker:
@@ -686,23 +742,34 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                     tracker.log_metrics({"train/rebuild_ms":  rebuild_ms, "train/rebuild_buf": shard_buffer_size,}, step=global_step)
 
         # 4c. Cold-start wait: if there are no shards yet, block on results_queue (event-driven)
-        # instead of polling. The driver has nothing else to do here. Rollout engines 
+        # instead of polling. The driver has nothing else to do here. Rollout engines
         # run as independent Ray actors so this block does NOT slow down generation.
         if shard_refs is None:
+            t0 = time.time()
+            logger.info(f"[DEBUG][Epoch {epoch+1}] 4c wait_for_first_rollouts START "
+                        f"(buffer={len(replay_buffer)} < batch={train_batch_size})")
             total_drained += wait_for_first_rollouts(results_queue=results_queue,
                                                     replay_buffer=replay_buffer,
                                                     rollout_acc=rollout_acc,
                                                     generation_start_time=generation_start_time,
                                                     rollout_timeout=rollout_timeout,
                                                     epoch=epoch,
-                                                    logger=logger)
+                                                    logger=logger,
+                                                    pull_refs=pull_refs)
+            logger.info(f"[DEBUG][Epoch {epoch+1}] 4c wait_for_first_rollouts done in "
+                        f"{time.time()-t0:.2f}s, buffer={len(replay_buffer)}")
             continue
 
         # 4d. Run one training step
+        t0 = time.time()
+        logger.info(f"[DEBUG][Epoch {epoch+1}] 4d run_training_step START "
+                    f"(shards built, train_step={train_step_count+1}/{steps_per_epoch})")
         train_metrics = run_training_step(engines=training_engines,
                                           shard_refs=shard_refs,
                                           logger=logger,
                                           train_step_timeout=train_step_timeout)
+        logger.info(f"[DEBUG][Epoch {epoch+1}] 4d run_training_step done in "
+                    f"{time.time()-t0:.2f}s")
         for k, v in train_metrics.items():
             epoch_metrics.setdefault(k, []).append(v)
         global_step += 1
@@ -749,6 +816,8 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
         # Only the end-of-epoch sync is skipped on the last epoch, since there is no next epoch to consume the new weights.
         if should_sync:
             inline_sync_start = time.time()
+            logger.info(f"[DEBUG][Epoch {epoch+1}] 4e perform_inline_sync START "
+                        f"(ess={ess}, train_step={train_step_count}/{steps_per_epoch})")
             sync_state = perform_inline_sync(epoch=epoch,
                                              train_step_count=train_step_count,
                                              steps_per_epoch=steps_per_epoch,
@@ -775,7 +844,15 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
 
             if sync_state['sync_triggered_this_epoch']:
                 sync_triggered_this_epoch = True
+                # Record sync step so main can detect post-sync drift and still
+                # fire EoE sync when more training steps ran after this inline sync.
+                last_sync_step = train_step_count
+
             inline_sync_ms = (time.time() - inline_sync_start) * 1000.0
+            logger.info(f"[DEBUG][Epoch {epoch+1}] 4e perform_inline_sync done in "
+                        f"{inline_sync_ms/1000:.2f}s, "
+                        f"should_continue={sync_state['should_continue']}, "
+                        f"sync_triggered={sync_state['sync_triggered_this_epoch']}")
 
             if tracker:
                 # Total inline sync wall time (drain + broadcast + relaunch).
@@ -790,8 +867,12 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
     # 5. If pull loops are still running, push poison pills to make them exit once remaining real
     # shards are consumed, drain results while waiting, and surface any exceptions. When pull_refs
     # is empty (e.g. inline sync drained on the final training step), there's nothing to wait for.
+    logger.info(f"[DEBUG][Epoch {epoch+1}] STEP 5 START (training loop exited at "
+                f"train_step={train_step_count}/{steps_per_epoch}, "
+                f"pull_refs={'set' if pull_refs else 'empty'})")
     pull_loop_ok = True
     if pull_refs:
+        t0 = time.time()
         pull_loop_ok, drained_during_wait = stop_pull_loops_and_check(pull_refs=pull_refs,
                                                                       prompt_queue=prompt_queue,
                                                                       results_queue=results_queue,
@@ -801,6 +882,8 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                                                                       timeout=rollout_timeout,
                                                                       logger=logger,
                                                                       push_pills=True)
+        logger.info(f"[DEBUG][Epoch {epoch+1}] STEP 5 stop_pull_loops_and_check done in "
+                    f"{time.time()-t0:.2f}s, ok={pull_loop_ok}, drained_during_wait={drained_during_wait}")
         total_drained += drained_during_wait
         if not pull_loop_ok:
             logger.error(f"[Epoch {epoch+1}] End-of-epoch pull-loop drain FAILED. "
@@ -813,23 +896,33 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
                          f"training step.")
 
     # 6. Drain any remaining results. Skip the blocking drain when pull_loop_ok is False: a stuck/dead engine
-    # means the missing results will never arrive, and waiting the full rollout_timeout (e.g. 3600s) before main() 
+    # means the missing results will never arrive, and waiting the full rollout_timeout (e.g. 3600s) before main()
     # raises just stalls the failure for an hour. main() will raise on the dead engine anyway.
+    logger.info(f"[DEBUG][Epoch {epoch+1}] STEP 6 START (drain remaining results, "
+                f"total_drained={total_drained}/{total_shards})")
+    t0 = time.time()
     drained, drain_acc = drain_results(results_queue, replay_buffer)
     total_drained += drained
     rollout_stats.accumulate(rollout_acc, drain_acc)
+    logger.info(f"[DEBUG][Epoch {epoch+1}] STEP 6 non-blocking drain done in "
+                f"{time.time()-t0:.2f}s, +{drained} → total_drained={total_drained}/{total_shards}")
 
     remaining = total_shards - total_drained
     if remaining > 0 and pull_loop_ok:
         logger.info(f"[Epoch {epoch+1}] Blocking drain for {remaining} remaining results")
-        blocking_acc = drain_results_blocking(results_queue=results_queue, 
-                                               replay_buffer=replay_buffer, 
-                                               remaining=remaining,
-                                               logger=logger, 
-                                               timeout=timeout)
+        blocking_drained, blocking_acc = drain_results_blocking(results_queue=results_queue,
+                                                                replay_buffer=replay_buffer,
+                                                                remaining=remaining,
+                                                                logger=logger,
+                                                                timeout=rollout_timeout)
 
         rollout_stats.accumulate(rollout_acc, blocking_acc)
-        total_drained += remaining
+        total_drained += blocking_drained
+        if blocking_drained < remaining:
+            logger.warning(f"[Epoch {epoch+1}] Blocking drain only got "
+                           f"{blocking_drained}/{remaining} missing results "
+                           f"before {rollout_timeout}s timeout. "
+                           f"total_drained={total_drained}/{total_shards}.")
 
     elif remaining > 0:
         logger.warning(f"[Epoch {epoch+1}] Skipping blocking drain for {remaining} "
@@ -839,8 +932,16 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
     logger.info(f"[Epoch {epoch+1}] Generation complete: {total_drained}/{total_shards} shards drained, "
                 f"replay buffer: {len(replay_buffer)} samples")
 
-    # 7. Post-training bookkeeping
-    if train_step_count > 0 and not version_bumped_early:
+    # 7. Post-training bookkeeping. Bump policy_version once per epoch
+    # to reflect the optimizer updates done in this epoch:
+    #   - No inline sync this epoch --> bump (version_bumped_early=False)
+    #   - Inline sync at the LAST step --> already bumped during sync, skip
+    #   - Inline sync mid-epoch with more steps after --> bump again so the
+    #     end-of-epoch sync gate sees the post-sync drift via lag.
+    sync_covers_final_weights = (last_sync_step is not None and
+                                 last_sync_step >= train_step_count)
+
+    if train_step_count > 0 and (not version_bumped_early or not sync_covers_final_weights):
         policy_version += 1
 
     evicted = replay_buffer.evict_stale(policy_version - max_lag)
@@ -867,7 +968,7 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines, rollout_dataload
             'rollout_policy_version': rollout_policy_version,
             'train_step_count': train_step_count,
             'train_time': train_time,
-            'sync_performed': sync_triggered_this_epoch,
+            'sync_performed': sync_covers_final_weights,
             'overlap_interleaved_sec': train_time,
             'overlap_gen_wait_sec': overlap_gen_wait,
             'overlap_ratio': overlap_ratio,
@@ -1200,11 +1301,11 @@ def main(args, config):
                                  "overlap/ratio": o_ratio,
                                 }, step=global_step)
 
-        # If nccl sync was already performed inline, sync_performed is True
+        # If nccl sync was already performed inline, sync_success is True
         # from the result and we skip. Otherwise we check the lag against
         # max_lag and either sync or skip.
-        sync_performed = result['sync_performed']
-        pull_loop_ok   = result.get('pull_loop_ok', True)
+        sync_success = result['sync_performed']
+        pull_loop_ok = result.get('pull_loop_ok', True)
 
         # If any rollout engine is stuck in generate() at end of epoch, its
         # ray mailbox has an in-flight call ahead of any new RPC. We MUST NOT
@@ -1226,6 +1327,7 @@ def main(args, config):
                                    f"after pull-loop drain failure. Dead engines: {dead_engines}. "
                                    f"Cannot continue — a stuck actor would deadlock the next "
                                    f"epoch's NCCL collectives. Restart the job.")
+
             logger.warning(f"[Epoch {epoch+1}] All engines responded to BOTH "
                            f"pings (process alive AND mailbox responsive); "
                            f"continuing into next epoch with stale weights. "
@@ -1264,6 +1366,14 @@ def main(args, config):
                                      f"failed with FATAL communicator error: {e}. "
                                      f"The weight-sync pg cannot be reused. Aborting.")
                         raise
+                    # Non-fatal: verify engines responsive before next epoch.
+                    # Catches wedged engines that would hang the next epoch's sync.
+                    dead_engines = check_rollout_engines_health(rollout_engines)
+                    if dead_engines:
+                        raise RuntimeError(f"[Epoch {epoch+1}] End-of-epoch NCCL sync failed "
+                                           f"AND engines unresponsive: {dead_engines}. Aborting "
+                                           f"to avoid silent hang on the next sync attempt.")
+
                     logger.error(f"[Epoch {epoch+1}] NCCL sync failed: {e}. "
                                  f"Engines will keep stale weights; lag will grow "
                                  f"until next end-of-epoch sync attempt.")

@@ -135,6 +135,7 @@ class WeightSyncExtension:
 
         use_pynccl = (self.weight_sync_backend == "nccl")
         num_loaded = 0
+        corrupt_params = []
 
         for name, dtype_str, shape in param_metadata:
             target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
@@ -147,10 +148,30 @@ class WeightSyncExtension:
                 buffer = torch.empty(tuple(shape), dtype=target_dtype, device="cpu")
                 torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
 
+            # Receiver-side verificatioas transport-layer corruption
+            # (NCCL bug, network glitch, CUDA error) can still produce a bad
+            # tensor on the receiver. We do noty raise error here if any. Instead,
+            # we record the corruption, skip the load, and CONTINUE receiving
+            # so the collective completes cleanly. finalize_weight_nccl will then
+            # see num_loaded != expected_params and return False
+            if not torch.isfinite(buffer).all():
+                num_bad = (~torch.isfinite(buffer)).sum().item()
+                corrupt_params.append((name, dtype_str, tuple(shape), num_bad))
+                del buffer
+                continue
+
             self.model_runner.model.load_weights(weights=[(name, buffer)])
             torch.cuda.synchronize()
             del buffer
             num_loaded += 1
+
+        if corrupt_params:
+            print(f"[receive_all_weights_nccl] DETECTED {len(corrupt_params)} "
+                  f"corrupted tensors in broadcast (NaN/Inf): "
+                  f"{[p[0] for p in corrupt_params[:5]]}{'...' if len(corrupt_params) > 5 else ''}. "
+                  f"Skipped load for these — NCCL collective drained cleanly. "
+                  f"finalize_weight_nccl will report partial load to driver.",
+                  flush=True)
 
         return num_loaded
 

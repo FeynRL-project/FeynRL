@@ -957,6 +957,13 @@ class COMMON:
         backend = self.weight_sync_backend
         use_pynccl = (backend == "nccl")
 
+        # Drain rank 0's queued cuda kernels (gather, nan check) before issuing
+        # on the weight-sync pg, otherwise they could interleave with the
+        # broadcast on the same stream and hit a cross-pg ordering hazard.
+        # Do NOT use dist.barrier(), this runs only on rank 0.
+        if use_pynccl:
+            torch.cuda.synchronize()
+
         for i, name in enumerate(param_names):
             param = state_dict[name]
             if use_pynccl:
@@ -979,6 +986,16 @@ class COMMON:
         # Also cleans up if gather was called but broadcast was never reached.
         self.pending_nccl_state_dict = None
         return num_params
+
+    def clear_pending_nccl_state_dict(self):
+        '''
+            Best-effort cleanup called by the driver after a failed inline sync,
+            so the gathered state dict on rank 0 doesn't leak across failed retries.
+            Safe to call on any rank.
+        '''
+        if hasattr(self, 'pending_nccl_state_dict'):
+            self.pending_nccl_state_dict = None
+        return True
 
     def close_weight_nccl_group(self):
         '''

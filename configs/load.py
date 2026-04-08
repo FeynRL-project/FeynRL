@@ -244,10 +244,6 @@ class Overlap(BaseModel):
     enabled: bool  | None = None
     # Max training steps ahead of rollout policy version
     max_lag: int | None = None
-    # Dataloader batches per generation chunk.
-    # One chunk in-flight at a time; smaller = more frequent NCCL sync windows.
-    # =1: max overlap, fastest ESS response. >1: fewer round-trips, coarser sync.
-    chunk_size: int | None = None
     # ESS below this triggers sync between training steps (P3O only)
     ess_sync_threshold: float | None = None
     # Static sync interval in training steps for non-P3O algorithms.
@@ -679,9 +675,15 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 raise ValueError("weight_sync_method must be 'direct', 'disk', or 'nccl'")
 
             overlap_enabled = config.overlap and config.overlap.enabled
+
+            # Async engine only supports nccl weight sync now.
+            if overlap_enabled and weight_sync_method != "nccl":
+                raise ValueError(f"overlap.enabled=True requires weight_sync_method='nccl' "
+                                 f"(got '{weight_sync_method}'). The async engine no longer "
+                                 f"supports direct/disk weight sync.")
             if weight_sync_method == "nccl" and not overlap_enabled:
                 raise ValueError("weight_sync_method 'nccl' requires overlap.enabled=True "
-                                 "(sync rollout engine does not support NCCL)")
+                                 "(sync rollout engine does not support nccl)")
 
             if weight_sync_method == "nccl":
                 nccl_backend = config.run.nccl_sync_backend
@@ -709,6 +711,20 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
             if config.rollout.rollout_batch_size_per_gpu is None or config.rollout.rollout_batch_size_per_gpu < 1:
                 raise ValueError(f"rollout.rollout_batch_size_per_gpu must be >= 1, got {config.rollout.rollout_batch_size_per_gpu}")
+
+            # rollout_samples_per_epoch must produce at least one batch.
+            # The dataloader builds batches of size num_engines * rollout_batch_size_per_gpu
+            # where num_engines = max(1, rollout_gpus // tp). An undersized samples_per_epoch yields 
+            # zero batches -> empty queue -> engines exit immediately on POISON pills -> training stalls until
+            # rollout_timeout fires with a confusing "no training data" error.
+            if config.run.rollout_gpus and config.rollout.tensor_parallel_size:
+                num_rollout_engines = max(1, config.run.rollout_gpus // config.rollout.tensor_parallel_size)
+                min_samples = num_rollout_engines * config.rollout.rollout_batch_size_per_gpu
+                if config.rollout.rollout_samples_per_epoch < min_samples:
+                    raise ValueError(f"rollout.rollout_samples_per_epoch ({config.rollout.rollout_samples_per_epoch}) "
+                                     f"must be >= num_rollout_engines * rollout_batch_size_per_gpu "
+                                     f"({num_rollout_engines} * {config.rollout.rollout_batch_size_per_gpu} = {min_samples}) "
+                                     f"to produce at least one batch per epoch.")
 
             if config.rollout.gpu_memory_utilization is not None and not (0.0 < config.rollout.gpu_memory_utilization <= 1.0):
                 raise ValueError(f"rollout.gpu_memory_utilization must be in (0.0, 1.0], got {config.rollout.gpu_memory_utilization}")
@@ -759,11 +775,9 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.overlap.max_lag is None or config.overlap.max_lag < 1:
                     raise ValueError(f"overlap.max_lag must be >= 1, got {config.overlap.max_lag}")
 
-                if config.overlap.chunk_size is None or config.overlap.chunk_size < 1:
-                    raise ValueError(f"overlap.chunk_size must be >= 1, got {config.overlap.chunk_size}")
-
-                if config.run.weight_sync_method != "nccl":
-                    raise ValueError(f"when overlap is enabled, weight_sync_method must be nccl")
+                if config.run.weight_sync_method not in ("nccl", "direct", "disk"):
+                    raise ValueError(f"weight_sync_method must be one of nccl/direct/disk, "
+                                     f"got {config.run.weight_sync_method}")
 
                 if config.overlap.ess_sync_threshold is None or not (0.0 < config.overlap.ess_sync_threshold <= 1.0):
                     raise ValueError(f"overlap.ess_sync_threshold must be in (0.0, 1.0], got {config.overlap.ess_sync_threshold}")

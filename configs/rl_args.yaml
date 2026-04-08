@@ -41,10 +41,6 @@ overlap:
   enabled: False
   # Max training steps ahead of rollout policy version
   max_lag: 2
-  # Dataloader batches per generation chunk.
-  # One chunk in-flight at a time; smaller = more frequent NCCL sync windows.
-  # 1 means max overlap, fastest ESS response. >1 means fewer round-trips, coarser sync.
-  chunk_size: 1
   # ESS below this triggers sync between training steps (P3O only)
   # lower threshold means more acceptance of offpolicyiness.
   ess_sync_threshold: 0.5

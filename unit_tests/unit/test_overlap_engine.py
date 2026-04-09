@@ -1,11 +1,11 @@
 '''
-    Unit tests for the queue-pull async overlap engine.
+    Unit tests for the queue-pull async overlap engine helpers.
 
-    Replaces the previous tests for the chunk-based dispatch model
-    (ChunkFuture / dispatch_one_chunk / finalize_chunk / cycle_chunk)
-    which no longer exist. The current architecture uses
-    fill_prompt_queue / run_pull_loop / drain_results / poison-pill
-    coordination.
+    The current architecture uses a persistent ShardProducer daemon thread
+    feeding a bounded prompt_queue, run_pull_loop on rollout actors, and
+    drain_results / poison-pill coordination on the driver. The previous
+    chunk-based dispatch model and the pre-launch / teardown_prelaunched
+    helpers no longer exist; their tests have been removed.
 
     Heavy dependencies (ray, deepspeed, transformers) are mocked in
     unit_tests/conftest.py. Functions exercised here are pure-Python
@@ -13,7 +13,7 @@
 '''
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import pytest
 
 # Stub heavy transitive imports BEFORE importing run_rl_async. The conftest
@@ -64,10 +64,10 @@ from run_rl_async import (
     POISON_PILL,
     drain_prompt_queue,
     stop_engines_and_drain,
-    compute_results_queue_maxsize,
+    compute_replay_buffer_size,
+    compute_pipeline_queue_sizes,
     check_ess_sync,
-    teardown_prelaunched,
-    fill_prompt_queue,
+    InfiniteShardIterator,
 )
 from misc.nccl_utils import is_nccl_fatal_error
 from misc.nccl_env import nccl_watchdog_env_vars
@@ -85,7 +85,7 @@ class FakePromptQueue:
     def __init__(self, items=None):
         self._items = list(items or [])
 
-    def put(self, item):
+    def put(self, item, block=True, timeout=None):
         self._items.append(item)
 
     def get(self, block=False, timeout=None):
@@ -119,37 +119,30 @@ class TestPoisonPillConstant:
 # ---------------------------------------------------------------------------
 
 class TestDrainPromptQueue:
-    def test_empty_queue_returns_empty_list(self):
+    def test_empty_queue_returns_zero(self):
         q = FakePromptQueue([])
-        assert drain_prompt_queue(q) == []
+        assert drain_prompt_queue(q) == 0
 
-    def test_only_real_shards(self):
+    def test_drains_real_shards(self):
         shards = [{"id": 0}, {"id": 1}, {"id": 2}]
         q = FakePromptQueue(shards)
-        result = drain_prompt_queue(q)
-        assert result == shards
+        n = drain_prompt_queue(q)
+        assert n == 3
         assert len(q) == 0
 
-    def test_only_pills_returns_empty_list_and_drains(self):
-        '''Pills must be discarded, not returned.'''
+    def test_drains_pills_too(self):
+        '''Pills are dropped along with everything else.'''
         q = FakePromptQueue([POISON_PILL, POISON_PILL, POISON_PILL])
-        result = drain_prompt_queue(q)
-        assert result == []
+        n = drain_prompt_queue(q)
+        assert n == 3
         assert len(q) == 0
 
-    def test_mixed_pills_and_shards_preserves_shard_order(self):
-        '''Real shards must come back in FIFO order; pills discarded.'''
+    def test_mixed_pills_and_shards(self):
         items = [{"a": 0}, POISON_PILL, {"a": 1}, POISON_PILL, {"a": 2}]
         q = FakePromptQueue(items)
-        result = drain_prompt_queue(q)
-        assert result == [{"a": 0}, {"a": 1}, {"a": 2}]
+        n = drain_prompt_queue(q)
+        assert n == 5
         assert len(q) == 0
-
-    def test_drain_does_not_remove_pills_after_get_raises(self):
-        '''If get raises Empty, drain returns whatever it has so far.'''
-        q = FakePromptQueue([{"a": 0}])
-        result = drain_prompt_queue(q)
-        assert result == [{"a": 0}]
 
 
 # ---------------------------------------------------------------------------
@@ -158,54 +151,194 @@ class TestDrainPromptQueue:
 
 class TestStopEnginesAndDrain:
     def test_drains_then_pushes_one_pill_per_engine(self):
-        shards = [{"a": 0}, {"a": 1}]
-        q = FakePromptQueue(shards)
-        leftover = stop_engines_and_drain(q, num_rollout_engines=3)
-        assert leftover == shards
+        q = FakePromptQueue([{"a": 0}, {"a": 1}])
+        stop_engines_and_drain(q, num_rollout_engines=3, logger=MagicMock())
         # After: queue contains exactly 3 pills, no real shards
         snap = q.snapshot()
         assert len(snap) == 3
         assert all(x == POISON_PILL for x in snap)
 
     def test_discards_stale_pills_before_pushing_new(self):
-        '''If a previous round left pills, they should be discarded.'''
+        '''If a previous round left pills, they should be discarded too.'''
         q = FakePromptQueue([POISON_PILL, {"a": 0}, POISON_PILL])
-        leftover = stop_engines_and_drain(q, num_rollout_engines=2)
-        assert leftover == [{"a": 0}]
+        stop_engines_and_drain(q, num_rollout_engines=2, logger=MagicMock())
         snap = q.snapshot()
         assert snap == [POISON_PILL, POISON_PILL]
 
-    def test_empty_queue_yields_empty_leftover_and_pushes_pills(self):
+    def test_empty_queue_pushes_pills(self):
         q = FakePromptQueue([])
-        leftover = stop_engines_and_drain(q, num_rollout_engines=4)
-        assert leftover == []
+        stop_engines_and_drain(q, num_rollout_engines=4, logger=MagicMock())
         assert q.snapshot() == [POISON_PILL] * 4
 
 
 # ---------------------------------------------------------------------------
-# compute_results_queue_maxsize
+# compute_replay_buffer_size
 # ---------------------------------------------------------------------------
 
-class TestComputeResultsQueueMaxsize:
-    def test_minimum_floor(self):
-        '''Even with max_lag=1, each engine should get at least the floor.'''
-        size = compute_results_queue_maxsize(num_rollout_engines=2, max_lag=1)
-        assert size >= 2 * 8  # at least num_engines * 8
+class TestComputeReplayBufferSize:
+    def test_returns_correct_breakdown(self):
+        '''Verifies the additive formula off_policy + consumption.'''
+        size, items_per_epoch, items_per_opt_step, off_policy, consumption = compute_replay_buffer_size(
+            rollout_samples_per_epoch=1024,
+            n_samples=16,
+            max_lag=4,
+            train_batch_size_per_gpu=4,
+            training_gpus=4,
+            gradient_accumulation_steps=2,
+            steps_per_epoch=2,
+        )
+        assert items_per_epoch == 1024 * 16
+        assert items_per_opt_step == 4 * 4 * 2
+        assert off_policy == items_per_epoch * max(2, 4)
+        assert consumption == items_per_opt_step * 2
+        assert size == off_policy + consumption
 
     def test_scales_with_max_lag(self):
-        small = compute_results_queue_maxsize(num_rollout_engines=4, max_lag=2)
-        big   = compute_results_queue_maxsize(num_rollout_engines=4, max_lag=8)
-        assert big >= small
+        '''Larger max_lag → larger off-policy bound → larger total.'''
+        small = compute_replay_buffer_size(1024, 16, 1, 4, 2, 2, 2)[0]
+        big   = compute_replay_buffer_size(1024, 16, 8, 4, 2, 2, 2)[0]
+        assert big > small
 
-    def test_scales_with_num_engines(self):
-        few  = compute_results_queue_maxsize(num_rollout_engines=2, max_lag=4)
-        many = compute_results_queue_maxsize(num_rollout_engines=8, max_lag=4)
+    def test_scales_with_steps_per_epoch(self):
+        '''Larger steps_per_epoch → larger consumption bound → larger total.'''
+        small = compute_replay_buffer_size(1024, 16, 4, 4, 2, 2, 1)[0]
+        big   = compute_replay_buffer_size(1024, 16, 4, 4, 2, 2, 32)[0]
+        assert big > small
+
+    def test_scales_with_rollout_samples_per_epoch(self):
+        '''Larger rollout_samples_per_epoch → larger items_per_epoch → larger off_policy_bound.'''
+        small = compute_replay_buffer_size(256, 16, 4, 4, 2, 2, 2)[0]
+        big   = compute_replay_buffer_size(2048, 16, 4, 4, 2, 2, 2)[0]
+        assert big > small
+
+    def test_max_lag_floor_of_two(self):
+        '''max_lag=1 should be treated as 2 (max(2, max_lag)).'''
+        with_one = compute_replay_buffer_size(1024, 16, 1, 4, 2, 2, 2)[3]
+        with_two = compute_replay_buffer_size(1024, 16, 2, 4, 2, 2, 2)[3]
+        assert with_one == with_two
+
+    def test_buffer_always_at_least_one_optimizer_step(self):
+        '''
+            Structural property of the additive formula: because
+            consumption_bound = items_per_opt_step * steps_per_epoch and
+            steps_per_epoch >= 1, replay_buffer_size is always at least
+            one optimizer step worth of items, regardless of how tiny the
+            rollout side is. Guards against future formula changes that
+            could re-introduce shard-mismatch hazards.
+        '''
+        for n_gpus, batch, ga in [(1, 1, 1), (4, 8, 2), (16, 1024, 8)]:
+            size, _, items_per_opt_step, _, _ = compute_replay_buffer_size(
+                rollout_samples_per_epoch=1,
+                n_samples=1,
+                max_lag=1,
+                train_batch_size_per_gpu=batch,
+                training_gpus=n_gpus,
+                gradient_accumulation_steps=ga,
+                steps_per_epoch=1,
+            )
+            assert size >= items_per_opt_step
+
+
+# ---------------------------------------------------------------------------
+# compute_pipeline_queue_sizes
+# ---------------------------------------------------------------------------
+
+class TestComputePipelineQueueSizes:
+    def test_basic_sizing(self):
+        prompt_q, results_q = compute_pipeline_queue_sizes(
+            num_rollout_engines=4,
+            max_lag=4,
+            rollout_batch_size_per_gpu=8,
+            n_samples=16,
+            replay_buffer_size=2112,
+        )
+        # prompt = num_engines * max(2, max_lag) = 4 * 4 = 16
+        assert prompt_q == 16
+        # results = max(prompt, buffer // items_per_shard)
+        #         = max(16, 2112 // 128) = max(16, 16) = 16
+        assert results_q == 16
+
+    def test_results_queue_at_least_prompt_queue(self):
+        '''results_queue must always be >= prompt_queue.'''
+        for buf_size in [100, 1000, 10000, 100000]:
+            prompt_q, results_q = compute_pipeline_queue_sizes(
+                num_rollout_engines=4, max_lag=4,
+                rollout_batch_size_per_gpu=8, n_samples=16,
+                replay_buffer_size=buf_size,
+            )
+            assert results_q >= prompt_q
+
+    def test_results_queue_scales_with_buffer(self):
+        '''Bigger buffer → bigger results_queue (until prompt floor dominates).'''
+        small = compute_pipeline_queue_sizes(4, 4, 8, 16, 1024)[1]
+        big   = compute_pipeline_queue_sizes(4, 4, 8, 16, 65536)[1]
+        assert big > small
+
+    def test_max_lag_floor_of_two(self):
+        '''Same floor logic as buffer sizing.'''
+        with_one = compute_pipeline_queue_sizes(4, 1, 8, 16, 2000)[0]
+        with_two = compute_pipeline_queue_sizes(4, 2, 8, 16, 2000)[0]
+        assert with_one == with_two
+
+    def test_prompt_queue_scales_with_engines(self):
+        few  = compute_pipeline_queue_sizes(2, 4, 8, 16, 2000)[0]
+        many = compute_pipeline_queue_sizes(16, 4, 8, 16, 2000)[0]
         assert many > few
 
-    def test_returns_positive(self):
-        for n in [1, 2, 8, 32]:
-            for lag in [1, 2, 4]:
-                assert compute_results_queue_maxsize(n, lag) > 0
+
+# ---------------------------------------------------------------------------
+# InfiniteShardIterator
+# ---------------------------------------------------------------------------
+
+class TestInfiniteShardIterator:
+    def test_rejects_empty_dataloader(self):
+        '''Empty dataloader at construction time → fail fast.'''
+        empty = MagicMock()
+        empty.__len__ = lambda self: 0
+        with pytest.raises(ValueError, match="zero batches"):
+            InfiniteShardIterator(dataloader=empty, num_rollout_engines=4)
+
+    def test_yields_shards_then_advances_epoch(self):
+        '''On dataloader exhaustion, increment epoch and reshuffle.'''
+        batch_sampler = MagicMock()
+        batch_sampler.set_epoch = MagicMock()
+        # 2-batch dataloader, each batch is a list of 2 prompts
+        loader = MagicMock()
+        loader.__len__ = lambda self: 2
+        loader.batch_sampler = batch_sampler
+        # iter() returns a fresh iterator each call (mimics DataLoader)
+        loader.__iter__ = lambda self: iter([[{"p": 0}, {"p": 1}],
+                                             [{"p": 2}, {"p": 3}]])
+        it = InfiniteShardIterator(dataloader=loader, num_rollout_engines=2, start_epoch=0)
+        assert it.epoch == 0
+
+        # Each next_shards() returns one batch worth of shards. With
+        # num_rollout_engines=2 and a 2-prompt batch, each call returns
+        # 2 shards of 1 prompt each.
+        shards_a = it.next_shards()
+        shards_b = it.next_shards()
+        assert len(shards_a) == 2
+        assert len(shards_b) == 2
+        assert it.epoch == 0  # still on epoch 0 — both batches consumed but no StopIteration yet
+
+        # The third call exhausts the iterator, triggering reset_for_new_epoch.
+        shards_c = it.next_shards()
+        assert len(shards_c) == 2
+        assert it.epoch == 1
+        # set_epoch was called: once at construction (epoch=0), once on reset (epoch=1)
+        assert batch_sampler.set_epoch.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Removed-symbol coverage
+# ---------------------------------------------------------------------------
+# The following helpers used to be tested here but have been deleted from
+# run_rl_async.py as part of the persistent-queue refactor:
+#   - compute_results_queue_maxsize  (replaced by compute_pipeline_queue_sizes)
+#   - teardown_prelaunched           (no more pre-launch path)
+#   - fill_prompt_queue              (replaced by ShardProducer thread)
+# Their tests were removed. The new helpers above cover the equivalent
+# functionality.
 
 
 # ---------------------------------------------------------------------------
@@ -301,114 +434,6 @@ class TestCheckEssSync:
             sync_triggered_this_epoch=True,
         )
         assert should_sync is True
-
-
-# ---------------------------------------------------------------------------
-# teardown_prelaunched
-# ---------------------------------------------------------------------------
-
-class TestTeardownPrelaunched:
-    def test_none_state_is_noop(self):
-        '''Common case: epoch not pre-launched.'''
-        logger = MagicMock()
-        teardown_prelaunched(None, num_rollout_engines=4, logger=logger)
-        logger.warning.assert_not_called()
-
-    def test_drains_real_shards_then_pushes_pills(self):
-        '''
-            Recent fix: teardown must drain unread shards FIRST so the pills
-            land at the head of the queue. Otherwise pull loops would process
-            every leftover shard before reaching their pill.
-        '''
-        q = FakePromptQueue([{"a": 0}, {"a": 1}, {"a": 2}])
-        with patch.object(run_rl_async, "ray") as mock_ray:
-            mock_ray.wait.return_value = ([], [])
-            teardown_prelaunched(
-                prelaunched_state={
-                    'prefilled_prompt_queue': q,
-                    'prefilled_pull_refs': [MagicMock(), MagicMock()],
-                },
-                num_rollout_engines=2,
-                logger=MagicMock(),
-            )
-        # After teardown, queue should contain only pills (real shards drained)
-        snap = q.snapshot()
-        assert all(x == POISON_PILL for x in snap)
-        assert len(snap) == 2
-
-    def test_handles_missing_keys_gracefully(self):
-        '''A best-effort cleanup must not raise on a partial state dict.'''
-        logger = MagicMock()
-        teardown_prelaunched(
-            prelaunched_state={'prefilled_pull_refs': []},
-            num_rollout_engines=2,
-            logger=logger,
-        )
-        # Should not raise; warning may or may not fire
-
-    def test_swallows_exceptions(self):
-        '''Cleanup is best-effort and must never propagate.'''
-        bad_q = MagicMock()
-        bad_q.get.side_effect = RuntimeError("network down")
-        bad_q.put.side_effect = RuntimeError("network down")
-        logger = MagicMock()
-        with patch.object(run_rl_async, "ray"):
-            teardown_prelaunched(
-                prelaunched_state={
-                    'prefilled_prompt_queue': bad_q,
-                    'prefilled_pull_refs': [],
-                },
-                num_rollout_engines=1,
-                logger=logger,
-            )
-        # No exception escaped
-
-
-# ---------------------------------------------------------------------------
-# fill_prompt_queue
-# ---------------------------------------------------------------------------
-
-class TestFillPromptQueue:
-    def test_all_shards_enqueued_plus_end_of_epoch_pills(self):
-        '''
-            Sharded across engines, every non-empty shard goes to the queue.
-            After all shards, fill_prompt_queue pushes exactly num_engines
-            POISON_PILL sentinels (the explicit "epoch done" signal that
-            replaces the previous 5-second polling timeout in run_pull_loop).
-        '''
-        q = FakePromptQueue()
-        # 2 batches × 2 engines × 2 prompts each = 4 non-empty shards total
-        dataloader = [
-            [{"p": 0}, {"p": 1}, {"p": 2}, {"p": 3}],
-            [{"p": 4}, {"p": 5}, {"p": 6}, {"p": 7}],
-        ]
-        num_engines = 2
-        engines = [MagicMock() for _ in range(num_engines)]
-        logger = MagicMock()
-        total = fill_prompt_queue(dataloader, engines, q, logger)
-        snap = q.snapshot()
-        # total_shards counts only real shards, NOT the trailing pills
-        assert total > 0
-        assert len(snap) == total + num_engines
-        # Pills are at the end, one per engine
-        pill_count = sum(1 for x in snap if x == POISON_PILL)
-        assert pill_count == num_engines
-        assert all(x == POISON_PILL for x in snap[-num_engines:])
-
-    def test_empty_dataloader_yields_zero_shards_but_still_pushes_pills(self):
-        '''
-            Even with no real work, the pills must be pushed so engines
-            (if any are running against this queue) can exit cleanly.
-        '''
-        q = FakePromptQueue()
-        num_engines = 3
-        engines = [MagicMock() for _ in range(num_engines)]
-        logger = MagicMock()
-        total = fill_prompt_queue([], engines, q, logger)
-        assert total == 0
-        snap = q.snapshot()
-        assert len(snap) == num_engines
-        assert all(x == POISON_PILL for x in snap)
 
 
 # ---------------------------------------------------------------------------

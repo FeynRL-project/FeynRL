@@ -1,14 +1,7 @@
-'''
-    Shared RL infrastructure: training/rollout engine factories, weight sync
-    helpers, training step dispatch, and rollout collation. Used by both the
-    sequential (main_rl.py) and queue-driven overlap (future main_rl_overlap.py)
-    entry points. Functions here are exact verbatim copies from main_rl.py;
-    do not modify behavior or formatting in this module.
-'''
 import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import ray
 import time
 
@@ -387,23 +380,85 @@ def collect_rollouts(dataloader,
 
     return rollout_stats.summarize(acc, rollout_time=time.time() - rollout_start_time)
 
-def prepare_training_batches(replay_buffer, batch_size: int, num_engines: int, seed: int = 0, epoch: int = 0) -> list:
+def weighted_sampler_by_recency(replay_buffer,
+                                recency_decay: float,
+                                current_policy_version: int | None,
+                                generator) -> 'WeightedRandomSampler | None':
+    '''
+        Build a WeightedRandomSampler (with replacement) that biases sampling
+        toward items produced by more recent policy versions.
+        recency_decay: (0.0, 1.0]. higher = retain more old data (closer to uniform), lower
+        = bias more aggressively toward recent data.
+            recency_decay = 1.0  -> uniform: all weights = 1.0, no bias.
+            recency_decay = 0.9  -> mild: 1 step old has 0.9x weight of fresh
+            recency_decay = 0.8  -> moderate
+            recency_decay = 0.5  -> strong: 1 step old has half weight, old
+                                            items rarely sampled
+            recency_decay -> 0   -> essentially on-policy: only fresh sampled
+    '''
+    if recency_decay >= 1.0 or len(replay_buffer) == 0:
+        return None
+
+    if current_policy_version is None:
+        current_v = max(s["policy_version"] for s in replay_buffer.items)
+
+    else:
+        current_v = current_policy_version
+
+    weights = torch.tensor([recency_decay ** (current_v - s["policy_version"])
+                            for s in replay_buffer.items], dtype=torch.float32)
+
+    return WeightedRandomSampler(weights=weights,
+                                 num_samples=len(replay_buffer),
+                                 replacement=True,
+                                 generator=generator)
+
+def prepare_training_batches(replay_buffer,
+                             batch_size: int,
+                             num_engines: int,
+                             seed: int = 0,
+                             epoch: int = 0,
+                             recency_decay: float = 1.0,
+                             current_policy_version: int | None = None,
+                             max_batches: int | None = None) -> list:
     '''
         Create and pad training batches for distributed training.
+        current_policy_version: trainer's current policy version, defaults
+            to None for sync-mode callers that don't track versions.
+        max_batches: cap the number of micro-batches built before padding.
+            Used by async mode to bound per-call work to one optimizer step
+            regardless of replay buffer size. without this, prepare_training_batches
+            scales O(buffer) which becomes seconds at large scale.
     '''
-    # Create dataloader from replay buffer and convert
-    # to list as ray needs serializable data.
-    # Use a seeded generator for deterministic shuffle order across runs.
+    # Create dataloader from replay buffer. Use a seeded generator for
+    # deterministic order across runs.
     g = torch.Generator()
     g.manual_seed(seed + epoch)
-    train_batches = list(DataLoader(dataset=replay_buffer,
-                                    batch_size=batch_size,
-                                    shuffle=True,
-                                    num_workers=0,
-                                    pin_memory=False,
-                                    collate_fn=replay_buffer.collate_fn,
-                                    generator=g,
-                                    ))
+    sampler = weighted_sampler_by_recency(replay_buffer, recency_decay,
+                                          current_policy_version, g)
+    if sampler is not None:
+        loader = DataLoader(dataset=replay_buffer,
+                            batch_size=batch_size,
+                            sampler=sampler,
+                            num_workers=0,
+                            pin_memory=False,
+                            collate_fn=replay_buffer.collate_fn)
+    else:
+        loader = DataLoader(dataset=replay_buffer,
+                            batch_size=batch_size,
+                            shuffle=True,
+                            num_workers=0,
+                            pin_memory=False,
+                            collate_fn=replay_buffer.collate_fn,
+                            generator=g)
+    # We materialize lazily via a for-loop so max_batches can short-circuit
+    # before the entire buffer is read.
+    train_batches = []
+    for b in loader:
+        train_batches.append(b)
+        if max_batches is not None and len(train_batches) >= max_batches:
+            break
+
     # Pad to ensure equal batches per engine (prevents DeepSpeed hang)
     num_batches = len(train_batches)
     batches_per_engine = (num_batches + num_engines - 1) // num_engines

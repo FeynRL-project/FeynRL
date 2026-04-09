@@ -907,7 +907,7 @@ class COMMON:
         '''
             Phase 1 of NCCL weight sync: gather the ZeRO-3 state dict.
             Must be called on ALL training ranks. Rank 0 stores the gathered state dict
-            and returns param metadata [(name, dtype_str, shape), ...]. Other ranks return [].
+            and returns param metadata [(name, dtype, shape), ...] (dtype is a torch.dtype). Other ranks return [].
         '''
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         device = self.policy_engine.device
@@ -946,7 +946,10 @@ class COMMON:
                                    f"Aborting broadcast to prevent corrupting rollout engines.")
 
             self.pending_nccl_state_dict = state_dict
-            metadata = [(name, str(param.dtype), tuple(param.shape)) for name, param in state_dict.items()]
+            # Send torch.dtype objects directly. Ray's cloudpickle restores the
+            # singletons, so there's no string round-trip and no dtype_map for
+            # the receiver to keep in sync.
+            metadata = [(name, param.dtype, tuple(param.shape)) for name, param in state_dict.items()]
 
             print(f"[Alg:{self.alg_name}][Rank 0] Gathered {len(metadata)} params for NCCL broadcast", flush=True)
             return metadata

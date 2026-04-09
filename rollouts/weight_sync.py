@@ -97,22 +97,17 @@ class WeightSyncExtension:
 
         return True
 
-    def update_weights_nccl(self, param_name, dtype_str, shape, empty_cache=False):
+    def update_weights_nccl(self, param_name, dtype, shape, empty_cache=False):
         '''
             Receive a single weight tensor via broadcast from training rank 0
-            and load it into the model.
+            and load it into the model. dtype is a torch.dtype.
         '''
-        dtype_map = {"torch.float16":  torch.float16,
-                     "torch.bfloat16": torch.bfloat16,
-                     "torch.float32":  torch.float32,}
-        target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
-
         if self.weight_sync_backend == "nccl":
-            buffer = torch.empty(shape, dtype=target_dtype, device="cuda")
+            buffer = torch.empty(shape, dtype=dtype, device="cuda")
             self.weight_sync_pynccl.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
 
         else:
-            buffer = torch.empty(shape, dtype=target_dtype, device="cpu")
+            buffer = torch.empty(shape, dtype=dtype, device="cpu")
             torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
 
         self.model_runner.model.load_weights(weights=[(param_name, buffer)])
@@ -129,23 +124,17 @@ class WeightSyncExtension:
             For nccl: uses PyNcclCommunicator.broadcast.
             For gloo: uses torch.distributed.broadcast.
         '''
-        dtype_map = {"torch.float16":  torch.float16,
-                     "torch.bfloat16": torch.bfloat16,
-                     "torch.float32":  torch.float32,}
-
         use_pynccl = (self.weight_sync_backend == "nccl")
         num_loaded = 0
         corrupt_params = []
 
-        for name, dtype_str, shape in param_metadata:
-            target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
-
+        for name, dtype, shape in param_metadata:
             if use_pynccl:
-                buffer = torch.empty(tuple(shape), dtype=target_dtype, device="cuda")
+                buffer = torch.empty(tuple(shape), dtype=dtype, device="cuda")
                 self.weight_sync_pynccl.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
 
             else:
-                buffer = torch.empty(tuple(shape), dtype=target_dtype, device="cpu")
+                buffer = torch.empty(tuple(shape), dtype=dtype, device="cpu")
                 torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
 
             # Receiver-side verificatioas transport-layer corruption
@@ -156,7 +145,7 @@ class WeightSyncExtension:
             # see num_loaded != expected_params and return False
             if not torch.isfinite(buffer).all():
                 num_bad = (~torch.isfinite(buffer)).sum().item()
-                corrupt_params.append((name, dtype_str, tuple(shape), num_bad))
+                corrupt_params.append((name, dtype, tuple(shape), num_bad))
                 del buffer
                 continue
 

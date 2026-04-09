@@ -711,14 +711,11 @@ class VLLMRolloutEngineAsync(Base):
             This avoids firing 340 separate .remote() calls per engine.
             The engine stays inside this method for the entire weight sync,
             calling NCCL broadcast for each param in lockstep with the sender.
-            param_metadata: list of (name, dtype_str, shape) tuples from
+            param_metadata: list of (name, dtype, shape) tuples from
                             gather_weights_for_nccl on training rank 0.
+                            dtype is a torch.dtype.
         '''
         if getattr(self, '_nccl_in_actor', False):
-            dtype_map = { "torch.float16": torch.float16,
-                          "torch.bfloat16": torch.bfloat16,
-                          "torch.float32": torch.float32}
-
             if not hasattr(self, '_nccl_state_dict'):
                 self._nccl_state_dict = {}
 
@@ -726,9 +723,8 @@ class VLLMRolloutEngineAsync(Base):
             backend = self.weight_sync_backend
             buf_device = "cuda" if backend == "nccl" else "cpu"
 
-            for i, (name, dtype_str, shape) in enumerate(param_metadata):
-                target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
-                buffer = torch.empty(tuple(shape), dtype=target_dtype, device=buf_device)
+            for i, (name, dtype, shape) in enumerate(param_metadata):
+                buffer = torch.empty(tuple(shape), dtype=dtype, device=buf_device)
                 torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
                 # Receiver-side nan/inf check. Must NOT raise mid-loop or the
                 # collective wedges the sender, skip the tensor instead and we let
@@ -737,7 +733,7 @@ class VLLMRolloutEngineAsync(Base):
                     num_bad = (~torch.isfinite(buffer)).sum().item()
                     print(f"[VLLMEngineAsync][Engine {self.engine_id}] "
                           f"receive_all_weights_nccl: NaN/Inf in '{name}' "
-                          f"(dtype={dtype_str} shape={tuple(shape)}, "
+                          f"(dtype={dtype} shape={tuple(shape)}, "
                           f"{num_bad} bad elements). Skipping load — "
                           f"finalize will report partial load.", flush=True)
                     del buffer
@@ -756,16 +752,16 @@ class VLLMRolloutEngineAsync(Base):
             num_params = len(param_metadata)
 
             # Convert tuples to ensure serializable metadata
-            serializable_metadata = [(name, dtype_str, tuple(shape)) for name, dtype_str, shape in param_metadata]
+            serializable_metadata = [(name, dtype, tuple(shape)) for name, dtype, shape in param_metadata]
             results = self.run_async(self.async_engine.collective_rpc("receive_all_weights_nccl",
                                                                       args=(serializable_metadata,)))
 
             self._nccl_tp_params_received = results[0] if results else 0
             return num_params
 
-    def update_weights_nccl(self, param_name, dtype_str, shape, empty_cache=False):
+    def update_weights_nccl(self, param_name, dtype, shape, empty_cache=False):
         '''
-            Receive a single weight tensor via NCCL broadcast.
+            Receive a single weight tensor via NCCL broadcast. dtype is a torch.dtype.
             For TP=1: receives directly in the Ray actor process and accumulates
             in _nccl_state_dict. The accumulated dict is loaded into vLLM in bulk
             during finalize_weight_nccl via update_weights_direct. This avoids the
@@ -774,12 +770,8 @@ class VLLMRolloutEngineAsync(Base):
         '''
         if getattr(self, '_nccl_in_actor', False):
             # TP=1: receive directly in the Ray actor process.
-            dtype_map = {"torch.float16": torch.float16,
-                         "torch.bfloat16": torch.bfloat16,
-                         "torch.float32": torch.float32}
-            target_dtype = dtype_map.get(dtype_str, torch.bfloat16)
             buf_device = "cuda" if self.weight_sync_backend == "nccl" else "cpu"
-            buffer = torch.empty(tuple(shape), dtype=target_dtype, device=buf_device)
+            buffer = torch.empty(tuple(shape), dtype=dtype, device=buf_device)
             torch.distributed.broadcast(buffer, src=0, group=self.weight_sync_group)
 
             # Receiver-side nan/inf check. Skip-and-continue rather than raise so the
@@ -789,7 +781,7 @@ class VLLMRolloutEngineAsync(Base):
                 num_bad = (~torch.isfinite(buffer)).sum().item()
                 print(f"[VLLMEngineAsync][Engine {self.engine_id}] "
                       f"update_weights_nccl: NaN/Inf in '{param_name}' "
-                      f"(dtype={dtype_str} shape={tuple(shape)}, "
+                      f"(dtype={dtype} shape={tuple(shape)}, "
                       f"{num_bad} bad elements). Skipping.", flush=True)
                 del buffer
 
@@ -807,7 +799,7 @@ class VLLMRolloutEngineAsync(Base):
             # TP>1: delegate to EngineCore workers.
             results = self.run_async(self.async_engine.collective_rpc(
                 "update_weights_nccl",
-                args=(param_name, dtype_str, tuple(shape), empty_cache)))
+                args=(param_name, dtype, tuple(shape), empty_cache)))
             return results
 
     def finalize_weight_nccl(self, version, expected_params=0):

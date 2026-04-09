@@ -1,4 +1,5 @@
 import torch
+from collections import deque
 from typing import Dict, Any, List, Optional
 from torch.utils.data import Dataset
 
@@ -9,13 +10,24 @@ class ReplayBuffer(Dataset):
     '''
        Replay buffer for RL.
        It stores one trajectory per item (one sequence).
+       max_size: optional hard cap on the number of stored items. Used
+                 by run_rl_async.py to bound per-iter work in
+                 prepare_training_batches and prevent the replay buffer from
+                 growing without limit while training is slower than generation.
     '''
     def __init__(self,
                 pad_token_id: int,
-                max_seq_len: int
+                max_seq_len: int,
+                max_size: Optional[int] = None,
                 ):
 
-        self.items: List[Dict[str, Optional[torch.Tensor]]] = []
+        if max_size is not None:
+            self.items: Any = deque(maxlen=max_size)
+
+        else:
+            self.items = []
+
+        self.max_size = max_size
         self.pad_token_id = int(pad_token_id)
         self.max_seq_len  = int(max_seq_len)
         # this shows the total number of action tokens which are not masked which
@@ -199,7 +211,11 @@ class ReplayBuffer(Dataset):
         '''
             Clear the replay buffer for the next epoch.
         '''
-        self.items = []
+        if self.max_size is not None:
+            self.items = deque(maxlen=self.max_size)
+
+        else:
+            self.items = []
         self.total_action_tokens = 0
 
     def evict_stale(self, min_version: int) -> int:
@@ -208,7 +224,12 @@ class ReplayBuffer(Dataset):
             Returns the number of evicted ones.
         '''
         before = len(self.items)
-        self.items = [x for x in self.items if x["policy_version"] >= min_version]
+        if isinstance(self.items, deque):
+            self.items = deque((x for x in self.items if x["policy_version"] >= min_version), maxlen=self.items.maxlen,)
+
+        else:
+            self.items = [x for x in self.items if x["policy_version"] >= min_version]
+
         # Recount action tokens from remaining samples
         self.total_action_tokens = sum(int((x["masks"] > 0.5).sum().item()) for x in self.items)
         evicted = before - len(self.items)

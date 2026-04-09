@@ -249,6 +249,9 @@ class Overlap(BaseModel):
     # Static sync interval in training steps for non-P3O algorithms.
     # None = disabled (only ESS-driven sync).
     fixed_sync_interval: int | None = None
+    # Recency-weighted replay sampling in overlap mode. 1.0 = uniform sampling
+    # over the replay buffer. <1.0 biases sampling toward more recent policy.
+    recency_decay: float | None = None
 
 class Rollout(BaseModel):
     '''
@@ -781,6 +784,10 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
                 if config.overlap.ess_sync_threshold is None or not (0.0 < config.overlap.ess_sync_threshold <= 1.0):
                     raise ValueError(f"overlap.ess_sync_threshold must be in (0.0, 1.0], got {config.overlap.ess_sync_threshold}")
+
+                if config.overlap.recency_decay  and not (0.0 < config.overlap.recency_decay <= 1.0):
+                    raise ValueError(f"overlap.recency_decay must be in (0.0, 1.0], got {config.overlap.recency_decay} "
+                                     f"(1.0 = uniform sampling, <1.0 biases sampling toward fresher policy versions)")
 
                 # ESS-driven sync only works with P3O for now.
                 # Other algorithms must use fixed_sync_interval for mid-epoch sync.

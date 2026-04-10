@@ -713,7 +713,8 @@ class VLLMRolloutEngineAsync(Base):
             calling NCCL broadcast for each param in lockstep with the sender.
             param_metadata: list of (name, dtype, shape) tuples from
                             gather_weights_for_nccl on training rank 0.
-                            dtype is a torch.dtype.
+                            dtype is a torch.dtype (converted to string for
+                            the TP>1 collective_rpc path).
         '''
         if getattr(self, '_nccl_in_actor', False):
             if not hasattr(self, '_nccl_state_dict'):
@@ -751,8 +752,8 @@ class VLLMRolloutEngineAsync(Base):
             # serializes the NCCL collectives across 398+ params.
             num_params = len(param_metadata)
 
-            # Convert tuples to ensure serializable metadata
-            serializable_metadata = [(name, dtype, tuple(shape)) for name, dtype, shape in param_metadata]
+            # Convert torch.dtype to string for msgpack serialization through vLLM's collective_rpc
+            serializable_metadata = [(name, str(dtype), tuple(shape)) for name, dtype, shape in param_metadata]
             results = self.run_async(self.async_engine.collective_rpc("receive_all_weights_nccl",
                                                                       args=(serializable_metadata,)))
 
@@ -761,7 +762,8 @@ class VLLMRolloutEngineAsync(Base):
 
     def update_weights_nccl(self, param_name, dtype, shape, empty_cache=False):
         '''
-            Receive a single weight tensor via NCCL broadcast. dtype is a torch.dtype.
+            Receive a single weight tensor via NCCL broadcast.
+            dtype is a torch.dtype (converted to string for TP>1 collective_rpc path).
             For TP=1: receives directly in the Ray actor process and accumulates
             in _nccl_state_dict. The accumulated dict is loaded into vLLM in bulk
             during finalize_weight_nccl via update_weights_direct. This avoids the
@@ -799,7 +801,7 @@ class VLLMRolloutEngineAsync(Base):
             # TP>1: delegate to EngineCore workers.
             results = self.run_async(self.async_engine.collective_rpc(
                 "update_weights_nccl",
-                args=(param_name, dtype, tuple(shape), empty_cache)))
+                args=(param_name, str(dtype), tuple(shape), empty_cache)))
             return results
 
     def finalize_weight_nccl(self, version, expected_params=0):

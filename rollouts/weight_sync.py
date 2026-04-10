@@ -97,11 +97,13 @@ class WeightSyncExtension:
 
         return True
 
-    def update_weights_nccl(self, param_name, dtype, shape, empty_cache=False):
+    def update_weights_nccl(self, param_name, dtype_raw, shape, empty_cache=False):
         '''
             Receive a single weight tensor via broadcast from training rank 0
-            and load it into the model. dtype is a torch.dtype.
+            and load it into the model. dtype_raw is a torch.dtype or a string
+            (e.g. "torch.bfloat16") when arriving through vLLM's collective_rpc.
         '''
+        dtype = getattr(torch, dtype_raw.replace("torch.", "")) if isinstance(dtype_raw, str) else dtype_raw
         if self.weight_sync_backend == "nccl":
             buffer = torch.empty(shape, dtype=dtype, device="cuda")
             self.weight_sync_pynccl.broadcast(buffer, src=0, stream=torch.cuda.current_stream())
@@ -128,7 +130,10 @@ class WeightSyncExtension:
         num_loaded = 0
         corrupt_params = []
 
-        for name, dtype, shape in param_metadata:
+        for name, dtype_raw, shape in param_metadata:
+            # dtype may arrive as a string (e.g. "torch.bfloat16") when sent
+            # through vLLM's msgpack-based collective_rpc serializer.
+            dtype = getattr(torch, dtype_raw.replace("torch.", "")) if isinstance(dtype_raw, str) else dtype_raw
             if use_pynccl:
                 buffer = torch.empty(tuple(shape), dtype=dtype, device="cuda")
                 self.weight_sync_pynccl.broadcast(buffer, src=0, stream=torch.cuda.current_stream())

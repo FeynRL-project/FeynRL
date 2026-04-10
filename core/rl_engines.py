@@ -51,6 +51,11 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
                # peft
                'peft_config':params.peft,
+
+               # decoupled loss when async overlap engine is used
+               'use_decoupled_loss': params.overlap.enabled if params.overlap else False,
+               'alpha': params.overlap.alpha if params.overlap else None,
+               'behave_imp_weight_cap': params.overlap.behave_imp_weight_cap if params.overlap else None,
     }
 
     # ppo arguments

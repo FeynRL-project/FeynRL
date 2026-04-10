@@ -252,6 +252,11 @@ class Overlap(BaseModel):
     # Recency-weighted replay sampling in overlap mode. 1.0 = uniform sampling
     # over the replay buffer. <1.0 biases sampling toward more recent policy.
     recency_decay: float | None = None
+    # Used for Decoupled PPO as interpolation coefficient for proximal policy.
+    # Must be in (0, 1] when overlap is enabled.
+    alpha: float | None = None
+    # Cap on behavioral importance weight (pi_prox / pi_behav). null means no cap.
+    behave_imp_weight_cap: float | None = None
 
 class Rollout(BaseModel):
     '''
@@ -788,6 +793,12 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.overlap.recency_decay  and not (0.0 < config.overlap.recency_decay <= 1.0):
                     raise ValueError(f"overlap.recency_decay must be in (0.0, 1.0], got {config.overlap.recency_decay} "
                                      f"(1.0 = uniform sampling, <1.0 biases sampling toward fresher policy versions)")
+
+                if config.overlap.alpha is None or not (0.0 < config.overlap.alpha <= 1.0):
+                    raise ValueError(f"overlap.alpha must be in (0.0, 1.0] when overlap is enabled, got {config.overlap.alpha}")
+
+                if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
+                    raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")
 
                 # ESS-driven sync only works with P3O for now.
                 # Other algorithms must use fixed_sync_interval for mid-epoch sync.

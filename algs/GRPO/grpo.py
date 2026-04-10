@@ -30,6 +30,9 @@ class GRPO(COMMON):
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
+                 alpha: float = None,
+                 use_decoupled_loss: bool = False,
+                 behave_imp_weight_cap: float = None,
                  ):
 
         self.alg_name = self.__class__.__name__
@@ -56,6 +59,11 @@ class GRPO(COMMON):
 
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
+
+        # params for decoupled PPO
+        self.use_decoupled_loss = use_decoupled_loss
+        self.alpha = float(alpha) if alpha is not None else None
+        self.behave_imp_weight_cap = float(behave_imp_weight_cap) if behave_imp_weight_cap is not None else None
 
         # if true, it means the update is done after seeing all samples in the reply buffer
         # treating the entire buffer as a single batch.
@@ -121,16 +129,46 @@ class GRPO(COMMON):
         mask = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
-        # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
-        raw_logratio = (logprobs - old_logprobs).to(torch.float32)
-        # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
-        logratio = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
-        ratio   = torch.exp(logratio)
+        if self.use_decoupled_loss:
+            # 2. Decoupled policy loss (https://arxiv.org/abs/2110.00641)
+            # loss = - E[ (pi_prox/pi_behav) * min(r_prox * A, clip(r_prox) * A)]
+            # where r_prox = pi / pi_prox
+            # log pi_prox = a * log pi + (1-a) * log pi_behav
+            logp_prox = self.alpha * logprobs.detach() + (1 - self.alpha) * old_logprobs
 
-        # 3. compute loss as raw sums (caller normalizes for backward)
-        unclipped = ratio * adv
-        clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
-        pi_sum    = -(torch.minimum(unclipped, clip_adv) * mask).sum()
+            # pr_prox = pi / pi_prox
+            raw_logratio_prox = (logprobs - logp_prox).to(torch.float32)
+            logratio_prox     = torch.where(mask_bool, raw_logratio_prox, torch.zeros_like(raw_logratio_prox))
+            r_prox            = torch.exp(logratio_prox)
+
+            # Behavioral ratio: w = pi_prox / pi_behav
+            raw_log_w = (logp_prox - old_logprobs).to(torch.float32)
+            log_w     = torch.where(mask_bool, raw_log_w, torch.zeros_like(raw_log_w))
+            behave_w  = torch.exp(log_w)
+            if self.behave_imp_weight_cap is not None:
+                behave_w = torch.clamp(behave_w, min=0.0, max=self.behave_imp_weight_cap)
+
+            # 3. Decoupled clipped surrogate: L = w * min(r_prox * A, clip(r_prox) * A)
+            unclipped = r_prox * adv
+            clip_adv  = torch.clamp(r_prox, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
+            pi_sum    = -(torch.minimum(unclipped, clip_adv) * behave_w * mask).sum()
+
+            # use r_prox as the ratio and logratio_prox as the logratio for logging
+            ratio    = r_prox
+            logratio = logratio_prox
+
+        else:
+            # 2. standard PPO
+            # loss = - E[ min(ratio * A, clip(ratio) * A)]
+            # ratio = pi / pi_old
+            raw_logratio = (logprobs - old_logprobs).to(torch.float32)
+            logratio     = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
+            ratio        = torch.exp(logratio)
+
+            # 3. compute loss as raw sums, will be normalized later
+            unclipped = ratio * adv
+            clip_adv  = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high) * adv
+            pi_sum    = -(torch.minimum(unclipped, clip_adv) * mask).sum()
 
         # 4. compute entropy loss (raw sum)
         if entropies is not None and self.ent_coeff > 0.0:
@@ -165,6 +203,19 @@ class GRPO(COMMON):
                        'pi_loss': (pi_sum / denom).item(),
                        'loss_total': (loss_total_sum / denom).item(),
                        'kl_ref': (kl_sum / denom).item(),}
+
+            if self.use_decoupled_loss:
+                behave_w_masked = behave_w * mask
+                metrics['behave_w_mean']    = (behave_w_masked.sum() / denom).item()
+                metrics['behave_w_max']     = behave_w[mask_bool].max().item() if mask_bool.any() else 0.0
+                metrics['behave_w_min']     = behave_w[mask_bool].min().item() if mask_bool.any() else 0.0
+                # approx KL between proximal and behavior: log(pi_prox/pi_behav)
+                metrics['behave_approx_kl'] = (log_w[mask_bool].sum() / denom).item() if mask_bool.any() else 0.0
+
+                # fraction of tokens where behave_w was capped
+                if self.behave_imp_weight_cap is not None:
+                    capped = (behave_w_masked >= self.behave_imp_weight_cap).to(dtype=dtype)
+                    metrics['behave_w_capfrac'] = (capped * mask).sum().item() / denom.item()
 
         return loss_total_sum, denom, metrics
 

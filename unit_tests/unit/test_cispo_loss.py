@@ -8,13 +8,14 @@ from algs.CISPO.cispo import CISPO
 def test_cispo_loss_logic():
     cispo_logic = CISPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.1, -0.2]])
     old_logprobs = torch.tensor([[-0.1, -0.2]])
     # Ratio = exp(0) = 1.0. Clipped ratio = 1.0.
@@ -31,14 +32,15 @@ def test_cispo_loss_logic():
 def test_cispo_loss_clipping():
     cispo_logic = CISPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
-    logprobs = torch.tensor([[-0.5]]) 
+
+    logprobs = torch.tensor([[-0.5]])
     old_logprobs = torch.tensor([[-10.5]]) # Ratio = exp(10)
     advantages = torch.tensor([[1.0]])
     mask = torch.tensor([[1.0]])
@@ -53,18 +55,19 @@ def test_cispo_loss_clipping():
 def test_cispo_loss_gradient_flow():
     cispo_logic = CISPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.5]], requires_grad=True)
     old_logprobs = torch.tensor([[-0.5]])
     advantages = torch.tensor([[1.0]])
     mask = torch.tensor([[1.0]])
-    
+
     loss, denom, metrics = cispo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, None, None)
     loss.backward()
     
@@ -76,13 +79,14 @@ def test_cispo_loss_gradient_flow():
 def test_cispo_loss_entropy():
     cispo_logic = CISPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.1, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.1,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.5]])
     old_logprobs = torch.tensor([[-0.5]])
     advantages = torch.tensor([[0.0]])
@@ -99,10 +103,11 @@ def test_cispo_loss_entropy():
 def test_cispo_loss_kl_ref():
     cispo_logic = CISPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.5,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
     # mock compute_kl_distance on dummy_self

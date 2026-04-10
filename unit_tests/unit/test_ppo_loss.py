@@ -9,13 +9,14 @@ def test_ppo_loss_clipped_objective():
     # Use PPO directly since conftest.py mocks @ray.remote to be a no-op
     ppo_logic = PPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.1, -0.2]])
     old_logprobs = torch.tensor([[-0.1, -0.2]])
     # Ratio = exp(0) = 1.0
@@ -34,13 +35,14 @@ def test_ppo_loss_clipped_objective():
 def test_ppo_loss_clipping():
     ppo_logic = PPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[10.0]]) # Ratio will be exp(10)
     old_logprobs = torch.tensor([[0.0]])
     advantages = torch.tensor([[1.0]])
@@ -55,10 +57,11 @@ def test_ppo_loss_clipping():
 def test_ppo_loss_entropy():
     ppo_logic = PPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.1, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.1,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
     
@@ -78,13 +81,14 @@ def test_ppo_loss_entropy():
 def test_ppo_loss_gradient_flow():
     ppo_logic = PPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.5]], requires_grad=True)
     old_logprobs = torch.tensor([[-0.5]])
     advantages = torch.tensor([[1.0]])
@@ -100,10 +104,11 @@ def test_ppo_loss_kl_ref():
     ppo_logic = PPO
     # Mock self with kl_coeff > 0
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.5,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
     # mock compute_kl_distance on dummy_self

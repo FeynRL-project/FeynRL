@@ -8,13 +8,14 @@ from algs.GRPO.grpo import GRPO
 def test_grpo_loss_clipped_objective():
     grpo_logic = GRPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.1, -0.2]])
     old_logprobs = torch.tensor([[-0.1, -0.2]])
     # Ratio = exp(0) = 1.0
@@ -31,13 +32,14 @@ def test_grpo_loss_clipped_objective():
 def test_grpo_loss_clipping():
     grpo_logic = GRPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[10.0]]) # Ratio will be exp(10)
     old_logprobs = torch.tensor([[0.0]])
     advantages = torch.tensor([[1.0]])
@@ -55,19 +57,20 @@ def test_grpo_loss_clipping():
 def test_grpo_loss_entropy():
     grpo_logic = GRPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.1, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.1,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.5]])
     old_logprobs = torch.tensor([[-0.5]])
     advantages = torch.tensor([[0.0]])
     mask = torch.tensor([[1.0]])
     entropies = torch.tensor([[0.7]])
-    
+
     loss, denom, metrics = grpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, entropies, None)
     
     # Loss_pi = 0 (adv = 0)
@@ -78,13 +81,14 @@ def test_grpo_loss_entropy():
 def test_grpo_loss_gradient_flow():
     grpo_logic = GRPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.0,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
-    
+
     logprobs = torch.tensor([[-0.5]], requires_grad=True)
     old_logprobs = torch.tensor([[-0.5]])
     advantages = torch.tensor([[1.0]])
@@ -100,10 +104,11 @@ def test_grpo_loss_gradient_flow():
 def test_grpo_loss_kl_ref():
     grpo_logic = GRPO
     dummy_self = SimpleNamespace(
-        clip_low=0.2, 
-        clip_high=0.2, 
-        ent_coeff=0.0, 
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.0,
         kl_coeff=0.5,
+        use_decoupled_loss=False,
         alg_name="Mock"
     )
     # mock compute_kl_distance on dummy_self

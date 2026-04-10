@@ -543,6 +543,23 @@ def perform_inline_sync(epoch, train_step_count, ess,
                                f"engines: {dead_engines}. NCCL world_size is "
                                f"fixed; restart job.")
 
+        # Force-cancel the wedged pull-loop tasks before relaunching. Without this, Ray keeps the old tasks
+        # queued on the actor and the new run_pull_loop calls below stack up behind them, every subsequent
+        # failed sync leaks another wedged task and eventually starves the actor's concurrency slots. force=True
+        # interrupts the running task; recursive=True cancels any child tasks the pull loop spawned.
+        for ref in pull_refs:
+            try:
+                ray.cancel(ref, force=True, recursive=True)
+            except Exception as cancel_err:
+                logger.warning(f"[Epoch {epoch+1}] ray.cancel on wedged pull_ref "
+                               f"failed (continuing): {cancel_err}")
+
+        # Drain leftover poison pills (and any stale shards) before relaunching.
+        # stop_engines_and_drain pushed N pills but only K engines consumed theirs
+        # before the timeout. The remaining N-K pills would kill the new pull
+        # loops immediately, causing a fatal RuntimeError on the next ray.wait.
+        drain_prompt_queue(prompt_queue)
+
         # Relaunch pull loops with OLD version, restart producer, return.
         new_pull_refs = [eng.run_pull_loop.remote(prompt_queue=prompt_queue,
                                                   results_queue=results_queue,
@@ -814,14 +831,18 @@ def run_epoch_overlap(epoch, training_engines, rollout_engines,
                                step=global_step)
             tracker.log_metrics({"train/step_time_sec": step_time}, step=global_step)
 
-            rollout_snapshot = rollout_stats.summarize(rollout_acc, rollout_time=time.time() - generation_start_time)
-            rollout_log = {f"rollout/{k}": v for k, v in rollout_snapshot.items()}
-            rollout_log["rollout/replay_buffer_size"] = len(replay_buffer)
-            rollout_log["rollout/policy_lag"] = policy_version - rollout_policy_version
-            rollout_log["rollout/shards_produced"] = producer.shards_produced
-            if qsize is not None:
-                rollout_log["rollout/results_queue_qsize"] = qsize
-            tracker.log_metrics(rollout_log, step=global_step)
+            # At epoch boundaries, the accumulator resets but the replay buffer carries over,
+            # hence training can run multiple steps from buffered shards before the non-blocking
+            # drain catches new results. Logging zeros during this window creates spurious dips in the tracker.
+            if rollout_acc['total_samples_generated'] > 0:
+                rollout_snapshot = rollout_stats.summarize(rollout_acc, rollout_time=time.time() - generation_start_time)
+                rollout_log = {f"rollout/{k}": v for k, v in rollout_snapshot.items()}
+                rollout_log["rollout/replay_buffer_size"] = len(replay_buffer)
+                rollout_log["rollout/policy_lag"] = policy_version - rollout_policy_version
+                rollout_log["rollout/shards_produced"] = producer.shards_produced
+                if qsize is not None:
+                    rollout_log["rollout/results_queue_qsize"] = qsize
+                tracker.log_metrics(rollout_log, step=global_step)
 
         # 5. Check ESS or fixed_sync_interval for inline weight sync.
         should_sync, ess = check_ess_sync(train_metrics=train_metrics,

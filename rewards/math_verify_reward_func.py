@@ -95,20 +95,34 @@ def _run_verification(ground_truth_boxed: str, solution_str: str, timeout_score:
         Top-level function executed in a subprocess via ProcessPoolExecutor.
         signal.SIGALRM (used by math_verify's @timeout decorator) works here
         because each subprocess has its own main thread.
+
+        LatexExtractionConfig and ExprExtractionConfig are run as separate parse
+        passes, each with its own independent timeout. Previously they shared a
+        single timeout: ExprExtractionConfig scanning a long chain-of-thought
+        would exhaust the budget before LatexExtractionConfig could find \boxed{},
+        causing correct answers to receive 0 reward.
     '''
-    verify_func = math_metric(gold_extraction_target=(LatexExtractionConfig(),),
-                              pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),)
+    # Suppress math_verify's "Timeout during parsing: <full model text>" warning,
+    # which would otherwise flood stderr with model completions via Ray actor logs.
+    logging.getLogger("math_verify").setLevel(logging.ERROR)
 
-    try:
-        score, _ = verify_func([ground_truth_boxed], [solution_str])
-        return float(score)
-    except TimeoutException:
-        return float(timeout_score)
+    _latex_verify = math_metric(gold_extraction_target=(LatexExtractionConfig(),),
+                                pred_extraction_target=(LatexExtractionConfig(),))
+    _expr_verify  = math_metric(gold_extraction_target=(LatexExtractionConfig(),),
+                                pred_extraction_target=(ExprExtractionConfig(),))
 
-    except Exception as e:
-        # Log in subprocess — will appear in Ray worker logs.
-        logging.getLogger(__name__).error(f"_run_verification failed: {e}")
-        return 0.0
+    best = 0.0
+    for verify_func in (_latex_verify, _expr_verify):
+        try:
+            score, _ = verify_func([ground_truth_boxed], [solution_str])
+            best = max(best, float(score))
+            if best == 1.0:
+                return best  # can't do better; skip remaining passes
+        except TimeoutException:
+            best = max(best, float(timeout_score))
+        except Exception as e:
+            logging.getLogger(__name__).error(f"_run_verification failed: {e}")
+    return best
 
 
 def compute_scores_batch(pairs: list[tuple[Dict[str, Any], Any]],

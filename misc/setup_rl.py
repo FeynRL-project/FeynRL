@@ -150,7 +150,9 @@ def save_checkpoint(epoch,
 
        Args:
            save_ds_engine: When False, skip saving the DeepSpeed engine state
-                           (optimizer/scheduler/RNG) to save ~90GB per checkpoint.
+                           (optimizer/scheduler/RNG). The optimizer state is
+                           typically several times larger than the raw weights,
+                           so this saves significant disk space per checkpoint.
                            Set to False when training resume is not needed.
     '''
     # Note if multi-node cluster is used, checkpoint_dir must be on a shared

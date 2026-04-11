@@ -209,8 +209,9 @@ class DeepSpeed(BaseModel):
 
     # Whether to save the DeepSpeed engine state (optimizer, scheduler, RNG)
     # alongside the HF-compatible weights. Set to False to skip the ds_engine/
-    # directory and save ~90GB of optimizer state per checkpoint when resume
-    # is not needed (e.g. eval-only or final checkpoints).
+    # directory when resume is not needed (e.g. eval-only or final checkpoints).
+    # The optimizer state is typically several times larger than the raw weights,
+    # so skipping it saves significant disk space per checkpoint.
     save_ds_engine: bool = True
 
     def model_dump(self, **kwargs):

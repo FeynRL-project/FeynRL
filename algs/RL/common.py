@@ -1077,8 +1077,10 @@ class COMMON:
 
             Args:
                 save_ds_engine: When False, skip saving optimizer/scheduler/RNG state.
-                                Set to False when resume is not needed (saves ~90GB per
-                                checkpoint). The HF-compatible weights are still saved
+                                Set to False when resume is not needed. The optimizer
+                                state is typically several times larger than the raw
+                                weights, so this saves significant disk space per
+                                checkpoint. The HF-compatible weights are still saved
                                 by save_checkpoint().
         '''
         if not save_ds_engine:

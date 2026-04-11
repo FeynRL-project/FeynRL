@@ -235,6 +235,8 @@ class Reward(BaseModel):
     model_config = ConfigDict(extra='forbid')
     broadcast: bool | None = None
     reward_func: str | None = None
+    reward_funcs: list[str] | None = None
+    reward_weights: list[float] | None = None
 
 class Overlap(BaseModel):
     '''
@@ -746,9 +748,26 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if config.model.ref_model is None and (config.train.kl_coeff > 0):
                 raise ValueError(f"model.ref must be not None if kl_coeff > 0")
 
-            # Reward function
-            if not config.reward or not config.reward.reward_func:
-                raise ValueError("reward.reward_func must be specified for RL training")
+            # Reward function(s)
+            if not config.reward:
+                raise ValueError("reward config must be specified for RL training")
+
+            has_single_reward = bool(config.reward.reward_func)
+            has_multi_reward = bool(config.reward.reward_funcs)
+
+            if has_single_reward and has_multi_reward:
+                raise ValueError("Use either reward.reward_func or reward.reward_funcs, not both")
+
+            if not has_single_reward and not has_multi_reward:
+                raise ValueError("Specify reward.reward_func or reward.reward_funcs for RL training")
+
+            if has_multi_reward:
+                if not config.reward.reward_weights:
+                    raise ValueError("reward.reward_weights must be specified when using reward.reward_funcs")
+                if len(config.reward.reward_funcs) != len(config.reward.reward_weights):
+                    raise ValueError("reward.reward_funcs and reward.reward_weights must have the same length")
+                if len(config.reward.reward_funcs) == 0:
+                    raise ValueError("reward.reward_funcs must contain at least one reward")
 
             # TP must evenly divide rollout GPUs
             tp = config.rollout.tensor_parallel_size

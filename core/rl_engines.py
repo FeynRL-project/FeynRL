@@ -251,6 +251,8 @@ def merge_rollout_with_stats(rollout_lists):
     # rewards
     all_rewards = []
     all_zscores = []
+    # named per-component rewards: Dict[str, List[float]]
+    all_named_rewards = {}
     # response
     all_response_lens = []
     min_response_len = float('inf')
@@ -275,6 +277,8 @@ def merge_rollout_with_stats(rollout_lists):
             # reward stats
             all_rewards.append(sample['pred_rewards'].sum().item())
             all_zscores.append(sample['pred_zscores'].sum().item())
+            for name, value in sample.get('named_rewards', {}).items():
+                all_named_rewards.setdefault(name, []).append(float(value))
             # response stats
             all_response_lens.append(sample['response_len'])
             min_response_len = min(min_response_len, sample['response_len'])
@@ -304,6 +308,7 @@ def merge_rollout_with_stats(rollout_lists):
     stats = {'total_samples_generated': total_samples_generated,
             'all_rewards': all_rewards,
             'all_zscores': all_zscores,
+            'all_named_rewards': all_named_rewards,
             'all_response_lens': all_response_lens,
             'min_response_len': min_response_len,
             'max_response_len': max_response_len,

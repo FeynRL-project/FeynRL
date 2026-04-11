@@ -1,7 +1,6 @@
 import os
 import atexit
 import numpy as np
-import importlib
 import ray
 import time
 import shutil
@@ -9,6 +8,7 @@ import threading
 
 # imports local methods, classes, etc.
 from misc.utils import load_algorithm, ray_get_with_timeout, set_random_seeds
+from misc.reward_utils import load_reward_function
 from ray.util.queue import Queue as RayQueue, Empty as RayQueueEmpty, Full as RayQueueFull
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
@@ -1055,14 +1055,15 @@ def main(args, config):
     # 5. Initialize rollout engines
     ########
     logger.info("Setting up rollout engines...")
-    reward_func_name = config.reward.reward_func if config.reward.reward_func else None
-    if reward_func_name:
-        reward_module = importlib.import_module("rewards." + reward_func_name)
-        reward_fnc    = getattr(reward_module, "compute_score")
-        logger.info(f"Using reward function: {reward_func_name}")
-
+    reward_fnc = load_reward_function(config.reward)
+    if config.reward.reward_funcs:
+        reward_desc = ", ".join(
+            f"{name}@{weight:g}"
+            for name, weight in zip(config.reward.reward_funcs, config.reward.reward_weights)
+        )
+        logger.info(f"Using reward functions: {reward_desc}")
     else:
-        raise ValueError("Reward function not specified")
+        logger.info(f"Using reward function: {config.reward.reward_func}")
 
     rollout_engines = create_rollout_engines(params=config,
                                              reward_fnc=reward_fnc,

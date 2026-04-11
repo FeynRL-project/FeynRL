@@ -254,7 +254,7 @@ def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_s
     return start_epoch, global_step
 
 
-def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None, ref_model_name=None):
+def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None, ref_model_name=None, save_ds_engine=True):
     '''
         Save a full training checkpoint: HF-compatible weights, model config,
         generation config, tokenizer, DeepSpeed engine state (optimizer/scheduler/RNG),
@@ -330,20 +330,23 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
     barrier_with_error_check(succeeded=save_ok, device=model_engine.device, label=f"{label}_save_config")
 
     # 3. Save DeepSpeed engine state (optimizer, scheduler, RNG) for resume
-    engine_state_dir = os.path.join(model_path, "ds_engine")
-    if rank == 0:
-        os.makedirs(engine_state_dir, exist_ok=True)
+    if save_ds_engine:
+        engine_state_dir = os.path.join(model_path, "ds_engine")
+        if rank == 0:
+            os.makedirs(engine_state_dir, exist_ok=True)
 
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
-    client_state = {'rng_python': random.getstate(),
-                    'rng_numpy': np.random.get_state(),
-                    'rng_torch_cpu': torch.random.get_rng_state()}
-    if torch.cuda.is_available():
-        client_state['rng_torch_cuda'] = torch.cuda.get_rng_state()
+        client_state = {'rng_python': random.getstate(),
+                        'rng_numpy': np.random.get_state(),
+                        'rng_torch_cpu': torch.random.get_rng_state()}
+        if torch.cuda.is_available():
+            client_state['rng_torch_cuda'] = torch.cuda.get_rng_state()
 
-    model_engine.save_checkpoint(engine_state_dir, tag="policy", client_state=client_state)
+        model_engine.save_checkpoint(engine_state_dir, tag="policy", client_state=client_state)
+    else:
+        logger.info(f"[Epoch {epoch+1}] Skipping DeepSpeed engine state save (save_ds_engine=False)")
 
     # 4. Training metadata and completion marker on rank 0
     if rank == 0:

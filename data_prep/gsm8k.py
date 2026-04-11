@@ -103,5 +103,31 @@ if __name__ == "__main__":
     print(f"Train file: {train_file_name} with {len(train_dataset)} examples.")
     print(f"Val file: {val_file_name} with {len(val_dataset)} examples.")
     print(f"Test file: {test_file_name} with {len(test_dataset)} examples.")
+
+    ########
+    # print samples from each shard
+    ########
+    SEP = "=" * 72
+    THIN = "-" * 72
+    N_SAMPLES = 2
+
+    for split_name, ds in [("TRAIN", train_dataset), ("VAL", val_dataset), ("TEST", test_dataset)]:
+        print(f"\n{SEP}")
+        print(f"  {split_name} SAMPLES  ({N_SAMPLES} of {len(ds)})")
+        print(SEP)
+        for i in range(N_SAMPLES):
+            ex = ds[i]
+            # Extract messages from the prompt
+            sys_msg  = next((m["content"] for m in ex["prompt"] if m["role"] == "system"), None)
+            user_msg = next((m["content"] for m in ex["prompt"] if m["role"] == "user"), "")
+            print(f"\n[{split_name} #{ex['index']}]")
+            print(THIN)
+            if sys_msg:
+                print(f"SYSTEM:\n  {sys_msg}\n")
+            print(f"QUESTION:\n  {user_msg}")
+            print(f"\nSOLUTION: {ex['solution']}")
+            print(THIN)
+        print()
+
     print("Done.")
     

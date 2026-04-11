@@ -181,6 +181,11 @@ data:
   solution_key: null
 
 deepspeed:
+  # Set to false to skip saving the ds_engine/ directory (optimizer/scheduler/RNG states).
+  # The optimizer state is typically several times larger than the raw weights, so
+  # skipping it saves significant disk space when training resume is not needed.
+  save_ds_engine: true
+
   zero_optimization:
     # 0:Disabled, 1:OptState, 2:Opt+Grad, 3:Opt+Grad+Param
     stage: 3

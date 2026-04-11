@@ -1311,6 +1311,7 @@ def main(args, config):
                     f"min_response_len={rollout_metrics['min_response_len']:.1f}, "
                     f"max_response_len={rollout_metrics['max_response_len']:.1f}, "
                     f"truncated_ratio={rollout_metrics['truncated_ratio']:.4f}, "
+                    f"seq_truncated_ratio={rollout_metrics['seq_truncated_ratio']:.4f}, "
                     f"eos_ratio={rollout_metrics['eos_ratio']:.4f}, "
                     f"mean_logprob={rollout_metrics['mean_logprob']:.4f}, "
                     f"unique_response_ratio={rollout_metrics['unique_response_ratio']:.4f}, "

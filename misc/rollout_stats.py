@@ -12,6 +12,7 @@ def new_accumulator():
             'max_response_len': float('-inf'),
             'total_tokens': 0,
             'total_truncated': 0,
+            'total_seq_truncated': 0,
             'total_eos': 0,
             'total_finish_stop': 0,
             'total_prompt_len': 0,
@@ -32,6 +33,7 @@ def accumulate(acc, stats):
     acc['max_response_len'] = max(acc['max_response_len'], stats['max_response_len'])
     acc['total_tokens'] += stats['total_tokens']
     acc['total_truncated'] += stats['total_truncated']
+    acc['total_seq_truncated'] += stats['total_seq_truncated']
     acc['total_eos'] += stats['total_eos']
     acc['total_finish_stop'] += stats['total_finish_stop']
     acc['total_prompt_len'] += stats['total_prompt_len']
@@ -57,7 +59,7 @@ def summarize(acc, rollout_time):
                 "frac_positive_reward": 0.0,
                 "avg_response_len": 0.0, "min_response_len": 0.0,
                 "max_response_len": 0.0, "response_len_std": 0.0,
-                "truncated_ratio": 0.0, "eos_ratio": 0.0,
+                "truncated_ratio": 0.0, "seq_truncated_ratio": 0.0, "eos_ratio": 0.0,
                 "finish_reason_stop_ratio": 0.0,
                 "mean_logprob": 0.0, "avg_prompt_len": 0.0,
                 "unique_response_ratio": 0.0, "tokens_per_sec": 0.0,
@@ -87,6 +89,7 @@ def summarize(acc, rollout_time):
             "max_response_len": acc['max_response_len'],
             "response_len_std": float(np.std(acc['all_response_lens'])),
             "truncated_ratio": acc['total_truncated'] / total,
+            "seq_truncated_ratio": acc['total_seq_truncated'] / total,
             "eos_ratio": acc['total_eos'] / total,
             "finish_reason_stop_ratio": acc['total_finish_stop'] / total,
             "mean_logprob": acc['total_logprob_sum'] / max(1, acc['total_logprob_tokens']),

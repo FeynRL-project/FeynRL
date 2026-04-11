@@ -431,7 +431,8 @@ class VLLMRolloutEngineAsync(Base):
                                         "prompt_ids": prompt_ids, # list[int]
                                         "response_text": getattr(response, "text", ""),
                                         "response_len": response_len,
-                                        "truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                        "truncated": 1 if finish_reason == "length" else 0,
+                                        "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
                                             })
 
             self.normalize_rewards(samples=group_samples, stats=group_stats, prompt_len=prompt_len, is_per_token=is_per_token)

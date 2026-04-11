@@ -261,6 +261,7 @@ def merge_rollout_with_stats(rollout_lists):
     # tokens
     total_tokens = 0
     total_truncated = 0
+    total_seq_truncated = 0
     total_eos = 0
     total_finish_stop = 0
     # prompts
@@ -300,6 +301,7 @@ def merge_rollout_with_stats(rollout_lists):
             # token stats
             total_tokens += len(sample['prompt_ids']) + len(sample['response_ids'])
             total_truncated += sample['truncated']
+            total_seq_truncated += sample['seq_truncated']
 
     stats = {'total_samples_generated': total_samples_generated,
             'all_rewards': all_rewards,
@@ -309,6 +311,7 @@ def merge_rollout_with_stats(rollout_lists):
             'max_response_len': max_response_len,
             'total_tokens': total_tokens,
             'total_truncated': total_truncated,
+            'total_seq_truncated': total_seq_truncated,
             'total_eos': total_eos,
             'total_finish_stop': total_finish_stop,
             'total_prompt_len': total_prompt_len,

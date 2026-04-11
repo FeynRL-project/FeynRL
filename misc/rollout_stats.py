@@ -7,6 +7,7 @@ def new_accumulator():
     return {'total_samples_generated': 0,
             'all_rewards': [],
             'all_zscores': [],
+            'all_named_rewards': {},   # Dict[str, List[float]] for per-component rewards
             'all_response_lens': [],
             'min_response_len': float('inf'),
             'max_response_len': float('-inf'),
@@ -27,6 +28,8 @@ def accumulate(acc, stats):
     acc['total_samples_generated'] += stats['total_samples_generated']
     acc['all_rewards'].extend(stats['all_rewards'])
     acc['all_zscores'].extend(stats['all_zscores'])
+    for name, values in stats.get('all_named_rewards', {}).items():
+        acc['all_named_rewards'].setdefault(name, []).extend(values)
     acc['all_response_lens'].extend(stats['all_response_lens'])
     acc['min_response_len'] = min(acc['min_response_len'], stats['min_response_len'])
     acc['max_response_len'] = max(acc['max_response_len'], stats['max_response_len'])
@@ -72,25 +75,32 @@ def summarize(acc, rollout_time):
     else:
         unique_response_ratio = 0.0
 
-    return {"total_samples_generated": total,
-            "total_tokens": acc['total_tokens'],
-            "avg_zscore": float(np.mean(zscore_arr)),
-            "zscore_std": float(np.std(zscore_arr)),
-            "avg_reward": float(np.mean(reward_arr)),
-            "total_reward": float(np.sum(reward_arr)),
-            "reward_std": float(np.std(reward_arr)),
-            "reward_min": float(np.min(reward_arr)),
-            "reward_max": float(np.max(reward_arr)),
-            "frac_positive_reward": float(np.mean(reward_arr > 0)),
-            "avg_response_len": float(np.mean(acc['all_response_lens'])),
-            "min_response_len": acc['min_response_len'],
-            "max_response_len": acc['max_response_len'],
-            "response_len_std": float(np.std(acc['all_response_lens'])),
-            "truncated_ratio": acc['total_truncated'] / total,
-            "eos_ratio": acc['total_eos'] / total,
-            "finish_reason_stop_ratio": acc['total_finish_stop'] / total,
-            "mean_logprob": acc['total_logprob_sum'] / max(1, acc['total_logprob_tokens']),
-            "avg_prompt_len": acc['total_prompt_len'] / total,
-            "unique_response_ratio": unique_response_ratio,
-            "tokens_per_sec": acc['total_tokens'] / max(1e-6, rollout_time),
-            "rollout_time": rollout_time}
+    summary = {"total_samples_generated": total,
+               "total_tokens": acc['total_tokens'],
+               "avg_zscore": float(np.mean(zscore_arr)),
+               "zscore_std": float(np.std(zscore_arr)),
+               "avg_reward": float(np.mean(reward_arr)),
+               "total_reward": float(np.sum(reward_arr)),
+               "reward_std": float(np.std(reward_arr)),
+               "reward_min": float(np.min(reward_arr)),
+               "reward_max": float(np.max(reward_arr)),
+               "frac_positive_reward": float(np.mean(reward_arr > 0)),
+               "avg_response_len": float(np.mean(acc['all_response_lens'])),
+               "min_response_len": acc['min_response_len'],
+               "max_response_len": acc['max_response_len'],
+               "response_len_std": float(np.std(acc['all_response_lens'])),
+               "truncated_ratio": acc['total_truncated'] / total,
+               "eos_ratio": acc['total_eos'] / total,
+               "finish_reason_stop_ratio": acc['total_finish_stop'] / total,
+               "mean_logprob": acc['total_logprob_sum'] / max(1, acc['total_logprob_tokens']),
+               "avg_prompt_len": acc['total_prompt_len'] / total,
+               "unique_response_ratio": unique_response_ratio,
+               "tokens_per_sec": acc['total_tokens'] / max(1e-6, rollout_time),
+               "rollout_time": rollout_time}
+
+    # Per-component reward averages, emitted as reward_<name>_avg
+    for name, values in acc.get('all_named_rewards', {}).items():
+        if values:
+            summary[f"reward_{name}_avg"] = float(np.mean(values))
+
+    return summary

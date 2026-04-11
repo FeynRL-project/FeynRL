@@ -166,10 +166,18 @@ class Base:
         '''
             Calculate the reward for each response token.
             it returns a float tensor of len(response_ids).
+
+            The reward function may return either:
+              (rewards, is_per_token, correct_threshold)
+              (rewards, is_per_token, correct_threshold, named_rewards)
+            where named_rewards is a Dict[str, float] of per-component scalars
+            for logging purposes.  Missing named_rewards defaults to {}.
         '''
         with torch.no_grad():
-            # per token rewards or scalar reward
-            rewards, is_per_token, correct_threshold = self.reward_func(prompt, response)
+            result = self.reward_func(prompt, response)
+
+        rewards, is_per_token, correct_threshold = result[:3]
+        named_rewards = result[3] if len(result) > 3 else {}
 
         if isinstance(rewards, torch.Tensor):
             rewards = rewards.to(dtype=torch.float32, device='cpu')
@@ -180,19 +188,27 @@ class Base:
         if rewards.numel() != len(response.token_ids):
             raise ValueError(f"score_response must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
 
-        return rewards, is_per_token, correct_threshold
+        return rewards, is_per_token, correct_threshold, named_rewards
 
     def score_responses_batch(self, pairs: List[tuple]) -> List[tuple]:
         '''
             Score all (prompt, response) pairs in one batch call.
             The reward function's .batch method handles concurrency internally
             (e.g. ProcessPoolExecutor with spawn context for math_verify).
+
+            Each result is normalized to a 4-tuple:
+              (rewards, is_per_token, correct_threshold, named_rewards)
+            where named_rewards is a Dict[str, float] of per-component scalars
+            for logging purposes.  Missing named_rewards defaults to {}.
         '''
         with torch.no_grad():
             raw_results = self.reward_func.batch(pairs)
 
         validated = []
-        for (rewards, is_per_token, correct_threshold), (_, response) in zip(raw_results, pairs):
+        for result, (_, response) in zip(raw_results, pairs):
+            rewards, is_per_token, correct_threshold = result[:3]
+            named_rewards = result[3] if len(result) > 3 else {}
+
             if isinstance(rewards, torch.Tensor):
                 rewards = rewards.to(dtype=torch.float32, device='cpu')
 
@@ -202,6 +218,6 @@ class Base:
             if rewards.numel() != len(response.token_ids):
                 raise ValueError(f"score_responses_batch must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
 
-            validated.append((rewards, is_per_token, correct_threshold))
+            validated.append((rewards, is_per_token, correct_threshold, named_rewards))
 
         return validated

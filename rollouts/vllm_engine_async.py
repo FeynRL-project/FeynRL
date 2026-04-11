@@ -353,7 +353,7 @@ class VLLMRolloutEngineAsync(Base):
                 rewards       = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
                 pred_rewards  = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
 
-                rewards_resp, is_per_token, correct_threshold = all_rewards[reward_idx]
+                rewards_resp, is_per_token, correct_threshold, named_rewards = all_rewards[reward_idx]
                 reward_idx += 1
                 rewards[prompt_len:] = rewards_resp
                 # correct_threshold must be collected from all responses, including empty
@@ -432,6 +432,7 @@ class VLLMRolloutEngineAsync(Base):
                                         "response_text": getattr(response, "text", ""),
                                         "response_len": response_len,
                                         "truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                        "named_rewards": named_rewards, # Dict[str, float] for per-component logging
                                             })
 
             self.normalize_rewards(samples=group_samples, stats=group_stats, prompt_len=prompt_len, is_per_token=is_per_token)

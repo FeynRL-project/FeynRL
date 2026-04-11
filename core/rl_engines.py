@@ -687,29 +687,23 @@ def init_nccl_weight_sync(training_engines, rollout_engines, master_addr, nccl_p
 
     return world_size, group_name
 
-def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_timeout):
+def start_nccl_gather(training_engines):
     '''
-        Broadcast weights from training engines to rollout engines via NCCL.
-        Three phases:
-          1. Gather: all training ranks participate in zero-3 collective gather.
-          2. Broadcast: fire receive on all rollout engines, then fire training broadcast.
-             Receive RPCs queue in Ray's actor mailbox behind any in-flight generate
-             calls. NCCL broadcast blocks until all participants enter.
-          3. Finalize: rollout engines load received weights into vLLM. We wait on
-             every engine and check the boolean return values — a False from any
-             engine indicates a partial load (the engine refused to advance its
-             loaded_version) and is treated as a sync failure.
-        Must only be called when ALL training engines are idle.
-        Returns True on full success, raises on any failure (gather/broadcast/
-        partial finalize). On failure, the caller is responsible for calling
-        clear_pending_nccl_state_dict on training rank 0 to free the gathered
-        ~28GB CPU buffer.
-    '''
-    start_time = time.time()
-    logger.info(f"[sync_weights_nccl] Starting weight sync v{version} to {len(rollout_engines)} rollout engines...")
+        Fire the ZeRO-3 gather on all training ranks (non-blocking).
+        Returns the list of Ray ObjectRefs for the gather futures. The caller
+        must eventually ray.get() them to obtain param_metadata.
 
-    # Phase 1: Gather state dict on all training ranks.
-    gather_futures = [engine.gather_weights_for_nccl.remote() for engine in training_engines]
+        This is the first phase of NCCL weight sync, separated so callers can
+        overlap the gather with other work (e.g. draining rollout pull loops).
+    '''
+    return [engine.gather_weights_for_nccl.remote() for engine in training_engines]
+
+def complete_nccl_gather(gather_futures, version, logger, sync_timeout):
+    '''
+        Wait for gather futures and extract param_metadata.
+        Returns param_metadata (list of (name, dtype, shape) tuples), or empty
+        list if no parameters were gathered.
+    '''
     gather_results = ray_get_with_timeout(refs=gather_futures,
                                           timeout=sync_timeout,
                                           description=f"NCCL weight gather v{version}",
@@ -721,8 +715,17 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
             param_metadata = result
             break
 
+    return param_metadata
+
+def broadcast_and_finalize_nccl(training_engines, rollout_engines, param_metadata, version, logger, sync_timeout):
+    '''
+        Phases 2+3 of NCCL weight sync: broadcast gathered weights from training rank 0 to all rollout engines, then finalize.
+        Expects gather to have already completed and param_metadata extracted via complete_nccl_gather. 
+        The gathered state dict sits in training_engines[0].pending_nccl_state_dict.
+        Returns True on full success, raises on any failure.
+    '''
     if not param_metadata:
-        logger.warning("[sync_weights_nccl] Phase 1: no parameters gathered; skipping broadcast")
+        logger.warning("[broadcast_and_finalize_nccl] No param_metadata; skipping broadcast")
         return True
 
     num_params = len(param_metadata)
@@ -731,7 +734,7 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
     # Phase 2: Fire receive on all engines, then training broadcast.
     # No barrier needed — NCCL broadcast is the implicit synchronization point.
     # Receive RPCs queue behind any in-flight generate calls in the actor mailbox.
-    logger.info(f"[sync_weights_nccl] Phase 2: dispatching receive ({num_params} params) to {num_engines} engines...")
+    logger.info(f"[broadcast_and_finalize_nccl] Dispatching receive ({num_params} params) to {num_engines} engines...")
     rollout_refs = [eng.receive_all_weights_nccl.remote(param_metadata)
                     for eng in rollout_engines]
 
@@ -744,7 +747,7 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
                              description=f"NCCL broadcast v{version}",
                              logger=logger)
     except Exception as e:
-        logger.error(f"[sync_weights_nccl] NCCL broadcast v{version} failed or timed out: {e}. "
+        logger.error(f"[broadcast_and_finalize_nccl] NCCL broadcast v{version} failed or timed out: {e}. "
                      f"Rollout engines may be stuck in NCCL collective. "
                      f"If training hangs after this, restart the job.")
         raise
@@ -763,12 +766,43 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
 
     if not all(bool(r) for r in finalize_results):
         failed = [i for i, r in enumerate(finalize_results) if not r]
-        raise RuntimeError(f"[sync_weights_nccl] Partial weight load on engines {failed}: "
+        raise RuntimeError(f"[broadcast_and_finalize_nccl] Partial weight load on engines {failed}: "
                            f"finalize_weight_nccl returned False. At least one engine "
                            f"received fewer params than expected ({num_params}). Aborting "
                            f"sync to prevent silent version mismatch.")
 
+    return True
+
+def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_timeout):
+    '''
+        Broadcast weights from training engines to rollout engines via nccl.
+        Three phases:
+          1. Gather: all training ranks participate in zero-3 collective gather.
+          2. Broadcast: fire receive on all rollout engines, then fire training broadcast.
+             Receive RPCs queue in Ray's actor mailbox behind any in-flight generate
+             calls. NCCL broadcast blocks until all participants enter.
+          3. Finalize: rollout engines load received weights into vLLM. We wait on
+             every engine and check the boolean return values — a False from any
+             engine indicates a partial load (the engine refused to advance its
+             loaded_version) and is treated as a sync failure.
+        Must only be called when ALL training engines are idle.
+        Returns True on full success, raises on any failure (gather/broadcast/
+        partial finalize). On failure, the caller is responsible for calling
+        clear_pending_nccl_state_dict on training rank 0 to free the gathere CPU buffer.
+    '''
+    start_time = time.time()
+    logger.info(f"[sync_weights_nccl] Starting weight sync v{version} to {len(rollout_engines)} rollout engines...")
+
+    gather_futures = start_nccl_gather(training_engines)
+    param_metadata = complete_nccl_gather(gather_futures, version, logger, sync_timeout)
+
+    if not param_metadata:
+        logger.warning("[sync_weights_nccl] Phase 1: no parameters gathered; skipping broadcast")
+        return True
+
+    broadcast_and_finalize_nccl(training_engines, rollout_engines, param_metadata, version, logger, sync_timeout)
+
     elapsed = time.time() - start_time
     logger.info(f"[sync_weights_nccl] Sync v{version} complete in {elapsed:.2f}s "
-                f"({num_params} params, {num_engines} engines)")
+                f"({len(param_metadata)} params, {len(rollout_engines)} engines)")
     return True

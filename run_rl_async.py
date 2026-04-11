@@ -28,7 +28,9 @@ from core.rl_engines import (Algorithm_Registry,
                             sync_weights_direct,
                             refresh_rollout_engine,
                             reinit_nccl_weight_sync_group,
-                            sync_weights_nccl)
+                            start_nccl_gather,
+                            complete_nccl_gather,
+                            broadcast_and_finalize_nccl)
 
 
 # Sentinel value pushed into prompt_queue to signal an engine to stop. Must
@@ -485,18 +487,18 @@ def perform_inline_sync(epoch, train_step_count, ess,
     '''
         Perform an inline mid-epoch nccl weight sync. Sequence:
           1. Stop the shard producer so it can't race with the drain.
-          2. Push poison pills, wait for pull loops to exit, draining results
-             continuously so engines blocked on results_queue.put() can unblock.
-          3. On drain failure: health-check engines, restart producer +
-             pull loops with OLD version, return so the caller skips the rest
-             of this iteration. End-of-epoch sync will retry.
-          4. On drain success: bump policy_version, sync_weights_nccl,
-             relaunch pull loops with NEW version, restart producer.
-          5. On sync exception: fatal NCCL errors re-raise (job exits);
-             recoverable errors leave engines on stale weights for retry.
-        Note, the infinite shard iterator means we don't need to preserve leftover
-        shards, any in-flight prompts that didn't complete are simply dropped
-        and the producer will pull fresh prompts on restart.
+          2. Push poison pills and fire ZeRO-3 gather on training engines. The gather is a 
+             training-side-only collective and it does not involve rollout engines, so it runs in parallel with step 3.
+          3. Wait for pull loops to exit, draining results continuously so engines blocked on results_queue.put()
+             can unblock. The gather runs concurrently on training GPUs during this wait.
+          4. On drain failure: wait for the in-flight gather to land, clear the pending state dict to avoid a CPU memory 
+             leak, health-check engines, restart producer + pull loops with OLD version, return.
+          5. On drain success: wait for gather (likely already done), bump policy_version, broadcast + finalize, relaunch 
+             pull loops with NEW version, restart producer.
+          6. On sync exception: fatal NCCL errors re-raise (job exits) and recoverable errors leave engines on stale weights for retry.
+
+        Note, the infinite shard iterator means we don't need to preserve leftover shards, any in-flight prompts
+        that didn't complete are simply dropped and the producer will pull fresh prompts on restart.
     '''
     num_engines = len(rollout_engines)
     sync_start = time.time()
@@ -514,6 +516,14 @@ def perform_inline_sync(epoch, train_step_count, ess,
     stop_engines_and_drain(prompt_queue=prompt_queue,
                            num_rollout_engines=num_engines,
                            logger=logger)
+
+    # Fire the ZeRO-3 gather on training engines BEFORE waiting for pull loops.
+    # The gather is a training-side-only collective, no rollout participation,
+    # so it runs concurrently with the pull-loop drain below.
+    t_gather_start = time.time()
+    gather_futures = start_nccl_gather(training_engines)
+    logger.info(f"[Epoch {epoch+1}] Fired ZeRO-3 gather on {len(training_engines)} "
+                f"training engines (overlapped with pull-loop drain)")
 
     # Wait for pull loops to exit. On timeout an engine is stuck in generate(),
     # so we abort sync to avoid wedging the broadcast collective.
@@ -534,7 +544,21 @@ def perform_inline_sync(epoch, train_step_count, ess,
         logger.error(f"[Epoch {epoch+1}] Skipping inline sync to avoid weight "
                      f"broadcast deadlock; end-of-epoch sync will retry.")
 
-        # we don't have reinit_nccl_weight_sync_group fallback for now, so we make sure that 
+        # The gather is still in flight on training engines. Let it finish.
+        # Since it's a zero-3 collective, we can't cancel it without risking a
+        # NCCL hang on the remaining ranks, so we need to let is finish.
+        # Then clear the pending state dict to avoid a CPU memory leak.
+        try:
+            ray.get(gather_futures, timeout=sync_timeout)
+        except Exception as gather_err:
+            logger.warning(f"[Epoch {epoch+1}] In-flight gather failed during "
+                           f"drain-failure cleanup (continuing): {gather_err}")
+        try:
+            ray.get(training_engines[0].clear_pending_nccl_state_dict.remote(), timeout=10)
+        except Exception:
+            pass
+
+        # we don't have reinit_nccl_weight_sync_group fallback for now, so we make sure that
         # any missing rank fails fast and would wedge next broadcast otherwise.
         dead_engines = check_rollout_engines_health(rollout_engines)
         if dead_engines:
@@ -591,11 +615,23 @@ def perform_inline_sync(epoch, train_step_count, ess,
     try:
         logger.info(f"[Epoch {epoch+1}] NCCL broadcast START (v{rollout_policy_version} -> v{policy_version})")
         t0 = time.time()
-        sync_weights_nccl(training_engines=training_engines,
-                          rollout_engines=rollout_engines,
-                          version=policy_version,
-                          logger=logger,
-                          sync_timeout=sync_timeout)
+
+        # Complete the gather
+        param_metadata = complete_nccl_gather(gather_futures=gather_futures,
+                                              version=policy_version,
+                                              logger=logger,
+                                              sync_timeout=sync_timeout)
+        gather_elapsed = time.time() - t_gather_start
+        logger.info(f"[Epoch {epoch+1}] ZeRO-3 gather complete in {gather_elapsed:.2f}s "
+                    f"({len(param_metadata)} params, overlapped with drain)")
+
+        # Broadcast gathered weights to rollout engines and finalize.
+        broadcast_and_finalize_nccl(training_engines=training_engines,
+                                    rollout_engines=rollout_engines,
+                                    param_metadata=param_metadata,
+                                    version=policy_version,
+                                    logger=logger,
+                                    sync_timeout=sync_timeout)
 
         rollout_policy_version = policy_version
         sync_triggered_this_epoch = True

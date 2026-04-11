@@ -140,12 +140,18 @@ def save_checkpoint(epoch,
                     experiment_id,
                     rank,
                     logger,
-                    save_timeout):
+                    save_timeout,
+                    save_ds_engine=True):
     '''
        Save model checkpoint. This must run on all ranks for ZeRO-3.
        Writes hf compatible weights and for vllm, ds engine state
        optimizer/scheduler for resume, training metadata, and a
        CHECKPOINT_COMPLETE marker for crash-safe.
+
+       Args:
+           save_ds_engine: When False, skip saving the DeepSpeed engine state
+                           (optimizer/scheduler/RNG) to save ~90GB per checkpoint.
+                           Set to False when training resume is not needed.
     '''
     # Note if multi-node cluster is used, checkpoint_dir must be on a shared
     # filesystem such as NFS, Lustre, etc. or each node writes to isolated local disk
@@ -178,7 +184,7 @@ def save_checkpoint(epoch,
     # 2. save DeepSpeed engine state so we can resume training later.
     # Directory creation happens inside save_engine_state on DS rank 0.
     engine_state_dir = os.path.join(model_path, "ds_engine")
-    state_futures = [engine.save_engine_state.remote(engine_state_dir) for engine in training_engines]
+    state_futures = [engine.save_engine_state.remote(engine_state_dir, save_ds_engine) for engine in training_engines]
     ray_get_with_timeout(refs=state_futures,
                          timeout=save_timeout,
                          description=f"engine state save (epoch {epoch+1})",

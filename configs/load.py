@@ -207,6 +207,12 @@ class DeepSpeed(BaseModel):
     # Monitor config
     monitor_config: Dict[str, Any] | None = None
 
+    # Whether to save the DeepSpeed engine state (optimizer, scheduler, RNG)
+    # alongside the HF-compatible weights. Set to False to skip the ds_engine/
+    # directory and save ~90GB of optimizer state per checkpoint when resume
+    # is not needed (e.g. eval-only or final checkpoints).
+    save_ds_engine: bool = True
+
     def model_dump(self, **kwargs):
         # Exclude None values by default for ds compatibility.
         # DS crashes when config contains explicit None values because

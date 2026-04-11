@@ -556,7 +556,8 @@ if __name__ == "__main__":
                                      logger=logger,
                                      label="cl",
                                      zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
-                                     model_dtype=config.model.dtype)
+                                     model_dtype=config.model.dtype,
+                                     save_ds_engine=config.deepspeed.save_ds_engine)
 
     total_training_time = time.time() - training_start_time
     logger.info(f"Training completed successfully! Total time: {total_training_time:.2f}s ({total_training_time/3600:.2f}h)")

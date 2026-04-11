@@ -1067,14 +1067,25 @@ class COMMON:
                                f"(this is rank {torch.distributed.get_rank()}), all ranks aborting "
                                 f"to prevent deadlock")
 
-    def save_engine_state(self, engine_state_dir):
+    def save_engine_state(self, engine_state_dir, save_ds_engine=True):
         '''
             Save deepspeed engine state such as optimizer, LR scheduler for training resume.
             Uses DS native save_checkpoint which handles ZeRO partition persistence
             so each rank saves its own optimizer shard. Must be called on ALL ranks.
             RNG states are stored in client_state so each rank preserves its own
             Python/NumPy/PyTorch/CUDA random generator state.
+
+            Args:
+                save_ds_engine: When False, skip saving optimizer/scheduler/RNG state.
+                                Set to False when resume is not needed (saves ~90GB per
+                                checkpoint). The HF-compatible weights are still saved
+                                by save_checkpoint().
         '''
+        if not save_ds_engine:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"[Alg:{self.alg_name}][Rank {rank}] Skipping DeepSpeed engine state save (save_ds_engine=False)")
+            return
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
         # Create dir on rank 0 to avoid NFS metadata propagation races.

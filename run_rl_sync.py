@@ -439,7 +439,8 @@ def main(args, config):
                                          experiment_id=config.run.experiment_id,
                                          rank=rank,
                                          logger=logger,
-                                         save_timeout=save_timeout)
+                                         save_timeout=save_timeout,
+                                         save_ds_engine=config.deepspeed.save_ds_engine)
             logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
 
         # Disk-based rollout refresh

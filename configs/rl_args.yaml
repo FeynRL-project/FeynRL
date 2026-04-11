@@ -182,7 +182,8 @@ data:
 
 deepspeed:
   # Set to false to skip saving the ds_engine/ directory (optimizer/scheduler/RNG states).
-  # Saves ~90GB per checkpoint when training resume is not needed.
+  # The optimizer state is typically several times larger than the raw weights, so
+  # skipping it saves significant disk space when training resume is not needed.
   save_ds_engine: true
 
   zero_optimization:

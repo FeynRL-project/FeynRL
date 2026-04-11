@@ -10,7 +10,8 @@ run:
 reward:
   # reward in duriong evaluation is fucntion that scores the model's answer
   broadcast: False
-  reward_func: dummy_reward_func
+  reward_funcs: [dummy_reward_func]
+  reward_weights: [1.0]
 
 rollout:
   temperature: 1.0

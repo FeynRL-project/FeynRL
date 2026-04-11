@@ -3,7 +3,6 @@ import json
 import yaml
 import numpy as np
 import argparse
-import importlib
 import torch
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
@@ -16,6 +15,7 @@ import configs.load as cfg # all config arguments
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from rollouts.vllm_engine import VLLMRolloutEngine
 from misc.utils import set_random_seeds, ray_get_with_timeout, get_determinism_env_vars
+from misc.reward_utils import load_reward_function
 from misc.logging import setup_logging, setup_tracker
 from rollouts.replay_buffer import ReplayBuffer
 
@@ -379,15 +379,15 @@ if __name__ == "__main__":
     # 6. initialize inference engine
     ########
     logger.info("Setting up inference/rollout engines...")
-
-    reward_func_name = config.reward.reward_func if config.reward.reward_func else None
-    if reward_func_name:
-        reward_module = importlib.import_module("rewards." + reward_func_name)
-        reward_fnc = getattr(reward_module, "compute_score")
-        logger.info(f"Using reward function: {reward_func_name}")
-
+    reward_fnc = load_reward_function(config.reward)
+    if config.reward.reward_funcs:
+        reward_desc = ", ".join(
+            f"{name}@{weight:g}"
+            for name, weight in zip(config.reward.reward_funcs, config.reward.reward_weights)
+        )
+        logger.info(f"Using reward functions: {reward_desc}")
     else:
-        raise ValueError("Reward function not specified")
+        logger.info(f"Using reward function: {config.reward.reward_func}")
 
     rollout_engines = create_rollout_engines(params=config,
                                              reward_fnc=reward_fnc,

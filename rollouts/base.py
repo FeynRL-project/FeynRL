@@ -170,14 +170,17 @@ class Base:
             The reward function may return either:
               (rewards, is_per_token, correct_threshold)
               (rewards, is_per_token, correct_threshold, named_rewards)
+              (rewards, is_per_token, correct_threshold, named_rewards, correctness_reward)
             where named_rewards is a Dict[str, float] of per-component scalars
-            for logging purposes.  Missing named_rewards defaults to {}.
+            for logging purposes. Missing named_rewards defaults to {}.
+            correctness_reward is an optional scalar used for pass@k metrics.
         '''
         with torch.no_grad():
             result = self.reward_func(prompt, response)
 
         rewards, is_per_token, correct_threshold = result[:3]
         named_rewards = result[3] if len(result) > 3 else {}
+        correctness_reward = result[4] if len(result) > 4 else None
 
         if isinstance(rewards, torch.Tensor):
             rewards = rewards.to(dtype=torch.float32, device='cpu')
@@ -188,7 +191,7 @@ class Base:
         if rewards.numel() != len(response.token_ids):
             raise ValueError(f"score_response must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
 
-        return rewards, is_per_token, correct_threshold, named_rewards
+        return rewards, is_per_token, correct_threshold, named_rewards, correctness_reward
 
     def score_responses_batch(self, pairs: List[tuple]) -> List[tuple]:
         '''
@@ -197,9 +200,10 @@ class Base:
             (e.g. ProcessPoolExecutor with spawn context for math_verify).
 
             Each result is normalized to a 4-tuple:
-              (rewards, is_per_token, correct_threshold, named_rewards)
+              (rewards, is_per_token, correct_threshold, named_rewards, correctness_reward)
             where named_rewards is a Dict[str, float] of per-component scalars
-            for logging purposes.  Missing named_rewards defaults to {}.
+            for logging purposes. Missing named_rewards defaults to {}.
+            correctness_reward is an optional scalar used for pass@k metrics.
         '''
         with torch.no_grad():
             raw_results = self.reward_func.batch(pairs)
@@ -208,6 +212,7 @@ class Base:
         for result, (_, response) in zip(raw_results, pairs):
             rewards, is_per_token, correct_threshold = result[:3]
             named_rewards = result[3] if len(result) > 3 else {}
+            correctness_reward = result[4] if len(result) > 4 else None
 
             if isinstance(rewards, torch.Tensor):
                 rewards = rewards.to(dtype=torch.float32, device='cpu')
@@ -218,6 +223,6 @@ class Base:
             if rewards.numel() != len(response.token_ids):
                 raise ValueError(f"score_responses_batch must return len={len(response.token_ids)} rewards, got {rewards.numel()}")
 
-            validated.append((rewards, is_per_token, correct_threshold, named_rewards))
+            validated.append((rewards, is_per_token, correct_threshold, named_rewards, correctness_reward))
 
         return validated

@@ -199,8 +199,12 @@ Controls interleaved rollout generation and training within a single epoch. When
 
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
-| `reward_func` | Reward function name in `rewards/` module | String | `"gsm8k_reward_func"` |
+| `reward_funcs` | Reward function names in `rewards/`, combined in order | List of strings | `["math_verify_reward_func", "eos_reward_func"]` |
+| `reward_weights` | Scalar weights applied to each reward before training | List of floats, same length as `reward_funcs` | `[1.0, 0.1]` |
+| `reward_func` | Legacy single reward function name in `rewards/` module | String | `"gsm8k_reward_func"` |
 | `broadcast` | Broadcast scalar reward across response tokens | Boolean | `false` |
+
+When `reward_funcs` is used, the first reward defines correctness for pass@k metrics. Auxiliary rewards still contribute to training reward and are logged independently.
 
 ---
 

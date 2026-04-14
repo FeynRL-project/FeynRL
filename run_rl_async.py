@@ -6,7 +6,7 @@ import ray
 import time
 import shutil
 import threading
-
+import math
 # imports local methods, classes, etc.
 from misc.utils import load_algorithm, ray_get_with_timeout, set_random_seeds
 from ray.util.queue import Queue as RayQueue, Empty as RayQueueEmpty, Full as RayQueueFull
@@ -389,38 +389,41 @@ def check_ess_sync(train_metrics, train_step_count, ess_sync_threshold, fixed_sy
 
     return False, ess
 
-def compute_replay_buffer_size(rollout_samples_per_epoch, n_samples, max_lag,
+def compute_pipeline_capacities(rollout_samples_per_epoch, rollout_batch_size_per_gpu,
+                               num_rollout_engines, n_samples, max_lag,
                                train_batch_size_per_gpu, training_gpus,
                                gradient_accumulation_steps, steps_per_epoch):
     '''
-        Derive the replay buffer hard cap from user-facing config knobs.
-        Returns (replay_buffer_size, items_per_epoch, items_per_opt_step,
-                 off_policy_bound, consumption_bound) so the caller can log
-                 the breakdown without recomputing.
+        Derive replay buffer hard cap and queue capacities from config.
+        Returns (replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize).
     '''
-    items_per_epoch    = rollout_samples_per_epoch * n_samples
-    items_per_opt_step = train_batch_size_per_gpu * training_gpus * gradient_accumulation_steps
-    # epochs of old data tolerated before eviction must drop it
-    off_policy_bound   = items_per_epoch * max(2, max_lag)
-    # items the trainer will consume per epoch
-    consumption_bound  = items_per_opt_step * steps_per_epoch
-    replay_buffer_size = off_policy_bound + consumption_bound
-    return replay_buffer_size, items_per_epoch, items_per_opt_step, off_policy_bound, consumption_bound
+    # Actual number of prompts per dataloader pass, rounded up to batch boundary.
+    # Same calculation as core/rl_engines.create_rollout_dataloader.
+    bsz_rollout       = num_rollout_engines * rollout_batch_size_per_gpu
+    prompt_per_pass   = math.ceil(rollout_samples_per_epoch / bsz_rollout) * bsz_rollout
+    generation_bound  = prompt_per_pass * n_samples * max(2, max_lag)
 
-def compute_pipeline_queue_sizes(num_rollout_engines, max_lag,
-                                  rollout_batch_size_per_gpu, n_samples,
-                                  replay_buffer_size):
-    '''
-        Derive prompt_queue and results_queue capacities.
-        Returns (prompt_queue_maxsize, results_queue_maxsize).
-    '''
-    # one shard per engine per burst
-    shards_per_burst      = num_rollout_engines
+    # One optimizer step's worth of samples as safety margin.
+    consumption_bound = train_batch_size_per_gpu * training_gpus * gradient_accumulation_steps
+    # Replay buffer holds max_lag passes worth of samples so off-policy data
+    # from older versions survives long enough for training to consume it.
+    # consumption_bound is added a safetey margin for the case when the training
+    # is faster than the generation. Otherwise, the training will be blocked.
+    replay_buffer_size = generation_bound + consumption_bound
+
+    # prompt_queue holds shards, not individual prompts. One shard = one list
+    # of rollout_batch_size_per_gpu prompts. The ShardProducer pushes one shard
+    # at a time, and each rollout engine pulls one shard per generation call.
+    # it should be large enough for each engine to have max(2, max_lag) shards queued.
+    prompt_queue_maxsize = num_rollout_engines * max(2, max_lag)
+
+    # results_queue holds shard results. Each item = one shard's completed
+    # samples, prompt_queue_maxsize. And like above, it should be large enough to absorb
+    # the buffer's worth of shard results without immediate backpressure.
     items_per_shard       = rollout_batch_size_per_gpu * n_samples
-    prompt_queue_maxsize  = shards_per_burst * max(2, max_lag)
-    # it should be large enough to absorb one buffer's worth without immediate backpressure
     results_queue_maxsize = max(prompt_queue_maxsize, replay_buffer_size // items_per_shard)
-    return prompt_queue_maxsize, results_queue_maxsize
+
+    return replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize
 
 def log_driver_heartbeat(epoch, train_step_count, steps_per_epoch,
                          prompt_queue, prompt_queue_maxsize,
@@ -1138,24 +1141,24 @@ def main(args, config):
 
     # Hard cap the replay buffer with a deque so per-iter work in prepare_training_batches
     # stays bounded as training runs.
-    (replay_buffer_size, items_per_epoch, items_per_opt_step,
-     off_policy_bound, consumption_bound) = compute_replay_buffer_size(rollout_samples_per_epoch=config.rollout.rollout_samples_per_epoch,
-                                                                       n_samples=config.rollout.n_samples,
-                                                                       max_lag=overlap_max_lag,
-                                                                       train_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
-                                                                       training_gpus=training_gpus,
-                                                                       gradient_accumulation_steps=config.train.gradient_accumulation_steps,
-                                                                       steps_per_epoch=steps_per_epoch,
-                                                                       )
+    (replay_buffer_size, results_queue_maxsize,
+                         prompt_queue_maxsize) = compute_pipeline_capacities(rollout_samples_per_epoch=config.rollout.rollout_samples_per_epoch,
+                                                                             rollout_batch_size_per_gpu=config.rollout.rollout_batch_size_per_gpu,
+                                                                             num_rollout_engines=num_rollout_engines,
+                                                                             n_samples=config.rollout.n_samples,
+                                                                             max_lag=overlap_max_lag,
+                                                                             train_batch_size_per_gpu=config.train.train_batch_size_per_gpu,
+                                                                             training_gpus=training_gpus,
+                                                                             gradient_accumulation_steps=config.train.gradient_accumulation_steps,
+                                                                             steps_per_epoch=steps_per_epoch,
+                                                                             )
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
                                  max_size=replay_buffer_size,
                                  )
-    logger.info(f"Replay buffer: deque(maxlen={replay_buffer_size}) "
-                f"[off_policy={off_policy_bound} (items_per_epoch={items_per_epoch} x lag={max(2, overlap_max_lag)}) "
-                f"+ consumption={consumption_bound} (items_per_opt_step={items_per_opt_step} x "
-                f"train_passes={steps_per_epoch})], max_seq_len={config.data.max_seq_len}, "
-                f"oldest evicted on insert.")
+    logger.info(f"Pipeline capacities: replay_buffer={replay_buffer_size}, "
+                f"results_queue={results_queue_maxsize}, prompt_queue={prompt_queue_maxsize}, "
+                f"max_seq_len={config.data.max_seq_len}")
 
     ########
     # 9. Resume from checkpoint if requested and clean up incomplete checkpoint directories
@@ -1240,11 +1243,7 @@ def main(args, config):
     ########
     # 11. Persistent rollout queues, shard producer, pull loops.
     ########
-    prompt_queue_maxsize, results_queue_maxsize = compute_pipeline_queue_sizes(num_rollout_engines=num_rollout_engines,
-                                                                                max_lag=overlap_max_lag,
-                                                                                rollout_batch_size_per_gpu=config.rollout.rollout_batch_size_per_gpu,
-                                                                                n_samples=config.rollout.n_samples,
-                                                                                replay_buffer_size=replay_buffer_size)
+    # Queue sizes already computed by compute_pipeline_capacities above.
     prompt_queue  = RayQueue(maxsize=prompt_queue_maxsize)
     results_queue = RayQueue(maxsize=results_queue_maxsize)
     logger.info(f"Queues: prompt_queue maxsize={prompt_queue_maxsize}, "

@@ -410,6 +410,9 @@ class Config(BaseModel):
                     "warmup_num_steps": warmup_steps
                 }
             }
+        elif self.train.lr_scheduler == "constant":
+            # No scheduler — DeepSpeed keeps the LR fixed at the optimizer's lr.
+            self.deepspeed.scheduler = None
         else:
             raise ValueError(f"Unsupported scheduler: {self.train.lr_scheduler}")
 

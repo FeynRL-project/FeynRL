@@ -425,55 +425,32 @@ def prepare_training_batches(replay_buffer,
                              batch_size: int,
                              num_engines: int,
                              seed: int = 0,
-                             epoch: int = 0,
-                             recency_decay: float = 1.0,
-                             current_policy_version: int | None = None,
-                             max_batches: int | None = None) -> list:
+                             epoch: int = 0) -> list:
     '''
-        Create and pad training batches for distributed training.
-        current_policy_version: trainer's current policy version, defaults
-            to None for sync-mode callers that don't track versions.
-        max_batches: cap the number of micro-batches built before padding.
-            Used by async mode to bound per-call work to one optimizer step
-            regardless of replay buffer size. without this, prepare_training_batches
-            scales O(buffer) which becomes seconds at large scale.
+        Build uniformly-shuffled, equal-sized training micro-batches from the
+        full replay buffer. Every item in the buffer appears in exactly one
+        micro-batch (except the final padding repeat to equalize per-engine
+        counts).
     '''
-    # Create dataloader from replay buffer. Use a seeded generator for
-    # deterministic order across runs.
     g = torch.Generator()
     g.manual_seed(seed + epoch)
-    sampler = weighted_sampler_by_recency(replay_buffer, recency_decay,
-                                          current_policy_version, g)
-    if sampler is not None:
-        loader = DataLoader(dataset=replay_buffer,
-                            batch_size=batch_size,
-                            sampler=sampler,
-                            num_workers=0,
-                            pin_memory=False,
-                            collate_fn=replay_buffer.collate_fn)
-    else:
-        loader = DataLoader(dataset=replay_buffer,
-                            batch_size=batch_size,
-                            shuffle=True,
-                            num_workers=0,
-                            pin_memory=False,
-                            collate_fn=replay_buffer.collate_fn,
-                            generator=g)
-    # We materialize lazily via a for-loop so max_batches can short-circuit
-    # before the entire buffer is read.
-    train_batches = []
-    for b in loader:
-        train_batches.append(b)
-        if max_batches is not None and len(train_batches) >= max_batches:
-            break
+    loader = DataLoader(dataset=replay_buffer,
+                        batch_size=batch_size,
+                        shuffle=True,
+                        num_workers=0,
+                        pin_memory=False,
+                        collate_fn=replay_buffer.collate_fn,
+                        generator=g)
 
-    # Pad to ensure equal batches per engine (prevents DeepSpeed hang)
+    train_batches = list(loader)
+
+    # Pad to ensure equal batches per engine, unequal shard sizes across
+    # engines deadlock ZeRO-3 collectives.
     num_batches = len(train_batches)
     batches_per_engine = (num_batches + num_engines - 1) // num_engines
-    total_needed = batches_per_engine * num_engines
+    total_needed       = batches_per_engine * num_engines
 
     if total_needed > num_batches:
-        # Pad by repeating the last batch
         padding = [train_batches[-1]] * (total_needed - num_batches)
         batches_padded = train_batches + padding
 
@@ -809,3 +786,92 @@ def sync_weights_nccl(training_engines, rollout_engines, version, logger, sync_t
     logger.info(f"[sync_weights_nccl] Sync v{version} complete in {elapsed:.2f}s "
                 f"({len(param_metadata)} params, {len(rollout_engines)} engines)")
     return True
+
+def log_driver_heartbeat(epoch, train_step_count, steps_per_epoch,
+                         prompt_queue, prompt_queue_maxsize,
+                         results_queue, results_queue_maxsize,
+                         pull_refs, producer, replay_buffer,
+                         since_last_step_s, logger):
+    '''
+        Snapshot of the live training-loop state. Catches
+        "rollout went idle and nothing was logged" cases.
+    '''
+    try:
+        pq_size = prompt_queue.qsize()
+    except Exception:
+        pq_size = -1
+
+    try:
+        rq_size = results_queue.qsize()
+    except Exception:
+        rq_size = -1
+
+    ready_refs, _  = ray.wait(pull_refs, num_returns=len(pull_refs), timeout=0)
+    alive_pulls    = len(pull_refs) - len(ready_refs)
+    producer_alive = (producer.thread is not None and producer.thread.is_alive())
+    since_str      = f"{since_last_step_s:.0f}s" if since_last_step_s is not None else "never"
+    logger.info(f"[Epoch {epoch+1}] HEARTBEAT step={train_step_count}/{steps_per_epoch}, "
+                f"buffer={len(replay_buffer)}, "
+                f"prompt_q={pq_size}/{prompt_queue_maxsize}, "
+                f"results_q={rq_size}/{results_queue_maxsize}, "
+                f"producer_alive={producer_alive} (shards={producer.shards_produced}), "
+                f"pull_loops_alive={alive_pulls}/{len(pull_refs)}, "
+                f"since_last_train_step={since_str}")
+
+def check_rollout_engines_health(rollout_engines, rollout_timeout):
+    '''
+        Two-stage parallel health check. Stages run serially; engines
+        within each stage are pinged in parallel.
+        all engines -> ping(10s):
+        1) dead -> record
+        2) live -> ping_mailbox(30s) -> (dead -> record or alive -> ok)
+        ping: detects dead process.
+        ping_mailbox: detects wedged pull loop via staleness vs rollout_timeout.
+        Returns list of (idx, reason) for engines that failed either stage.
+    '''
+    PING_TIMEOUT    = 10.0
+    MAILBOX_TIMEOUT = 30.0
+    def parallel_check(refs, indices, timeout, prefix):
+        '''
+            Submit refs, wait with timeout, collect (idx, reason) for failures.
+        '''
+        ready, unready = ray.wait(refs, num_returns=len(refs), timeout=timeout)
+        ref_idx = dict(zip(refs, indices))
+        failed  = [(ref_idx[r], f"{prefix}: timeout after {timeout}s") for r in unready]
+        for r in ready:
+            try:
+                ray.get(r)
+            except Exception as e:
+                failed.append((ref_idx[r], f"{prefix}: {e}"))
+        return failed
+
+    n = len(rollout_engines)
+
+    # Stage 1: ping all engines.
+    dead = parallel_check(refs=[eng.ping.remote() for eng in rollout_engines],
+                           indices=list(range(n)),
+                           timeout=PING_TIMEOUT,
+                           prefix="health")
+
+    # Stage 2: ping_mailbox only engines that passed stage 1.
+    dead_set = {idx for idx, _ in dead}
+    alive    = [i for i in range(n) if i not in dead_set]
+    if alive:
+        dead.extend(parallel_check(refs=[rollout_engines[i].ping_mailbox.remote(float(rollout_timeout)) for i in alive],
+                                  indices=alive,
+                                  timeout=MAILBOX_TIMEOUT,
+                                  prefix="mailbox wedged",))
+
+    return dead
+
+def clear_pending_nccl_state_dict(rank0_engine, logger=None):
+    '''
+        Best-effort cleanup of the rank-0 cached state dict left by a
+        completed ZeRO-3 gather.
+    '''
+    try:
+        ray.get(rank0_engine.clear_pending_nccl_state_dict.remote(), timeout=10)
+    except Exception as e:
+        if logger is not None:
+            logger.warning(f"[clear_pending_nccl_state_dict] best-effort cleanup failed "
+                           f"(CPU memory may leak on this retry): {e}")

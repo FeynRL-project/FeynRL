@@ -39,19 +39,8 @@ run:
 overlap:
   # Overlap training and rollout generation
   enabled: False
-  # Max training steps ahead of rollout policy version
+  # Number of policy versions retained in the replay buffer.
   max_lag: 2
-  # ESS below this triggers sync between training steps (P3O only)
-  # lower threshold means more acceptance of offpolicyiness.
-  ess_sync_threshold: 0.5
-  # Static sync interval in training steps for non-P3O algorithms regardless of off-policness of data.
-  # Set to null for P3O (ESS drives sync). For GRPO/CISPO, set >= steps_per_epoch
-  # to sync once per epoch, or null to only sync at epoch boundaries via max_lag.
-  # Note setting to 1 forces sync after every step, effectively limiting training to 1 step.
-  fixed_sync_interval: null
-  # 1.0 = uniform sampling over the buffer
-  # <1.0 biases sampling toward fresher data. Only used in async mode.
-  recency_decay: 1.0
   # Used for Decoupled PPO as interpolation coefficient for proximal policy.
   # Must be in (0, 1] when overlap is enabled.
   alpha: null

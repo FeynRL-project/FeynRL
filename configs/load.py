@@ -242,16 +242,8 @@ class Overlap(BaseModel):
     '''
     model_config = ConfigDict(extra='forbid')
     enabled: bool  | None = None
-    # Max training steps ahead of rollout policy version
+    # Number of policy versions retained in the replay buffer.
     max_lag: int | None = None
-    # ESS below this triggers sync between training steps (P3O only)
-    ess_sync_threshold: float | None = None
-    # Static sync interval in training steps for non-P3O algorithms.
-    # None = disabled (only ESS-driven sync).
-    fixed_sync_interval: int | None = None
-    # Recency-weighted replay sampling in overlap mode. 1.0 = uniform sampling
-    # over the replay buffer. <1.0 biases sampling toward more recent policy.
-    recency_decay: float | None = None
     # Used for Decoupled PPO as interpolation coefficient for proximal policy.
     # Must be in (0, 1] when overlap is enabled.
     alpha: float | None = None
@@ -790,36 +782,11 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                     raise ValueError(f"weight_sync_method must be one of nccl/direct/disk, "
                                      f"got {config.run.weight_sync_method}")
 
-                if config.overlap.ess_sync_threshold is None or not (0.0 < config.overlap.ess_sync_threshold <= 1.0):
-                    raise ValueError(f"overlap.ess_sync_threshold must be in (0.0, 1.0], got {config.overlap.ess_sync_threshold}")
-
-                if config.overlap.recency_decay  and not (0.0 < config.overlap.recency_decay <= 1.0):
-                    raise ValueError(f"overlap.recency_decay must be in (0.0, 1.0], got {config.overlap.recency_decay} "
-                                     f"(1.0 = uniform sampling, <1.0 biases sampling toward fresher policy versions)")
-
                 if config.overlap.alpha is None or not (0.0 < config.overlap.alpha <= 1.0):
                     raise ValueError(f"overlap.alpha must be in (0.0, 1.0] when overlap is enabled, got {config.overlap.alpha}")
 
                 if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
                     raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")
-
-                # ESS-driven sync only works with P3O for now.
-                # Other algorithms must use fixed_sync_interval for mid-epoch sync.
-                alg_name = config.train.alg_name.lower() if config.train.alg_name else ""
-                fixed_interval = config.overlap.fixed_sync_interval
-                if alg_name != "p3o" and (fixed_interval is None or fixed_interval <= 0):
-                    raise ValueError(f"overlap.fixed_sync_interval must be > 0 when overlap is enabled "
-                                     f"with algorithm '{config.train.alg_name}' (only P3O supports ESS-driven sync). "
-                                     f"Set it to train_steps_per_epoch ({config.train.train_steps_per_epoch}) "
-                                     f"for one sync per epoch, or a smaller value for more frequent syncs.")
-
-                steps_per_epoch = config.train.train_steps_per_epoch
-                if fixed_interval is not None and fixed_interval > 0 and fixed_interval < steps_per_epoch:
-                    if rank == 0:
-                        print(f"[Config] WARNING: overlap.fixed_sync_interval={fixed_interval} < "
-                              f"train.train_steps_per_epoch={steps_per_epoch}. Training will be truncated to "
-                              f"{fixed_interval} step(s) per epoch before sync triggers. "
-                              f"Set fixed_sync_interval >= train_steps_per_epoch to use all training steps.")
 
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:

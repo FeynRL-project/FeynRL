@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import torch
 import torch.distributed
 import gc
@@ -15,7 +16,7 @@ from misc.metrics import compute_pass_metrics
 from misc.nccl_utils import create_nccl_process_group
 from rollouts.base import Base
 
-@ray.remote(concurrency_groups={"health": 1, "pull": 1})
+@ray.remote(concurrency_groups={"health": 1, "pull": 1, "mailbox": 1})
 class VLLMRolloutEngineAsync(Base):
     def __init__(self,
                  seed: int,
@@ -101,6 +102,12 @@ class VLLMRolloutEngineAsync(Base):
         self.load_async_engine()
         self.loaded_version = 0
         self.sampling_params = self.make_sampling_params()
+
+        # Liveness tracking for ping_mailbox. run_pull_loop flips _pull_loop_active
+        # on entry/exit and refreshes _last_pull_progress per iteration + per successful put.
+        # ping_mailbox only checks staleness while active, so exited engines are always alive.
+        self._last_pull_progress = time.time()
+        self._pull_loop_active   = False
 
     def log(self, msg: str) -> None:
         '''
@@ -507,11 +514,24 @@ class VLLMRolloutEngineAsync(Base):
                 return
             results = self.complete_generation(future=p[0], prompts=p[1], current_iter=epoch, policy_version=policy_version)
             results_queue.put(results)
+            # Liveness: only reached after a successful put, so a blocked
+            # put leaves the timestamp stale (ping_mailbox detects that).
+            self._last_pull_progress = time.time()
             batches_done += 1
 
+        # Order matters: refresh timestamp BEFORE flipping active=True.
+        # ping_mailbox (mailbox-group thread) could otherwise read active=True
+        # with a stale timestamp from a prior pull-loop exit and false-flag
+        # the engine as wedged.
+        self._last_pull_progress = time.time()
+        self._pull_loop_active   = True
         try:
             while True:
                 shard = prompt_queue.get(block=True)
+                # Liveness signal after successful get (also covers idle waits
+                # on an empty prompt_queue, engine is alive even if blocked
+                # waiting for producer).
+                self._last_pull_progress = time.time()
                 if isinstance(shard, str) and shard == POISON:
                     break
                 # Submit the new shard FIRST (its requests join the running
@@ -524,11 +544,15 @@ class VLLMRolloutEngineAsync(Base):
                 flush(to_flush)
                 pending = (new_future, shard)
         finally:
-            # Flush the trailing pending shard. We let exceptions propagate so
-            # the driver's ray.get(pull_refs) sees real failures instead of
-            # silently losing the last shard. If the loop body already
-            # raised, Python's exception chaining will surface both.
-            flush(pending)
+            # Flush the trailing pending shard. We let exceptions propagate so the driver's
+            # ray.get(pull_refs) sees real failures instead of silently losing the last shard.
+            # If the loop body already raised, Python's exception chaining will surface both.
+            try:
+                flush(pending)
+            finally:
+                # Always clear the active flag, even if flush raised, a failed-but-exited
+                # pull loop should not be flagged as "mailbox wedged" by the driver's health check.
+                self._pull_loop_active = False
 
         return batches_done
 
@@ -628,31 +652,29 @@ class VLLMRolloutEngineAsync(Base):
         '''
         return True
 
-    @ray.method(concurrency_group="pull")
-    def ping_mailbox(self):
+    @ray.method(concurrency_group="mailbox")
+    def ping_mailbox(self, wedge_threshold_s: float = 300.0):
         '''
-            Runs in the "pull" concurrency_group (max_concurrency=1) so it
-            queues behind any in-flight run_pull_loop. If the pull thread
-            is wedged (vllm internal hang inside complete_generation,
-            permanently stuck generate, etc.), this call times out, letting
-            the driver detect the wedge.
-            Without this group decorator, ping_mailbox would run on the
-            default actor thread which is independent of the pull thread,
-            and it would always return True even when the pull loop is
-            stuck, leading the driver to relaunch run_pull_loop behind
-            the wedged call and hang forever.
-            Combined with ping() (which runs in the "health" group and
-            bypasses all mailboxes), the driver classifies engines as:
-              ping=ok, ping_mailbox=ok       -> fully alive
-              ping=ok, ping_mailbox=timeout  -> pull thread wedged (treat as dead)
-              ping=timeout                   -> process dead
+            Runs in its own "mailbox" concurrency group, responsive regardless of run_pull_loop's state.
+            Returns True unless the pull loop is active AND its last progress was > wedge_threshold_s
+            ago (then raises, driver flags dead). Inactive engines (never started or already
+            exited) always return True — nothing to check.`
+            Note Backpressure is NOT wedged: a blocked put leaves the timestamp stale only for
+            as long as the block. If it stays stale > wedge_threshold_s, something is genuinely wrong
+            (vllm hang, downstream stall). wedge_threshold_s default 300s must exceed the worst legitimate
+            per-shard time.
+        '''
+        # If no pull loop is currently running (e.g., between sync retries or immediately
+        # after a normal exit via POISON), the staleness of the timestamp is meaningless,return True.
+        if not self._pull_loop_active:
+            return True
 
-            Driver-side timeout for this call (see check_rollout_engines_health
-            in run_rl_async.py) must exceed the longest legitimate
-            single-shard processing time, including the reward function's
-            worst-case wall-clock cap, otherwise false positives fire on
-            slow reward functions like math_verify.
-        '''
+        staleness = time.time() - self._last_pull_progress
+        if staleness > wedge_threshold_s:
+            raise RuntimeError(f"Pull loop stale for {staleness:.1f}s "
+                              f"(wedge_threshold={wedge_threshold_s:.1f}s). "
+                              f"Engine may be stuck in complete_generation or a downstream "
+                              f"consumer is not draining results_queue.")
         return True
 
     def init_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend):
@@ -807,16 +829,17 @@ class VLLMRolloutEngineAsync(Base):
 
     def finalize_weight_nccl(self, version, expected_params=0):
         '''
-            After all NCCL parameters have been received, load them into vLLM.
-            For TP=1 + gloo (actor-side): loads the accumulated _nccl_state_dict
-            into vllm via the existing update_weights_direct path (pickle to
-            /dev/shm → collective_rpc("update_weights_from_state")).
-            For TP>1 or nccl backend: weights were already loaded per-parameter
-            in EngineCore via load_weights, so just update the version.
-            expected_params: total params the sender broadcast. If the received
-            count doesn't match, the load was partial and the version is NOT
-            updated to prevent generating with a corrupted model.
+            Load received NCCL params into vllm.
+            TP=1 + gloo: flush accumulated _nccl_state_dict via update_weights_direct
+            (pickle → collective_rpc).
+            TP>1 or nccl: already loaded per-param in EngineCore; just bump the version.
+            If received count != expected_params, load was partial, do NOT bump version
+            (prevents generating with a corrupted model).
         '''
+        assert not self._pull_loop_active, (f"finalize_weight_nccl (engine {self.engine_id}) called while "
+                                            f"run_pull_loop is still active. This would race the weight "
+                                            f"update against in-flight generate(). Callers must drain pull "
+                                            f"loops (poison pills + wait_for_pull_loops) before finalizing.")
         if getattr(self, '_nccl_in_actor', False) and \
            hasattr(self, '_nccl_state_dict') and self._nccl_state_dict:
             num_params = len(self._nccl_state_dict)

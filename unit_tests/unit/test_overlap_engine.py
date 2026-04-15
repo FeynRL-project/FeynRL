@@ -64,9 +64,7 @@ from run_rl_async import (
     POISON_PILL,
     drain_prompt_queue,
     stop_engines_and_drain,
-    compute_replay_buffer_size,
-    compute_pipeline_queue_sizes,
-    check_ess_sync,
+    compute_pipeline_capacities,
     InfiniteShardIterator,
 )
 from misc.nccl_utils import is_nccl_fatal_error
@@ -172,118 +170,88 @@ class TestStopEnginesAndDrain:
 
 
 # ---------------------------------------------------------------------------
-# compute_replay_buffer_size
+# compute_pipeline_capacities
 # ---------------------------------------------------------------------------
 
-class TestComputeReplayBufferSize:
-    def test_returns_correct_breakdown(self):
-        '''Verifies the additive formula off_policy + consumption.'''
-        size, items_per_epoch, items_per_opt_step, off_policy, consumption = compute_replay_buffer_size(
+class TestComputePipelineCapacities:
+    def _call(self, **kwargs):
+        '''Helper with sensible defaults. Signature is
+        (rollout_samples_per_epoch, rollout_batch_size_per_gpu,
+         num_rollout_engines, n_samples, max_lag).
+        '''
+        defaults = dict(
             rollout_samples_per_epoch=1024,
-            n_samples=16,
-            max_lag=4,
-            train_batch_size_per_gpu=4,
-            training_gpus=4,
-            gradient_accumulation_steps=2,
-            steps_per_epoch=2,
-        )
-        assert items_per_epoch == 1024 * 16
-        assert items_per_opt_step == 4 * 4 * 2
-        assert off_policy == items_per_epoch * max(2, 4)
-        assert consumption == items_per_opt_step * 2
-        assert size == off_policy + consumption
-
-    def test_scales_with_max_lag(self):
-        '''Larger max_lag → larger off-policy bound → larger total.'''
-        small = compute_replay_buffer_size(1024, 16, 1, 4, 2, 2, 2)[0]
-        big   = compute_replay_buffer_size(1024, 16, 8, 4, 2, 2, 2)[0]
-        assert big > small
-
-    def test_scales_with_steps_per_epoch(self):
-        '''Larger steps_per_epoch → larger consumption bound → larger total.'''
-        small = compute_replay_buffer_size(1024, 16, 4, 4, 2, 2, 1)[0]
-        big   = compute_replay_buffer_size(1024, 16, 4, 4, 2, 2, 32)[0]
-        assert big > small
-
-    def test_scales_with_rollout_samples_per_epoch(self):
-        '''Larger rollout_samples_per_epoch → larger items_per_epoch → larger off_policy_bound.'''
-        small = compute_replay_buffer_size(256, 16, 4, 4, 2, 2, 2)[0]
-        big   = compute_replay_buffer_size(2048, 16, 4, 4, 2, 2, 2)[0]
-        assert big > small
-
-    def test_max_lag_floor_of_two(self):
-        '''max_lag=1 should be treated as 2 (max(2, max_lag)).'''
-        with_one = compute_replay_buffer_size(1024, 16, 1, 4, 2, 2, 2)[3]
-        with_two = compute_replay_buffer_size(1024, 16, 2, 4, 2, 2, 2)[3]
-        assert with_one == with_two
-
-    def test_buffer_always_at_least_one_optimizer_step(self):
-        '''
-            Structural property of the additive formula: because
-            consumption_bound = items_per_opt_step * steps_per_epoch and
-            steps_per_epoch >= 1, replay_buffer_size is always at least
-            one optimizer step worth of items, regardless of how tiny the
-            rollout side is. Guards against future formula changes that
-            could re-introduce shard-mismatch hazards.
-        '''
-        for n_gpus, batch, ga in [(1, 1, 1), (4, 8, 2), (16, 1024, 8)]:
-            size, _, items_per_opt_step, _, _ = compute_replay_buffer_size(
-                rollout_samples_per_epoch=1,
-                n_samples=1,
-                max_lag=1,
-                train_batch_size_per_gpu=batch,
-                training_gpus=n_gpus,
-                gradient_accumulation_steps=ga,
-                steps_per_epoch=1,
-            )
-            assert size >= items_per_opt_step
-
-
-# ---------------------------------------------------------------------------
-# compute_pipeline_queue_sizes
-# ---------------------------------------------------------------------------
-
-class TestComputePipelineQueueSizes:
-    def test_basic_sizing(self):
-        prompt_q, results_q = compute_pipeline_queue_sizes(
-            num_rollout_engines=4,
-            max_lag=4,
             rollout_batch_size_per_gpu=8,
+            num_rollout_engines=4,
             n_samples=16,
-            replay_buffer_size=2112,
+            max_lag=4,
         )
-        # prompt = num_engines * max(2, max_lag) = 4 * 4 = 16
-        assert prompt_q == 16
-        # results = max(prompt, buffer // items_per_shard)
-        #         = max(16, 2112 // 128) = max(16, 16) = 16
-        assert results_q == 16
+        defaults.update(kwargs)
+        return compute_pipeline_capacities(**defaults)
+
+    def test_returns_three_values(self):
+        buf, results_q, prompt_q = self._call()
+        assert isinstance(buf, int)
+        assert isinstance(results_q, int)
+        assert isinstance(prompt_q, int)
+
+    def test_buffer_uses_rounded_prompts(self):
+        '''prompt_per_pass rounds up to bsz_rollout boundary: items_per_round × max_lag.'''
+        # rollout_samples_per_epoch=20, bsz=4*8=32 → ceil(20/32)*32 = 32
+        buf, _, _ = self._call(rollout_samples_per_epoch=20,
+                               rollout_batch_size_per_gpu=8,
+                               num_rollout_engines=4, n_samples=8, max_lag=2)
+        # items_per_round = 32 * 8 = 256; buffer = 256 * 2 = 512
+        assert buf == 512
+
+    def test_buffer_exact_multiple(self):
+        '''No rounding when rollout_samples_per_epoch is exact multiple of bsz.'''
+        buf, _, _ = self._call(rollout_samples_per_epoch=128,
+                               rollout_batch_size_per_gpu=16,
+                               num_rollout_engines=4, n_samples=16, max_lag=4)
+        # bsz=64, ceil(128/64)*64=128, items=128*16=2048, buffer=2048*4=8192
+        assert buf == 8192
+
+    def test_scales_linearly_with_max_lag(self):
+        '''Buffer is exactly items_per_round × max_lag.'''
+        buf2 = self._call(max_lag=2)[0]
+        buf8 = self._call(max_lag=8)[0]
+        assert buf8 == 4 * buf2
+
+    def test_scales_with_rollout_samples(self):
+        small = self._call(rollout_samples_per_epoch=256)[0]
+        big   = self._call(rollout_samples_per_epoch=2048)[0]
+        assert big > small
+
+    def test_max_lag_one_gives_one_round(self):
+        '''max_lag=1 means exactly one round in the buffer (no floor now).'''
+        # rollout_samples=64, bsz=32, n_samples=4: items_per_round = 64*4 = 256
+        buf, _, _ = self._call(rollout_samples_per_epoch=64,
+                               rollout_batch_size_per_gpu=8,
+                               num_rollout_engines=4, n_samples=4, max_lag=1)
+        assert buf == 256
+
+    def test_prompt_queue_has_floor_of_two_bursts(self):
+        '''prompt_queue = num_engines × max(2, max_lag) — floor ensures 2 bursts lookahead.'''
+        _, _, pq1 = self._call(num_rollout_engines=4, max_lag=1)
+        _, _, pq2 = self._call(num_rollout_engines=4, max_lag=2)
+        assert pq1 == pq2 == 4 * 2
+
+    def test_prompt_queue_scales_with_engines(self):
+        _, _, few  = self._call(num_rollout_engines=2)
+        _, _, many = self._call(num_rollout_engines=16)
+        assert many > few
 
     def test_results_queue_at_least_prompt_queue(self):
-        '''results_queue must always be >= prompt_queue.'''
-        for buf_size in [100, 1000, 10000, 100000]:
-            prompt_q, results_q = compute_pipeline_queue_sizes(
-                num_rollout_engines=4, max_lag=4,
-                rollout_batch_size_per_gpu=8, n_samples=16,
-                replay_buffer_size=buf_size,
-            )
+        for max_lag in [1, 2, 4, 8]:
+            _, results_q, prompt_q = self._call(max_lag=max_lag)
             assert results_q >= prompt_q
 
     def test_results_queue_scales_with_buffer(self):
-        '''Bigger buffer → bigger results_queue (until prompt floor dominates).'''
-        small = compute_pipeline_queue_sizes(4, 4, 8, 16, 1024)[1]
-        big   = compute_pipeline_queue_sizes(4, 4, 8, 16, 65536)[1]
-        assert big > small
-
-    def test_max_lag_floor_of_two(self):
-        '''Same floor logic as buffer sizing.'''
-        with_one = compute_pipeline_queue_sizes(4, 1, 8, 16, 2000)[0]
-        with_two = compute_pipeline_queue_sizes(4, 2, 8, 16, 2000)[0]
-        assert with_one == with_two
-
-    def test_prompt_queue_scales_with_engines(self):
-        few  = compute_pipeline_queue_sizes(2, 4, 8, 16, 2000)[0]
-        many = compute_pipeline_queue_sizes(16, 4, 8, 16, 2000)[0]
-        assert many > few
+        '''Bigger buffer → bigger results_queue.'''
+        _, small_rq, _ = self._call(rollout_samples_per_epoch=128)
+        _, big_rq, _   = self._call(rollout_samples_per_epoch=4096)
+        assert big_rq > small_rq
 
 
 # ---------------------------------------------------------------------------
@@ -339,101 +307,6 @@ class TestInfiniteShardIterator:
 #   - fill_prompt_queue              (replaced by ShardProducer thread)
 # Their tests were removed. The new helpers above cover the equivalent
 # functionality.
-
-
-# ---------------------------------------------------------------------------
-# check_ess_sync
-# ---------------------------------------------------------------------------
-
-class TestCheckEssSync:
-    def test_p3o_ess_below_threshold_triggers(self):
-        '''P3O path: ESS < threshold → True. One-shot per epoch.'''
-        should_sync, ess = check_ess_sync(
-            train_metrics={"ess_factor": 0.3},
-            train_step_count=10,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=None,
-            sync_triggered_this_epoch=False,
-        )
-        assert should_sync is True
-        assert ess == 0.3
-
-    def test_p3o_ess_above_threshold_does_not_trigger(self):
-        should_sync, ess = check_ess_sync(
-            train_metrics={"ess_factor": 0.8},
-            train_step_count=10,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=None,
-            sync_triggered_this_epoch=False,
-        )
-        assert should_sync is False
-        assert ess == 0.8
-
-    def test_p3o_already_synced_this_epoch_does_not_retrigger(self):
-        '''ESS-driven sync is gated to one-shot per epoch.'''
-        should_sync, _ = check_ess_sync(
-            train_metrics={"ess_factor": 0.1},
-            train_step_count=10,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=None,
-            sync_triggered_this_epoch=True,
-        )
-        assert should_sync is False
-
-    def test_no_ess_metric_no_p3o_trigger(self):
-        '''Non-P3O algorithms don't expose ess_factor.'''
-        should_sync, ess = check_ess_sync(
-            train_metrics={"loss": 0.5},
-            train_step_count=10,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=None,
-            sync_triggered_this_epoch=False,
-        )
-        assert should_sync is False
-        assert ess is None
-
-    def test_fixed_interval_triggers_at_boundary(self):
-        '''Fixed interval: deterministic, NOT gated by sync_triggered_this_epoch.'''
-        should_sync, _ = check_ess_sync(
-            train_metrics={},
-            train_step_count=10,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=10,
-            sync_triggered_this_epoch=False,
-        )
-        assert should_sync is True
-
-    def test_fixed_interval_not_at_boundary(self):
-        should_sync, _ = check_ess_sync(
-            train_metrics={},
-            train_step_count=11,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=10,
-            sync_triggered_this_epoch=False,
-        )
-        assert should_sync is False
-
-    def test_fixed_interval_step_zero_does_not_trigger(self):
-        '''step % interval == 0 at step=0 must NOT fire (would sync at start).'''
-        should_sync, _ = check_ess_sync(
-            train_metrics={},
-            train_step_count=0,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=10,
-            sync_triggered_this_epoch=False,
-        )
-        assert should_sync is False
-
-    def test_fixed_interval_fires_even_after_already_synced(self):
-        '''Fixed interval is NOT one-shot — can fire multiple times per epoch.'''
-        should_sync, _ = check_ess_sync(
-            train_metrics={},
-            train_step_count=20,
-            ess_sync_threshold=0.5,
-            fixed_sync_interval=10,
-            sync_triggered_this_epoch=True,
-        )
-        assert should_sync is True
 
 
 # ---------------------------------------------------------------------------

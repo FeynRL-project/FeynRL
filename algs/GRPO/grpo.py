@@ -30,7 +30,6 @@ class GRPO(COMMON):
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
-                 alpha: float = None,
                  use_decoupled_loss: bool = False,
                  behave_imp_weight_cap: float = None,
                  ):
@@ -62,7 +61,6 @@ class GRPO(COMMON):
 
         # params for decoupled PPO
         self.use_decoupled_loss = use_decoupled_loss
-        self.alpha = float(alpha) if alpha is not None else None
         self.behave_imp_weight_cap = float(behave_imp_weight_cap) if behave_imp_weight_cap is not None else None
 
         # if true, it means the update is done after seeing all samples in the reply buffer
@@ -102,12 +100,14 @@ class GRPO(COMMON):
                             mask: torch.Tensor,
                             entropies: torch.Tensor,
                             ref_logprobs: torch.Tensor,
+                            prox_logprobs: torch.Tensor = None,
                             ):
         '''
             logprobs: [B, T-1]
             old_logprobs, advantages, mask: [B, T - 1]
             entropies: [B, T-1]
             ref_logprobs: [B, T-1]
+            prox_logprobs: [B, T-1]
             Compute policy loss:
                 1. ratio = exp(logprobs - old_logprobs)
                 2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
@@ -133,16 +133,13 @@ class GRPO(COMMON):
             # 2. Decoupled policy loss (https://arxiv.org/abs/2110.00641)
             # loss = - E[ (pi_prox/pi_behav) * min(r_prox * A, clip(r_prox) * A)]
             # where r_prox = pi / pi_prox
-            # log pi_prox = a * log pi + (1-a) * log pi_behav
-            logp_prox = self.alpha * logprobs.detach() + (1 - self.alpha) * old_logprobs
-
             # pr_prox = pi / pi_prox
-            raw_logratio_prox = (logprobs - logp_prox).to(torch.float32)
+            raw_logratio_prox = (logprobs - prox_logprobs).to(torch.float32)
             logratio_prox     = torch.where(mask_bool, raw_logratio_prox, torch.zeros_like(raw_logratio_prox))
             r_prox            = torch.exp(logratio_prox)
 
             # Behavioral ratio: w = pi_prox / pi_behav
-            raw_log_w = (logp_prox - old_logprobs).to(torch.float32)
+            raw_log_w = (prox_logprobs - old_logprobs).to(torch.float32)
             log_w     = torch.where(mask_bool, raw_log_w, torch.zeros_like(raw_log_w))
             behave_w  = torch.exp(log_w)
             if self.behave_imp_weight_cap is not None:
@@ -278,6 +275,15 @@ class GRPO(COMMON):
         # Weight health check before any update
         self.check_weights_health(engine_id, "BEFORE training step")
 
+        prox_logprobs = None
+        if self.use_decoupled_loss:
+            # Snapshot pi_prox under current policy BEFORE any optimizer step.
+            # eval() disables dropout for the snapshot and train() restores it for the inner update loop.
+            self.policy_engine.eval()
+            # [B, T-1] as policy_forward shifts internally.
+            prox_logprobs, prox_nan_masks = self.snapshot_prox_logprobs(micro_batches=micro_batches, engine_id=engine_id, device=device)
+            self.policy_engine.train()
+
         # track metrics across all micro-batches
         all_metrics = []
         consecutive_nan_steps = 0
@@ -332,12 +338,22 @@ class GRPO(COMMON):
                 mask = mask * (~ref_nan).to(mask.dtype)
 
             # Compute policy loss using the current policy.
+            # prox_logprobs entries are already [B, T-1].
+            if prox_logprobs is not None:
+                prox_nan_mask = prox_nan_masks[step]
+                mask = mask * (~prox_nan_mask).to(mask.dtype)
+                prox_lp_step = prox_logprobs[step]
+
+            else:
+                prox_lp_step = None
+
             loss_total_sum, local_denom, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
                                                                                old_logprobs=old_logprobs,
                                                                                advantages=advs,
                                                                                mask=mask,
                                                                                entropies=pi_entropies,
-                                                                               ref_logprobs=ref_logprobs)
+                                                                               ref_logprobs=ref_logprobs,
+                                                                               prox_logprobs=prox_lp_step)
 
             # store metrics
             all_metrics.append(pi_metrics)

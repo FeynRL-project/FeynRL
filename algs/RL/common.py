@@ -220,6 +220,30 @@ class COMMON:
 
         return ga_denoms, dp_scale
 
+    def snapshot_prox_logprobs(self, micro_batches, engine_id, device):
+        '''
+            Snapshot pi_prox under current policy BEFORE any optimizer step.
+            Returns a list of [B, T-1] tensors, one per micro-batch, ordered to
+            match the (already-shuffled) micro_batches list so callers can index
+            by step.
+        '''
+        logprobs_prox = []
+        nan_masks     = []
+        for step, micro_batch in enumerate(micro_batches):
+            # all are [B, T]
+            input_ids = micro_batch['input_ids'].to(device, non_blocking=True)
+            att_mask  = micro_batch['attn_mask'].to(device, non_blocking=True)
+            pos_ids   = micro_batch.get('position_ids', None)
+            with torch.no_grad():
+                # curr_logprobs is [B, T-1], shift happoens inside policy_forward
+                curr_logprobs, _, _ = self.policy_forward(input_ids=input_ids,
+                                                          att_mask=att_mask,
+                                                          pos_ids=pos_ids)
+                curr_logprobs, prox_nan_mask = self.sanitize_logprobs(logprobs=curr_logprobs, engine_id=engine_id, step=step, num_micro=len(micro_batches))
+            nan_masks.append(prox_nan_mask)
+            logprobs_prox.append(curr_logprobs.detach())
+        return logprobs_prox, nan_masks
+
     def check_logit_health(self, logits):
         '''
             Check if there is nan or inf in logits.

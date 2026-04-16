@@ -244,9 +244,6 @@ class Overlap(BaseModel):
     enabled: bool  | None = None
     # Number of policy versions retained in the replay buffer.
     max_lag: int | None = None
-    # Used for Decoupled PPO as interpolation coefficient for proximal policy.
-    # Must be in (0, 1] when overlap is enabled.
-    alpha: float | None = None
     # Cap on behavioral importance weight (pi_prox / pi_behav). null means no cap.
     behave_imp_weight_cap: float | None = None
 
@@ -781,9 +778,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.run.weight_sync_method not in ("nccl", "direct", "disk"):
                     raise ValueError(f"weight_sync_method must be one of nccl/direct/disk, "
                                      f"got {config.run.weight_sync_method}")
-
-                if config.overlap.alpha is None or not (0.0 < config.overlap.alpha <= 1.0):
-                    raise ValueError(f"overlap.alpha must be in (0.0, 1.0] when overlap is enabled, got {config.overlap.alpha}")
 
                 if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
                     raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")

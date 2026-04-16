@@ -41,9 +41,6 @@ overlap:
   enabled: False
   # Number of policy versions retained in the replay buffer.
   max_lag: 2
-  # Used for Decoupled PPO as interpolation coefficient for proximal policy.
-  # Must be in (0, 1] when overlap is enabled.
-  alpha: null
   # Cap on behavioral importance weight. null = no cap.
   behave_imp_weight_cap: null
 

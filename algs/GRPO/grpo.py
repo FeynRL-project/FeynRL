@@ -112,10 +112,9 @@ class GRPO(COMMON):
                 1. ratio = exp(logprobs - old_logprobs)
                 2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
             Returns:
-                loss_total_sum: scalar tensor — raw sum of masked losses (no normalization).
-                                Caller is responsible for scaling before backward.
-                denom: float — local token count in this micro-batch (for metrics and fallback normalization).
-                metrics: dict — per-token mean metrics using local denom for interpretability.
+                loss_total_sum: scalar tensor, raw sum of masked losses (no normalization).
+                denom: local token count in this micro-batch (for metrics and fallback normalization).
+                metrics: dict, per-token mean metrics using local denom for interpretability.
         '''
         device = logprobs.device
         dtype = logprobs.dtype

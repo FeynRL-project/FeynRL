@@ -4,8 +4,8 @@ run:
   logger_type: "mlflow"
   tracking_uri: ""
   checkpoint_dir: "./ckps/qwen3-4b-thinking-2507"
-  training_gpus: 6
-  rollout_gpus: 2
+  training_gpus: 4
+  rollout_gpus: 4
   ray_address: null
   ray_master_port: 29500
   seed: 42

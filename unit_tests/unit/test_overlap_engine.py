@@ -189,26 +189,27 @@ class TestComputePipelineCapacities:
         defaults.update(kwargs)
         return compute_pipeline_capacities(**defaults)
 
-    def test_returns_three_values(self):
-        buf, results_q, prompt_q = self._call()
+    def test_returns_four_values(self):
+        buf, results_q, prompt_q, items_per_round = self._call()
         assert isinstance(buf, int)
         assert isinstance(results_q, int)
         assert isinstance(prompt_q, int)
+        assert isinstance(items_per_round, int)
 
     def test_buffer_uses_rounded_prompts(self):
         '''prompt_per_pass rounds up to bsz_rollout boundary: items_per_round × max_lag.'''
         # rollout_samples_per_epoch=20, bsz=4*8=32 → ceil(20/32)*32 = 32
-        buf, _, _ = self._call(rollout_samples_per_epoch=20,
-                               rollout_batch_size_per_gpu=8,
-                               num_rollout_engines=4, n_samples=8, max_lag=2)
+        buf, _, _, _ = self._call(rollout_samples_per_epoch=20,
+                                  rollout_batch_size_per_gpu=8,
+                                  num_rollout_engines=4, n_samples=8, max_lag=2)
         # items_per_round = 32 * 8 = 256; buffer = 256 * 2 = 512
         assert buf == 512
 
     def test_buffer_exact_multiple(self):
         '''No rounding when rollout_samples_per_epoch is exact multiple of bsz.'''
-        buf, _, _ = self._call(rollout_samples_per_epoch=128,
-                               rollout_batch_size_per_gpu=16,
-                               num_rollout_engines=4, n_samples=16, max_lag=4)
+        buf, _, _, _ = self._call(rollout_samples_per_epoch=128,
+                                  rollout_batch_size_per_gpu=16,
+                                  num_rollout_engines=4, n_samples=16, max_lag=4)
         # bsz=64, ceil(128/64)*64=128, items=128*16=2048, buffer=2048*4=8192
         assert buf == 8192
 
@@ -226,32 +227,44 @@ class TestComputePipelineCapacities:
     def test_max_lag_one_gives_one_round(self):
         '''max_lag=1 means exactly one round in the buffer (no floor now).'''
         # rollout_samples=64, bsz=32, n_samples=4: items_per_round = 64*4 = 256
-        buf, _, _ = self._call(rollout_samples_per_epoch=64,
-                               rollout_batch_size_per_gpu=8,
-                               num_rollout_engines=4, n_samples=4, max_lag=1)
+        buf, _, _, _ = self._call(rollout_samples_per_epoch=64,
+                                  rollout_batch_size_per_gpu=8,
+                                  num_rollout_engines=4, n_samples=4, max_lag=1)
         assert buf == 256
 
     def test_prompt_queue_has_floor_of_two_bursts(self):
         '''prompt_queue = num_engines × max(2, max_lag) — floor ensures 2 bursts lookahead.'''
-        _, _, pq1 = self._call(num_rollout_engines=4, max_lag=1)
-        _, _, pq2 = self._call(num_rollout_engines=4, max_lag=2)
+        _, _, pq1, _ = self._call(num_rollout_engines=4, max_lag=1)
+        _, _, pq2, _ = self._call(num_rollout_engines=4, max_lag=2)
         assert pq1 == pq2 == 4 * 2
 
     def test_prompt_queue_scales_with_engines(self):
-        _, _, few  = self._call(num_rollout_engines=2)
-        _, _, many = self._call(num_rollout_engines=16)
+        _, _, few, _  = self._call(num_rollout_engines=2)
+        _, _, many, _ = self._call(num_rollout_engines=16)
         assert many > few
 
     def test_results_queue_at_least_prompt_queue(self):
         for max_lag in [1, 2, 4, 8]:
-            _, results_q, prompt_q = self._call(max_lag=max_lag)
+            _, results_q, prompt_q, _ = self._call(max_lag=max_lag)
             assert results_q >= prompt_q
 
     def test_results_queue_scales_with_buffer(self):
         '''Bigger buffer → bigger results_queue.'''
-        _, small_rq, _ = self._call(rollout_samples_per_epoch=128)
-        _, big_rq, _   = self._call(rollout_samples_per_epoch=4096)
+        _, small_rq, _, _ = self._call(rollout_samples_per_epoch=128)
+        _, big_rq, _, _   = self._call(rollout_samples_per_epoch=4096)
         assert big_rq > small_rq
+
+    def test_items_per_round_matches_buffer_over_max_lag(self):
+        '''items_per_round × max_lag == buffer size (the knob's stated semantic).'''
+        for ml in [1, 2, 5, 10]:
+            buf, _, _, items_per_round = self._call(max_lag=ml)
+            assert items_per_round * ml == buf
+
+    def test_items_per_round_independent_of_max_lag(self):
+        '''items_per_round is one dataloader pass; max_lag doesn't change it.'''
+        _, _, _, ipr1 = self._call(max_lag=1)
+        _, _, _, ipr8 = self._call(max_lag=8)
+        assert ipr1 == ipr8
 
 
 # ---------------------------------------------------------------------------

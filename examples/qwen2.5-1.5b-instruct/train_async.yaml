@@ -1,0 +1,142 @@
+run:
+  experiment_id: "feynrl_qwen2.5_1.5b_instruct_gsm8k_async"
+  project_name: "feynrl"
+  logger_type : "mlflow"
+  tracking_uri: ""
+  checkpoint_dir: "./ckps/qwen2.5-1.5b-instruct-async"
+  training_gpus: 6
+  rollout_gpus: 2
+  ray_address: null
+  ray_master_port: 29500
+  seed: 42
+
+  weight_sync_method: "direct"
+  checkpoint_save_interval: 15
+
+  nccl_socket_ifname: null
+  nccl_ib_hca: null
+  nccl_sync_port: null
+  nccl_sync_backend: "gloo"
+
+  init_timeout: 3600
+  rollout_timeout: 3600
+  train_step_timeout: 3600
+  save_timeout: 1800
+  sync_timeout: 900
+
+overlap:
+  enabled: True
+  max_lag: 1
+  behave_imp_weight_cap: 5.0
+
+train:
+  alg_name: "grpo"
+  optimizer_name: "adamw"
+  lr: 1e-5
+  adam_epsilon: 1e-8
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.1
+  clip_grad_norm: 1.0
+  lr_scheduler: "WarmupCosineLR"
+
+  kl_coeff: 0.0
+  clip_low: 0.4
+  clip_high: 0.4
+  entropy_coeff: 0.0
+  update_after_full_replay: True
+
+  tau: null
+  gamma: null
+  value_lr: null
+  value_weight_decay: null
+  value_clip_grad_norm: null
+
+  total_number_of_epochs: 100
+  train_steps_per_epoch: 1
+  dynamic_ratio_every_step: False
+
+  train_batch_size_per_gpu: 8
+  gradient_accumulation_steps: 1
+  val_batch_size_per_gpu: 8
+  normalize_loss: True
+
+reward:
+  broadcast: True
+  reward_func: math_verify_reward_func
+
+rollout:
+  temperature: 1.0
+  max_tokens: 1024
+  n_samples: 4
+  top_p: 1.0
+  top_k: -1
+  ignore_eos: False
+  stop: ""
+  gpu_memory_utilization: 0.9
+  stop_token_ids: []
+  prompt_logprobs: False
+  force_strict_on_policy: True
+  tensor_parallel_size: 1
+  rollout_batch_size_per_gpu: 64
+  rollout_samples_per_epoch: 512
+  batch_invariant: True
+  max_model_len: null
+
+model:
+  name: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  ref_model: ""
+  ref_model_offload_to_cpu: False
+  trust_remote_code: False
+  model_class: "llm"
+  gradient_checkpointing: True
+  attn_implementation: "flash_attention_2"
+  value_model: ""
+
+peft:
+  use_peft: False
+  peft_type: "lora"
+  task_type: "CAUSAL_LM"
+  lora_rank: 64
+  lora_alpha: 128
+  lora_dropout: 0.0
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+data:
+  train_ratios: {"gsm8k_train": 1.0}
+  train_files_path: ["./data/gsm8k_train.parquet"]
+  val_files_path: ["./data/gsm8k_val.parquet"]
+  num_workers: 4
+  max_seq_len: 1024
+  prompt_key: "prompt"
+  answer_key: "answer"
+  solution_key: "solution"
+
+deepspeed:
+  zero_optimization:
+    stage: 3
+    stage3_param_persistence_threshold: "auto"
+    stage3_prefetch_bucket_size: "auto"
+    contiguous_gradients: true
+    overlap_comm: true
+    reduce_scatter: true
+    reduce_bucket_size: "auto"
+    allgather_bucket_size: "auto"
+    stage3_gather_16bit_weights_on_model_save: true
+
+  prescale_gradients: false
+
+  data_types:
+    grad_accum_dtype: "fp32"
+
+  activation_checkpointing: {}
+  steps_per_print: 100
+  wall_clock_breakdown: false
+  flops_profiler:
+    enabled: false
+    profile_step: 10
+    module_depth: -1
+    top_modules: 1
+    detailed: true
+    output_file: null

@@ -1,9 +1,9 @@
 run:
-  experiment_id: "framework_comparison_feynrl_aime2024"
+  experiment_id: "framework_comparison_feynrl_{benchmark}"
   project_name: "feynrl-eval"
   logger_type: "mlflow"
   tracking_uri: ""
-  checkpoint_dir: "./ckps/eval/aime2024"
+  checkpoint_dir: "./ckps/eval/{benchmark}"
   rollout_gpus: 8
   seed: 42
   ray_address: null
@@ -35,7 +35,7 @@ model:
   trust_remote_code: False
 
 data:
-  test_files_path: "./data/aime_2024/aime2024_processed_aime2024_v1_ns_test.parquet"
+  test_files_path: "./data/{benchmark}_test.parquet"
   num_workers: 8
   max_seq_len: 8192
   prompt_key: "prompt"

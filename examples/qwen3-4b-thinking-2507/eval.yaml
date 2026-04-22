@@ -1,9 +1,9 @@
 run:
-  experiment_id: "framework_comparison_qwen3_4b_thinking_2507_feynrl_sync_brumo_wsp"
+  experiment_id: "framework_comparison_qwen3_4b_thinking_2507_feynrl_sync_{benchmark}"
   project_name: "feynrl-eval"
   logger_type: "mlflow"
   tracking_uri: ""
-  checkpoint_dir: "./ckps/eval/brumo_wsp"
+  checkpoint_dir: "./ckps/{benchmark}"
   rollout_gpus: 8
   seed: 42
   ray_address: null
@@ -35,7 +35,7 @@ model:
   trust_remote_code: False
 
 data:
-  test_files_path: "./data/brumo_2025/brumo_2025_processed_123245_wsp_test.parquet"
+  test_files_path: "./data/{benchmark}_test.parquet"
   num_workers: 8
   max_seq_len: 4096
   prompt_key: "prompt"

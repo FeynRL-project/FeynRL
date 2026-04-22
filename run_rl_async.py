@@ -218,7 +218,11 @@ def compute_pipeline_capacities(rollout_samples_per_epoch, rollout_batch_size_pe
                                num_rollout_engines, n_samples, max_lag):
     '''
         Derive replay buffer hard cap and queue capacities from config.
-        Returns (replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize).
+        Returns (replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize,
+                 items_per_round_theoretical).
+        items_per_round_theoretical shows one dataloader pass worth of items.
+        Used by run_round diagnostics to compare actual items-per-cycle against
+        this theoretical round size.
     '''
     # Actual number of prompts per dataloader pass, rounded up to batch boundary.
     # Matches core/rl_engines.create_rollout_dataloader. This is an UPPER bound, actual
@@ -227,6 +231,7 @@ def compute_pipeline_capacities(rollout_samples_per_epoch, rollout_batch_size_pe
     bsz_rollout        = num_rollout_engines * rollout_batch_size_per_gpu
     prompt_per_pass    = math.ceil(rollout_samples_per_epoch / bsz_rollout) * bsz_rollout
     replay_buffer_size = prompt_per_pass * n_samples * max_lag
+    items_per_round_theoretical = prompt_per_pass * n_samples
 
     # prompt_queue holds shards (lists of prompts). num_rollout_engines * 2
     # gives each engine at least one shard queued plus one in-flight so the
@@ -238,7 +243,7 @@ def compute_pipeline_capacities(rollout_samples_per_epoch, rollout_batch_size_pe
     items_per_shard       = rollout_batch_size_per_gpu * n_samples
     results_queue_maxsize = max(prompt_queue_maxsize, replay_buffer_size // max(1, items_per_shard))
 
-    return replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize
+    return replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize, items_per_round_theoretical
 
 def drain_prompt_queue(prompt_queue):
     '''
@@ -308,7 +313,10 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
           2. Wait for pull_refs while continuously draining results_queue. Note
              engines blocked on put() can't exit until we free queue space.
           3. Surface any pull-loop exceptions via ray_get_with_timeout.
-        Returns True on clean shutdown, False on timeout or pull-loop raise.
+        Returns (ok, total_drained_shards). ok=True on clean shutdown, False on
+        timeout or pull-loop raise. total_drained_shards is the cumulative count of
+        result-lists pulled from results_queue during the shutdown which is used as
+        carryover into the next round's wait target.
     '''
     # Track undelivered pills so we can retry as prompt_queue frees up
     # during the drain loop below. drain_results frees results_queue →
@@ -329,6 +337,7 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
 
     deadline = time.time() + timeout
     pending  = list(pull_refs)
+    total_drained_shards = 0
     while pending:
         # Retry undelivered pills non-blocking. Each successful put lets one
         # more engine see its pill and exit.
@@ -339,14 +348,15 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
             except RayQueueFull:
                 break
 
-        _, drain_acc = drain_results(results_queue, replay_buffer)
+        drained, drain_acc = drain_results(results_queue, replay_buffer)
+        total_drained_shards += drained
         rollout_stats.accumulate(rollout_acc, drain_acc)
 
         time_left = deadline - time.time()
         if time_left <= 0:
             logger.error(f"[wait_for_pull_loops] Timeout after {timeout}s "
                          f"with {len(pending)} pull loops still running")
-            return False
+            return False, total_drained_shards
 
         # 0.5s cap so we loop back to drain as engines stuck on results_queue.put
         # (full queue) can't exit until we free space.
@@ -357,9 +367,9 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
         ray_get_with_timeout(refs=pull_refs, timeout=10, description="pull loop final check", logger=logger)
     except Exception as e:
         logger.error(f"[wait_for_pull_loops] Pull loop raised: {e}")
-        return False
+        return False, total_drained_shards
 
-    return True
+    return True, total_drained_shards
 
 def wait_for_round_completion(results_queue, replay_buffer, rollout_acc, target_shards, timeout, pull_refs):
     '''
@@ -441,16 +451,21 @@ def perform_inline_sync(epoch, training_engines, rollout_engines,
     t_gather_start = time.time()
     gather_futures = start_nccl_gather(training_engines)
 
-    # step 2: wait for pull loops to exit (drain results_queue concurrently).
-    drain_ok = wait_for_pull_loops(pull_refs=pull_refs,
-                                   prompt_queue=prompt_queue,
-                                   results_queue=results_queue,
-                                   replay_buffer=replay_buffer,
-                                   rollout_acc=rollout_acc,
-                                   num_rollout_engines=num_engines,
-                                   timeout=rollout_timeout,
-                                   logger=logger,
-                                   push_pills=False)
+    # snapshot counters to report how many items are drained into the buffer
+    # during sync via wait_for_pull_loops + post-gather drain_results.
+    items_added_pre_sync = replay_buffer.total_items_added
+    qsize_pre_sync       = results_queue.qsize()
+
+    # step 2: wait for pull loops to exit and drain results_queue concurrently.
+    drain_ok, shards_from_pull_loops = wait_for_pull_loops(pull_refs=pull_refs,
+                                                           prompt_queue=prompt_queue,
+                                                           results_queue=results_queue,
+                                                           replay_buffer=replay_buffer,
+                                                           rollout_acc=rollout_acc,
+                                                           num_rollout_engines=num_engines,
+                                                           timeout=rollout_timeout,
+                                                           logger=logger,
+                                                           push_pills=False)
 
     if not drain_ok:
         # Engines stuck in complete_generation. Clean up training side, raise.
@@ -466,12 +481,13 @@ def perform_inline_sync(epoch, training_engines, rollout_engines,
                            f"rollout.rollout_batch_size_per_gpu.")
 
     # step 3: complete gather, broadcast, finalize.
-    sync_triggered_this_epoch = False
+    sync_triggered_this_epoch  = False
+    shards_from_residual_drain = 0
     try:
-        # Drain residual results that arrived between wait exit and now.
-        # It catches any failure (malformed shard, corrupted accumulator state)
+        # drain residual results that arrived between wait exit and now.
+        # catches any failure (malformed shard, corrupted accumulator state)
         # and triggers the state_dict cleanup path.
-        _, drain_acc = drain_results(results_queue=results_queue, replay_buffer=replay_buffer)
+        shards_from_residual_drain, drain_acc = drain_results(results_queue=results_queue, replay_buffer=replay_buffer)
         rollout_stats.accumulate(rollout_acc, drain_acc)
 
         param_metadata = complete_nccl_gather(gather_futures=gather_futures,
@@ -505,6 +521,17 @@ def perform_inline_sync(epoch, training_engines, rollout_engines,
         logger.warning(f"[Epoch {epoch+1}] Non-fatal broadcast error: {e}. "
                        f"Engines resume with stale weights; next round retries.")
 
+    # snapshot items drained into buffer during sync + results_queue state
+    # before/after. At max_lag=1 these sync-drained items will be fifo-evicted
+    # by the next round's wait_for_round_completion, never trained on.
+    items_added_during_sync = replay_buffer.total_items_added - items_added_pre_sync
+    qsize_post_sync         = results_queue.qsize()
+    sync_drained_shards     = shards_from_pull_loops + shards_from_residual_drain
+    logger.info(f"[Epoch {epoch+1}] Sync drain: +{items_added_during_sync} items "
+                f"({sync_drained_shards} shards) into buffer, "
+                f"results_queue {qsize_pre_sync} -> {qsize_post_sync}, "
+                f"buffer={len(replay_buffer)}")
+
     # step 4: relaunch pull loops, restart producer.
     new_pull_refs = [eng.run_pull_loop.remote(prompt_queue, results_queue, epoch, rollout_policy_version)
                                              for eng in rollout_engines]
@@ -515,7 +542,8 @@ def perform_inline_sync(epoch, training_engines, rollout_engines,
     return {'pull_refs': new_pull_refs,
             'policy_version': policy_version,
             'rollout_policy_version': rollout_policy_version,
-            'sync_triggered_this_epoch': sync_triggered_this_epoch,}
+            'sync_triggered_this_epoch': sync_triggered_this_epoch,
+            'sync_drained_shards': sync_drained_shards,}
 
 def run_round(epoch, training_engines, rollout_engines,
               prompt_queue, prompt_queue_maxsize,
@@ -526,7 +554,9 @@ def run_round(epoch, training_engines, rollout_engines,
               target_shards_per_round,
               rollout_timeout, train_step_timeout, sync_timeout,
               is_last_epoch,
-              tracker, logger):
+              tracker, logger,
+              carryover_shards, overlap_max_lag,
+              items_per_round_theoretical):
     '''
         One round of round-based overlap training (matching sync mode):
           1. Wait for target_shards_per_round shards to arrive in results_queue ,blocks until rollout
@@ -542,6 +572,14 @@ def run_round(epoch, training_engines, rollout_engines,
     round_start_time  = time.time()
     num_train_engines = len(training_engines)
     rollout_acc       = rollout_stats.new_accumulator()
+
+    # If results_queue is 0 right after a sync, no overlap data is waiting and,
+    # hence, wait_for_round_completion will block for a full fresh round which
+    # translates to no wall-clock speedup from overlap.
+    qsize_round_start     = results_queue.qsize()
+    items_added_pre_round = replay_buffer.total_items_added
+    logger.info(f"[Epoch {epoch+1}] Round start: results_queue_qsize={qsize_round_start}, "
+                f"buffer={len(replay_buffer)}")
 
     # Surface producer thread errors and dead pull loops before doing anything.
     producer.check_error()
@@ -561,24 +599,55 @@ def run_round(epoch, training_engines, rollout_engines,
                     f"{observed_pass_shards} (shard_batch_for_engines dropped "
                     f"{target_shards_per_round - observed_pass_shards} empty shards).")
 
+    # subtract shards already drained into the buffer during the previous sync
+    # from this round's wait target. Those items are already trained-eligible,
+    # so we only need to block for the remainder. carryover_shards=0 on the first epoch.
+    wait_target = max(0, round_target_shards - carryover_shards)
+    if carryover_shards > 0:
+        logger.info(f"[Epoch {epoch+1}] carryover_shards={carryover_shards}, "
+                    f"wait_target={wait_target}/{round_target_shards}")
+
     # Step 1: Drain one round's rollout output into the buffer
     drain_start     = time.time()
     shards_received = wait_for_round_completion(results_queue=results_queue,
                                                 replay_buffer=replay_buffer,
                                                 rollout_acc=rollout_acc,
-                                                target_shards=round_target_shards,
+                                                target_shards=wait_target,
                                                 timeout=rollout_timeout,
                                                 pull_refs=pull_refs)
     drain_time = time.time() - drain_start
-    logger.info(f"[Epoch {epoch+1}] Drain: {shards_received}/{round_target_shards} "
+    logger.info(f"[Epoch {epoch+1}] Drain: {shards_received}/{wait_target} "
                 f"shards in {drain_time:.2f}s, buffer={len(replay_buffer)}")
+
+    # enforce max_lag by versions, not FIFO. Keep items whose policy_version >= policy_version - overlap_max_lag.
+    # For example, max_lag=1 tolerates 1 version of drift (the sync-drained overlap items are kept).
+    # max_lag=2 keeps two prior versions plus current, etc.
+    if overlap_max_lag is not None and overlap_max_lag > 0:
+        min_v   = policy_version - overlap_max_lag
+        evicted = replay_buffer.evict_stale(min_version=min_v)
+        if evicted > 0:
+            logger.info(f"[Epoch {epoch+1}] evict_stale(min_v={min_v}): -{evicted} items, "
+                        f"buffer={len(replay_buffer)}")
+
+    # snapshot version diversity in the training buffer. At max_lag=K, we expect unique_versions
+    # up to K+1 (current and K stale). items_added_this_round counts new items pulled from results_queue this round
+    # Note it can be 0 if wait_target=0 due to carryover saturation.
+    items_added_this_round = replay_buffer.total_items_added - items_added_pre_round
+    buf_versions           = [it["policy_version"] for it in replay_buffer.items]
+    if buf_versions:
+        lag_max  = policy_version - min(buf_versions)
+        lag_mean = policy_version - (sum(buf_versions) / len(buf_versions))
+        unique_v = len(set(buf_versions))
+        logger.info(f"[Epoch {epoch+1}] Buffer at train: items_added_this_round={items_added_this_round}, "
+                    f"lag_max={lag_max}, lag_mean={lag_mean:.2f}, unique_versions={unique_v}")
 
     # need at least one micro-batch per engine to avoid deepspeed hang on empty shard.
     min_buffer_items = train_batch_size * num_train_engines
     if len(replay_buffer) < min_buffer_items:
         raise RuntimeError(f"[Epoch {epoch+1}] Buffer underfilled after drain: "
                            f"{len(replay_buffer)} < {min_buffer_items} (train_batch_size × num_engines). "
-                           f"Drained {shards_received}/{round_target_shards} shards. "
+                           f"Drained {shards_received}/{wait_target} shards (round_target={round_target_shards}, "
+                           f"carryover={carryover_shards}). "
                            f"Likely rollout stall, or too many sequences exceeded max_seq_len. "
                            f"Check rollout engine health and data.max_seq_len vs rollout.max_tokens.")
 
@@ -676,6 +745,14 @@ def run_round(epoch, training_engines, rollout_engines,
                 rollout_log["rollout/shards_produced"] = producer.shards_produced
                 if qsize is not None:
                     rollout_log["rollout/results_queue_qsize"] = qsize
+
+                # Actual staleness of items currently in the buffer, policy_lag above is always 0 under inline sync.
+                buf_versions = [it["policy_version"] for it in replay_buffer.items]
+                if buf_versions:
+                    rollout_log["rollout/buffer_lag_max"]         = policy_version - min(buf_versions)
+                    rollout_log["rollout/buffer_lag_mean"]        = policy_version - (sum(buf_versions) / len(buf_versions))
+                    rollout_log["rollout/buffer_unique_versions"] = len(set(buf_versions))
+
                 tracker.log_metrics(rollout_log, step=global_step)
 
     train_time = time.time() - train_start_time
@@ -683,7 +760,8 @@ def run_round(epoch, training_engines, rollout_engines,
     # Step 4: Bump policy_version to reflect training drift, then sync.
     policy_version += 1
 
-    sync_success = False
+    sync_success        = False
+    sync_drained_shards = 0
     if not is_last_epoch:
         sync_start = time.time()
         sync_state = perform_inline_sync(epoch=epoch,
@@ -704,6 +782,7 @@ def run_round(epoch, training_engines, rollout_engines,
         policy_version         = sync_state['policy_version']
         rollout_policy_version = sync_state['rollout_policy_version']
         sync_success           = sync_state['sync_triggered_this_epoch']
+        sync_drained_shards    = sync_state['sync_drained_shards']
 
         sync_ms = (time.time() - sync_start) * 1000.0
         if tracker:
@@ -714,6 +793,35 @@ def run_round(epoch, training_engines, rollout_engines,
     rollout_metrics = rollout_stats.summarize(rollout_acc, rollout_time=generation_time)
     rollout_metrics["rollout_time_with_overlap"] = generation_time
 
+    # Since max_lag is an upper bound on the actual lag and it is a function of
+    # rollout and trainign speed to hit that limit, here provide some estimate how are things are going.
+    # ratio ~ 1.0  -> balanced pipeline: max_lag enforced as configured.
+    # ratio > 1.0  -> rollout faster than training: buffer saturates in fewer than max_lag cycles, FIFO beats evict_stale, effective lag < max_lag.
+    # ratio < 1.0  -> training faster than rollout: wait_for_round_completion blocks for fresh items, no async speedup, but max_lag enforced.
+    items_per_cycle = replay_buffer.total_items_added - items_added_pre_round
+    if items_per_round_theoretical > 0:
+        rollout_speed_ratio = items_per_cycle / items_per_round_theoretical
+    else:
+        rollout_speed_ratio = float('nan')
+
+    logger.info(f"[Epoch {epoch+1}] Pipeline regime: items_per_cycle={items_per_cycle}, "
+                f"theoretical_items_per_round={items_per_round_theoretical}, "
+                f"rollout_speed_ratio={rollout_speed_ratio:.2f}")
+
+    if tracker and rollout_acc['total_samples_generated'] > 0:
+        rollout_log = {f"rollout/{k}": v for k, v in rollout_metrics.items()}
+        rollout_log["rollout/replay_buffer_size"] = len(replay_buffer)
+        rollout_log["rollout/policy_lag"] = policy_version - rollout_policy_version
+        rollout_log["rollout/shards_produced"] = producer.shards_produced
+        rollout_log["rollout/items_per_cycle"] = items_per_cycle
+        rollout_log["rollout/speed_ratio"]     = rollout_speed_ratio
+        buf_versions = [it["policy_version"] for it in replay_buffer.items]
+        if buf_versions:
+            rollout_log["rollout/buffer_lag_max"]         = policy_version - min(buf_versions)
+            rollout_log["rollout/buffer_lag_mean"]        = policy_version - (sum(buf_versions) / len(buf_versions))
+            rollout_log["rollout/buffer_unique_versions"] = len(set(buf_versions))
+        tracker.log_metrics(rollout_log, step=global_step)
+
     return {'rollout_metrics': rollout_metrics,
             'epoch_metrics': epoch_metrics,
             'global_step': global_step,
@@ -722,7 +830,8 @@ def run_round(epoch, training_engines, rollout_engines,
             'pull_refs': pull_refs,
             'train_step_count': steps_per_epoch,
             'train_time': train_time,
-            'sync_performed': sync_success}
+            'sync_performed': sync_success,
+            'sync_drained_shards': sync_drained_shards}
 
 def main(args, config):
     '''
@@ -870,13 +979,13 @@ def main(args, config):
 
     # Buffer sizing: items_per_round × max_lag. Upper bound — actual fill may
     # be lower due to sequences dropped at max_seq_len or failed generations.
-    (replay_buffer_size, results_queue_maxsize,
-                         prompt_queue_maxsize) = compute_pipeline_capacities(rollout_samples_per_epoch=config.rollout.rollout_samples_per_epoch,
-                                                                             rollout_batch_size_per_gpu=config.rollout.rollout_batch_size_per_gpu,
-                                                                             num_rollout_engines=num_rollout_engines,
-                                                                             n_samples=config.rollout.n_samples,
-                                                                             max_lag=overlap_max_lag,
-                                                                             )
+    (replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize,
+                         items_per_round_theoretical) = compute_pipeline_capacities(rollout_samples_per_epoch=config.rollout.rollout_samples_per_epoch,
+                                                                                    rollout_batch_size_per_gpu=config.rollout.rollout_batch_size_per_gpu,
+                                                                                    num_rollout_engines=num_rollout_engines,
+                                                                                    n_samples=config.rollout.n_samples,
+                                                                                    max_lag=overlap_max_lag,
+                                                                                    )
 
     # One round = one pass over the rollout dataloader. Each dataloader batch
     # produces up to num_rollout_engines shards (one per engine). Used as the
@@ -1005,6 +1114,10 @@ def main(args, config):
     ########
     entire_training_start_time = time.time()
 
+    # Carryover is the count of shards drained into the replay buffer during the previous epoch's sync.
+    # This is used to skip redundant blocking on rollout output that was already produced in the background.
+    carryover_shards = 0
+
     for epoch in range(start_epoch, number_of_epochs):
         epoch_start_time = time.time()
         is_last_epoch = (epoch == number_of_epochs - 1)
@@ -1030,7 +1143,10 @@ def main(args, config):
                            sync_timeout=sync_timeout,
                            is_last_epoch=is_last_epoch,
                            tracker=tracker,
-                           logger=logger)
+                           logger=logger,
+                           carryover_shards=carryover_shards,
+                           overlap_max_lag=overlap_max_lag,
+                           items_per_round_theoretical=items_per_round_theoretical)
 
         # Unpack result. pull_refs may have been relaunched by the end-of-round sync.
         global_step            = result['global_step']
@@ -1038,6 +1154,7 @@ def main(args, config):
         rollout_metrics        = result['rollout_metrics']
         rollout_policy_version = result['rollout_policy_version']
         pull_refs              = result['pull_refs']
+        carryover_shards       = result['sync_drained_shards']
 
         # Log rollout metrics
         time_str = f"time={rollout_metrics['rollout_time']:.2f}s"

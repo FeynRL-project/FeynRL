@@ -33,6 +33,8 @@ class ReplayBuffer(Dataset):
         # this shows the total number of action tokens which are not masked which
         # can be used for token-weighted scaling later.
         self.total_action_tokens = 0
+        # lifetime count of items added, never decremented on eviction
+        self.total_items_added = 0
 
     def add_batch_seqs(self, samples: List[Dict[str, Any]]) -> None:
         '''
@@ -141,6 +143,7 @@ class ReplayBuffer(Dataset):
 
         # Count only tokens we will ever train on
         self.total_action_tokens += int((masks > 0.5).sum().item())
+        self.total_items_added += 1
 
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         '''

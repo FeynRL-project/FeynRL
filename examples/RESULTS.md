@@ -61,6 +61,14 @@ The reward curve below overlays the dedicated sync and async FeynRL runs, using 
 
 At 1 hour, the sync run reaches **0.894** reward and the async run reaches **0.858**.
 
+To prepare the GSM8K parquet files for this experiment with the repo's `data_prep` scripts:
+
+```bash
+python data_prep/gsm8k.py --local_dir ./data --run_id 123245 --system_prompt ""
+```
+
+This produces `./data/gsm8k_processed_123245_ns_train.parquet` and `./data/gsm8k_processed_123245_ns_val.parquet`, so update `data.train_files_path` and `data.val_files_path` in the training config if you use these generated files directly.
+
 To reproduce the dedicated sync and async runs:
 
 ```bash

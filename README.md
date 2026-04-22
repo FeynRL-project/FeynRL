@@ -86,6 +86,8 @@ The repository is organized so that algorithmic changes usually stay local:
 
 **[Usage & Examples](docs/HOWTO.md)** — Learn how to launch jobs and run experiments.
 
+**[Reported Results](examples/RESULTS.md)** — Reference experiment results and the canonical example configs used to reproduce them.
+
 **[Configuration Reference](configs/README.md)** — Full parameter guide for RL, SFT, DPO, and evaluation configs.
 
 ## 🤝 Contributing

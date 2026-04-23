@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/feynrl.png" alt="FeynRL Logo" width="300">
+  <img src="docs/feynrl.png" alt="FeynRL Logo" width="220">
 </p>
 
 <p align="center">

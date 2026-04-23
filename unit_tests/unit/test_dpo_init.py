@@ -69,7 +69,7 @@ def test_dpo_eval_step():
                 'chosen_rewards':    torch.tensor([0.5]),
                 'rejected_rewards':  torch.tensor([-0.3]),
                 'reward_accuracies': torch.tensor([1.0])}
-    dpo._per_sample_loss_and_metrics = MagicMock(return_value=expected)
+    dpo.compute_per_sample_loss_and_metrics = MagicMock(return_value=expected)
 
     micro_batch = {
         'input_ids': torch.zeros(1, 2, 5, dtype=torch.long),

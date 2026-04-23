@@ -19,10 +19,9 @@ from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
 
 
-Algorithm_Registry = {
-    # supported algorithms
-    'dpo': ('algs.DPO.dpo', 'DPO'),
-}
+Algorithm_Registry = {# supported algorithms
+                     'dpo': ('algs.DPO.dpo', 'DPO'),
+                     }
 
 def init_rank_world_size():
     '''
@@ -133,6 +132,9 @@ def load_models_and_tokenizer(model_name, model_dtype, ref_model_name,trust_remo
     # as vllm and similar read pad_token_id from config.json, not tokenizer
     if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
+
+    if ref_model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
+        ref_model.config.pad_token_id = tokenizer.pad_token_id
 
     return model, ref_model, tokenizer
 
@@ -337,7 +339,6 @@ if __name__ == "__main__":
                        f"This may cause OOM during validation. The warning is just a heads-up and this won't always OOM. "
                        f"Consider setting val_batch_size_per_gpu <= train_batch_size_per_gpu.")
 
-
     ########
     # 7. Initiate the learning algorithm
     ########
@@ -354,7 +355,6 @@ if __name__ == "__main__":
     if rank == 0:
         print("Starting training...")
 
-    total_number_of_train_samples = len(train_dataloader.dataset)
     micro_batches_per_epoch = config.train.micro_batches_per_epoch
     optimizer_steps_per_epoch = micro_batches_per_epoch // ga_steps
 
@@ -380,7 +380,8 @@ if __name__ == "__main__":
                                                           logger=logger,
                                                           zero_stage=zero_stage,
                                                           model_dtype=config.model.dtype,
-                                                          use_peft=config.peft.use_peft)
+                                                          use_peft=config.peft.use_peft,
+                                                          ref_model_name=config.model.ref_model or config.model.name)
 
     experiment_dir = os.path.join(config.run.checkpoint_dir, config.run.experiment_id)
     cleanup_incomplete_checkpoints(experiment_dir=experiment_dir, rank=rank, logger=logger)
@@ -427,6 +428,10 @@ if __name__ == "__main__":
         # if accumulation steps were not perfectly aligned (though we enforce alignment above).
         model_engine.train()
         model_engine.zero_grad()
+        # Reset CUDA peak-memory counter so gpu_peak_mem reported at end of this epoch
+        # reflects THIS epoch's peak, not the cumulative all-time peak since process start.
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(model_engine.device)
 
         ########
         # 11. Training loop
@@ -440,51 +445,76 @@ if __name__ == "__main__":
         # This allows processing a subset of the data per epoch (useful for large datasets).
         # Optimizer steps per epoch = micro_batches_per_epoch // gradient_accumulation_steps
 
-        epoch_loss_sum = 0.0
-        epoch_reward_acc_sum = 0.0
-        epoch_step_count = 0
+        # Epoch-level accumulators, tensors for all-reduce across ranks
+        epoch_loss_sum       = torch.tensor(0.0, device=model_engine.device)
+        epoch_reward_acc_sum = torch.tensor(0.0, device=model_engine.device)
+        epoch_step_count     = torch.tensor(0.0, device=model_engine.device)
+
+        # GA-window accumulator for accurate per-step tracker logging.
+        # All 4 metrics packed into one tensor for a single all-reduce call.
+        # [loss, chosen_rewards, rejected_rewards, reward_accuracies]
+        window_metrics = torch.zeros(4, device=model_engine.device)
 
         for step, micro_batch in enumerate(progress_bar):
-            # Move batch to gpu (deepspeed engine device)
+            # Move batch to gpu
             micro_batch = {k: v.to(model_engine.device) for k, v in micro_batch.items()}
 
             # Run one train step for micro-batch.
             metric = alg.train_step(micro_batch)
-            epoch_loss_sum += metric['loss']
+
+            epoch_loss_sum       += metric['loss']
             epoch_reward_acc_sum += metric['reward_accuracies']
-            epoch_step_count += 1
+            epoch_step_count     += 1
+
+            window_metrics[0] += metric['loss']
+            window_metrics[1] += metric['chosen_rewards']
+            window_metrics[2] += metric['rejected_rewards']
+            window_metrics[3] += metric['reward_accuracies']
 
             # Only increment global_step when ds actually updates weights
             if model_engine.is_gradient_accumulation_boundary():
                 global_step += 1
 
-            # logging
-            if rank == 0:
-                progress_bar.set_postfix({'loss': metric['loss'],
-                                           'chosen_rewards': metric['chosen_rewards'],
-                                           'rejected_rewards': metric['rejected_rewards'],
-                                           'reward_accuracies': metric['reward_accuracies'],
-                                           })
-                if tracker and model_engine.is_gradient_accumulation_boundary():
-                    current_lr = optimizer.param_groups[0]['lr']
-                    tracker.log_metrics({
-                        "train/loss": metric['loss'],
-                        "train/chosen_rewards": metric['chosen_rewards'],
-                        "train/rejected_rewards": metric['rejected_rewards'],
-                        "train/reward_accuracies": metric['reward_accuracies'],
-                        "train/lr": current_lr,
-                    }, step=global_step)
+                # All-reduce to get globally-averaged ga-window metrics across all ranks.
+                # Each rank contributed ga_steps micro-batches to this window.
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(window_metrics, op=torch.distributed.ReduceOp.SUM)
+
+                denom = ga_steps * world_size
+
+                if rank == 0:
+                    w_loss     = window_metrics[0].item() / denom
+                    w_chosen   = window_metrics[1].item() / denom
+                    w_rejected = window_metrics[2].item() / denom
+                    w_acc      = window_metrics[3].item() / denom
+
+                    progress_bar.set_postfix({'loss': w_loss,
+                                             'chosen_rewards': w_chosen,
+                                             'rejected_rewards': w_rejected,
+                                             'reward_accuracies': w_acc})
+                    if tracker:
+                        current_lr = optimizer.param_groups[0]['lr']
+                        tracker.log_metrics({"train/loss": w_loss,
+                                            "train/chosen_rewards": w_chosen,
+                                            "train/rejected_rewards": w_rejected,
+                                            "train/reward_accuracies": w_acc,
+                                            "train/lr": current_lr,}, step=global_step)
+
+                window_metrics.zero_()
 
         ########
         # 12. Sync before validation to ensure consistent state
         ########
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+            torch.distributed.all_reduce(epoch_loss_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(epoch_reward_acc_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(epoch_step_count, op=torch.distributed.ReduceOp.SUM)
 
-        epoch_time = time.time() - epoch_start_time
-        avg_train_loss = epoch_loss_sum / epoch_step_count if epoch_step_count > 0 else 0.0
-        avg_reward_acc = epoch_reward_acc_sum / epoch_step_count if epoch_step_count > 0 else 0.0
-        gpu_mem_gb = torch.cuda.max_memory_allocated(model_engine.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+        epoch_time     = time.time() - epoch_start_time
+        avg_train_loss = (epoch_loss_sum / epoch_step_count).item() if epoch_step_count.item() > 0 else 0.0
+        avg_reward_acc = (epoch_reward_acc_sum / epoch_step_count).item() if epoch_step_count.item() > 0 else 0.0
+        gpu_mem_gb     = torch.cuda.max_memory_allocated(model_engine.device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
         logger.info(f"Epoch {epoch+1}/{config.train.total_number_of_epochs} completed in {epoch_time:.2f}s | "
                     f"avg_train_loss: {avg_train_loss:.4f} | avg_reward_acc: {avg_reward_acc:.4f} | "
                     f"global_step: {global_step} | lr: {optimizer.param_groups[0]['lr']:.2e} | "
@@ -497,11 +527,19 @@ if __name__ == "__main__":
         ########
         # 13. Validation loop
         ########
-        # DPO eval_step returns per-batch metrics (loss, chosen_rewards, rejected_rewards, reward_accuracies).
-        # We accumulate and average across batches and GPUs.
+        # DPO eval_step returns per-sample tensors of shape [B] (one entry per
+        # preference pair). We sum the real entries here and reduce across ranks.
         local_sums = {k: torch.tensor(0.0, device=model_engine.device)
-                      for k in ('loss', 'chosen_rewards', 'rejected_rewards', 'reward_accuracies')}
+                                      for k in ('loss', 'chosen_rewards', 'rejected_rewards', 'reward_accuracies')}
         local_sample_count = torch.tensor(0.0, device=model_engine.device)
+
+        # DistributedSampler(drop_last=False, shuffle=False) pads each rank's iteration with
+        # head-of-dataset duplicates appended at the END, so the first num_real_for_rank samples this rank produces
+        # are real and the rest are duplicates of indices already counted by other ranks. Without this mask, SUM-aggregated val
+        # metrics would double-count up to (world_size - 1) samples.
+        num_total_val      = len(val_dataloader.dataset)
+        num_real_for_rank  = max(0, (num_total_val - rank + world_size - 1) // world_size)
+        samples_seen       = 0
 
         val_start_time = time.time()
         model_engine.eval()
@@ -510,10 +548,18 @@ if __name__ == "__main__":
             for data in val_iter:
                 val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
                 batch_size = val_batch['input_ids'].shape[0]
-                val_metric = alg.eval_step(val_batch)
+                per_sample = alg.eval_step(val_batch)  # dict of [B] tensors
+                # Real samples in this batch: clip to remaining real-sample budget.
+                # Real samples always precede padding within a rank's iteration order.
+                real_in_batch  = max(0, min(batch_size, num_real_for_rank - samples_seen))
+                samples_seen  += batch_size
+                if real_in_batch == 0:
+                    continue
+
+                # Sum only the real entries — exact, no batch-mean approximation.
                 for k in local_sums:
-                    local_sums[k] += val_metric[k] * batch_size
-                local_sample_count += batch_size
+                    local_sums[k] += per_sample[k][:real_in_batch].sum()
+                local_sample_count += real_in_batch
 
         # Aggregate across all ranks.
         if torch.distributed.is_initialized():
@@ -556,7 +602,8 @@ if __name__ == "__main__":
                                      logger=logger,
                                      label="cl",
                                      zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
-                                     model_dtype=config.model.dtype)
+                                     model_dtype=config.model.dtype,
+                                     ref_model_name=config.model.ref_model or config.model.name)
 
     total_training_time = time.time() - training_start_time
     logger.info(f"Training completed successfully! Total time: {total_training_time:.2f}s ({total_training_time/3600:.2f}h)")

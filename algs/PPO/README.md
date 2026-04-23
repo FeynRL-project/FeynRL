@@ -1,4 +1,6 @@
-### PPO
+### PPO (Proximal Policy Optimization)
+
+PPO [[1]](#references) is a policy gradient algorithm that uses a clipped surrogate objective to constrain policy updates, together with a learned value function for variance reduction through Generalized Advantage Estimation (GAE) [[2]](#references).
 
 Our PPO training step (`train_step`) runs on a replay shard (a list of `micro_batches`) and uses DeepSpeed for micro-batching and gradient accumulation. Before any policy/value updates, we call `precompute_gae(micro_batches)`, which runs the value model in `eval()` mode and computes returns and advantages via `compute_advantages(...)`. Then, for each `micro_batch`, we update the policy with a PPO clipped objective using stored `old_logprobs` and `mask`, plus optional entropy regularization (`ent_coeff`) and optional KL-to-reference penalty (`kl_coeff` if a reference model exists). We also update the value model by regressing `values` to the precomputed `returns` with a masked MSE. If `update_only_after_full_replay=True`, we take one optimizer step at the end of the replay shard (and scale losses by `ga_steps/num_micro` to keep gradient magnitude consistent).
 
@@ -54,6 +56,10 @@ That effectively assumes there is no future value beyond the cutoff, which intro
 - **GAE validation checks**: `compute_advantages` validates that rewards and values contain no NaN on valid positions, that `done` flags are not set on padding positions, and that the mask has no non-contiguous holes (e.g., `[1,1,0,1,1]` is rejected).
 
 - **Tracked metrics**: Policy metrics (`clipfrac`, `approx_kl`, `ent_loss`, `pi_loss`, `loss_total`, `kl_ref`) plus `value_loss_v` (value function MSE loss).
+
+- **Global token normalization instead of per-micro-batch means.** Standard PPO implementations typically use `loss_sum / mask.sum()` per micro-batch. With variable-length rollouts this produces "mean of means ≠ global mean", giving disproportionate gradient weight to micro-batches with fewer valid tokens. With `normalize_loss=True`, the global valid-token count across all micro-batches and all ranks is computed before the training loop and used as the loss denominator, so every action token contributes equally regardless of which micro-batch or rank it lands on. See [RL Common README — Global Token Normalization](../RL/README.md#global-token-normalization-for-rl) and [SFT README — Loss Normalization](../SFT/README.md#loss-normalization) for the derivation.
+
+- **Sync vs. async considerations**: PPO uses a **fixed** clip range $(1-\epsilon_\ell, 1+\epsilon_h)$ and a learned value function whose predictions also become stale as the policy drifts. It is best suited to sync mode, where each update sees near-on-policy data and the critic is fresh. In async / overlap mode, value estimates for older replay samples can become inaccurate and the fixed clip range does not self-adjust to rising off-policyness. For heavy off-policy use, consider: tightening the clip range, lowering `train_steps_per_epoch` / `max_lag`, enabling a **decoupled loss** [[3]](#references) (separate importance ratios for the clip vs. the gradient, so the clip doesn't zero out the gradient on stale tokens), or switching to a critic-free algorithm with a data-driven clip such as [P3O](../P3O/README.md) [[4]](#references).
 
 
 **Input:** initial policy parameters $\theta_0$, initial value parameters $\phi_0$, replay shards $\mathcal{B}$ (`micro_batches`)
@@ -119,3 +125,13 @@ $$
    - DeepSpeed backward/step for value (same boundary)
 
 **Return:** $\theta,\phi$
+
+#### References
+
+[1] J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov. *Proximal Policy Optimization Algorithms.* arXiv:1707.06347, 2017. [https://arxiv.org/abs/1707.06347](https://arxiv.org/abs/1707.06347)
+
+[2] J. Schulman, P. Moritz, S. Levine, M. Jordan, and P. Abbeel. *High-Dimensional Continuous Control Using Generalized Advantage Estimation.* arXiv:1506.02438, 2015. [https://arxiv.org/abs/1506.02438](https://arxiv.org/abs/1506.02438)
+
+[3] J. Hilton, K. Cobbe, and J. Schulman. *Batch size-invariance for policy optimization.* arXiv:2110.00641, 2021. [https://arxiv.org/abs/2110.00641](https://arxiv.org/abs/2110.00641)
+
+[4] R. Fakoor, P. Chaudhari, and A. J. Smola. *P3O: Policy-on Policy-off Policy Optimization.* arXiv:1905.01756, 2019. [https://arxiv.org/abs/1905.01756](https://arxiv.org/abs/1905.01756)

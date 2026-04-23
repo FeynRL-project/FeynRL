@@ -1,4 +1,4 @@
-# FeynRL — Results
+# Experiments
 
 This document summarizes the main training and evaluation results for FeynRL on mathematical reasoning tasks, together with the canonical configs used to reproduce them.
 
@@ -8,7 +8,7 @@ The experiments below share the same high-level training and evaluation setup:
 
 - **Algorithm:** GRPO
 - **DeepSpeed:** ZeRO stage 3, bf16
-- **Tracking:** MLflow
+- **Hardware** 8xH100 GPUs with CUDA v12.4
 - **Training reproduction:** `python main_rl.py --config examples/<experiment>/<train_config>.yaml`
 - **Evaluation reproduction:** `python main_eval.py --config examples/<experiment>/eval.yaml`
 
@@ -57,7 +57,7 @@ For reproduction, use the single canonical `examples/<experiment>/eval.yaml` for
 
 The reward curve below overlays the dedicated sync and async FeynRL runs, using `rollout/avg_reward` over the first hour of wall-clock training time.
 
-![FeynRL reward curve](examples/feynrl_reward_curve.png)
+![FeynRL reward curve](feynrl_reward_curve.png)
 
 At 1 hour, the sync run reaches **0.894** reward and the async run reaches **0.858**.
 
@@ -142,7 +142,7 @@ python main_eval.py --config examples/qwen2.5-1.5b-instruct/eval.yaml
 
 The reward curve below overlays the dedicated sync and async FeynRL runs, using `rollout/avg_reward` over the first 8 hours of wall-clock training time.
 
-![FeynRL Qwen3 reward curve](examples/feynrl_reward_curve_qwen3.png)
+![FeynRL Qwen3 reward curve](feynrl_reward_curve_qwen3.png)
 
 At 8 hours, the sync run is at **0.526** reward and the async run is at **0.584**.
 
@@ -157,12 +157,6 @@ To reproduce the dedicated sync and async comparison runs:
 ```bash
 python main_rl.py --config examples/qwen3-4b-thinking-2507/train_sync.yaml
 python main_rl.py --config examples/qwen3-4b-thinking-2507/train_async.yaml
-```
-
-To regenerate the figure:
-
-```bash
-python examples/plot_reward_curve_qwen3.py
 ```
 
 ### Downstream Evaluation

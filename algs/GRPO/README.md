@@ -1,18 +1,15 @@
-### GRPO (our implementation)
+### GRPO (Group Relative Policy Optimization)
 
-GRPO is a PPO-style update trained from a replay buffer. During rollout, for each prompt we generate multiple completions and compute group-normalized advantages (e.g., z-scored rewards within the set of completions for the same prompt). These advantages, along with the corresponding old policy log-probabilities (`old_logprobs`) and a token mask (to exclude prompt/padding), are stored in the replay buffer.
+GRPO [[1]](#references) is a PPO-style policy optimization algorithm that samples multiple completions for each prompt and derives advantages from their relative rewards within the sampled group. This group-relative formulation removes the need for a separate value model and provides a simple variance-reduction mechanism for policy updates.
 
-At training time, we do **not** construct batches that keep all completions of the same prompt together. Instead, we **uniformly sample** from the replay buffer, so each (micro-)batch contains a mixture of tokens from many prompts and many generations. For each micro-batch we run a forward pass under the current policy to obtain token log-probabilities, form the PPO ratio, and apply the standard clipped surrogate objective using the stored advantages. Optionally, we add an entropy bonus and an optional KL-to-reference penalty implemented in a variance-reduced form.
+#### Differences vs. standard GRPO implementations
 
-We do this replay-style, uniform sampling for two practical reasons. First, it makes the training loop more flexible in how batches are constructed: groups do not need to be materialized explicitly during training, and we can easily support variable numbers of samples per prompt-group. This is also convenient when rollouts contain duplicates (e.g., a group where multiple generations collapse to the same completion for a prompt), since we can ignore or down-weight such samples directly during generation without restructuring group batches. Second, optimizing over an uniform samples from replay buffer rather than only the current set of grouped completions tends to improve stability, because each update is informed by a broader, more diverse mix of recent experiences.
+**Training batches are not group-structured.** Common GRPO implementations build each training step around prompt-groups: generate $G$ completions per prompt, keep them together in the training batch, and compute both the normalization and the update within that group. Our implementation uniformly samples from the replay buffer instead, so each (micro-)batch is a mixture of tokens from many prompts and many generations. The group normalization still happens at rollout time and is baked into the stored `zscore`; only the training-time batching is decoupled from the group structure. We prefer this for two reasons:
 
-#### Difference vs official GRPO-style implementations
+- **Flexibility**: groups don't need to be materialized during training, we can handle variable numbers of samples per prompt-group, and we can drop or down-weight degenerate samples (e.g., duplicate completions within a group) at rollout time without restructuring training batches.
+- **Stability**: updates driven by a broader mix of recent experiences tend to be more stable than updates confined to a single prompt's completions.
 
-Common GRPO implementations typically build each training step around prompt-groups: start from a batch of prompts, generate G completions per prompt, and compute normalization (advantages/scaling) within each group (across the G completions for the same prompt). Training batches therefore preserve group structure by construction.
-
-In contrast, our GRPO uses uniform sampling from replay buffer, so training batches are not group-structured (even though the stored advantages are computed using per-prompt group normalization at rollout time). This changes the update statistics: instead of operating on a self-contained set of completions for a prompt, each update is driven by a mixture of replay samples across many prompts.
-
-Additionally, standard GRPO implementations typically use a per-micro-batch masked mean for loss normalization (`loss_sum / mask.sum()`). When micro-batches have different numbers of valid tokens, which is common with variable-length rollouts, this produces "mean of means != global mean", giving disproportionate gradient weight to micro-batches with fewer valid tokens. Our implementation supports global token normalization (`normalize_loss=True`): the global token count (total valid tokens across all micro-batches and all GPUs) is computed before the training loop and used as the loss denominator. This ensures every action token contributes equally to the gradient regardless of which micro-batch or rank it lands on. See [RL Common README — Global Token Normalization](../RL/README.md#global-token-normalization-for-rl) and [SFT README — Loss Normalization](../SFT/README.md#loss-normalization) for the full derivation.
+**Global token normalization instead of per-micro-batch means.** Standard GRPO typically uses `loss_sum / mask.sum()` per micro-batch. With variable-length rollouts this produces "mean of means ≠ global mean", giving disproportionate gradient weight to micro-batches with fewer valid tokens. With `normalize_loss=True`, the global valid-token count across all micro-batches and all ranks is computed before the training loop and used as the loss denominator, so every action token contributes equally regardless of which micro-batch or rank it lands on. See [RL Common README — Global Token Normalization](../RL/README.md#global-token-normalization-for-rl) and [SFT README — Loss Normalization](../SFT/README.md#loss-normalization) for the derivation.
 
 #### `update_only_after_full_replay=True`
 
@@ -32,6 +29,8 @@ This flag does **not** change sampling as we still sample uniformly from replay.
 - **Masking**: Padded and prompt positions are zeroed out in both the loss and all metrics. The denominator for mean computation is `mask.sum()` (clamped to ≥ 1).
 
 - **Tracked metrics** (averaged across micro-batches): such as `clipfrac` (fraction of masked tokens where ratio falls outside the clip range), `approx_kl` (variance-reduced approximate KL between current and old policy), `ent_loss`, `pi_loss`, `loss_total`, `kl_ref`, etc.
+
+- **Sync vs. async considerations**: GRPO uses a **fixed** clip range $(1-\epsilon_\ell, 1+\epsilon_h)$ that does not self-adjust with data staleness. It works well in sync mode, where each update sees nearly on-policy data. In async / overlap mode, as the replay buffer mixes older policy versions, a larger fraction of tokens can fall outside the clip range and contribute no gradient (high `clipfrac`, reduced effective sample size). For heavy off-policy use, consider: tightening the clip range, using a smaller `train_steps_per_epoch` / `max_lag`, enabling a **decoupled loss** [[2]](#references) (separate importance ratios for the clip vs. the gradient, so the clip doesn't zero out the gradient on stale tokens), or switching to an algorithm with a data-driven clip such as [P3O](../P3O/README.md) [[3]](#references).
 
 
 **Input:** initial policy parameters $\theta_0$, replay shards $\mathcal{B}$ (`micro_batches`)
@@ -87,3 +86,11 @@ $$
    - DeepSpeed backward/step (grad accumulation; optionally one step at shard end)
 
 **Return:** $\theta$
+
+#### References
+
+[1] Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, M. Zhang, Y. K. Li, Y. Wu, and D. Guo. *DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.* arXiv:2402.03300, 2024. [https://arxiv.org/abs/2402.03300](https://arxiv.org/abs/2402.03300)
+
+[2] J. Hilton, K. Cobbe, and J. Schulman. *Batch size-invariance for policy optimization.* arXiv:2110.00641, 2021. [https://arxiv.org/abs/2110.00641](https://arxiv.org/abs/2110.00641)
+
+[3] R. Fakoor, P. Chaudhari, and A. J. Smola. *P3O: Policy-on Policy-off Policy Optimization.* arXiv:1905.01756, 2019. [https://arxiv.org/abs/1905.01756](https://arxiv.org/abs/1905.01756)

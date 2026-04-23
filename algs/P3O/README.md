@@ -1,6 +1,6 @@
 ### P3O (Policy-on Policy-off Policy Optimization)
 
-P3O learns from mixed on/off-policy replay data without manually tuned clip bounds or KL coefficients. It uses a single statistic, the **Effective Sample Size (ESS)** of the token-level importance weights, to **simultaneously** govern two complementary mechanisms:
+P3O [[1]](#references) learns from mixed on/off-policy replay data without manually tuned clip bounds or KL coefficients. It uses a single statistic, the **Effective Sample Size (ESS)** of the token-level importance weights, to **simultaneously** govern two complementary mechanisms:
 
 - **How much to trust the policy gradient** from the current batch (via a one-sided ESS cap on the importance ratio), and
 - **How strongly to pull the policy back** toward the data-generating distribution (via an adaptive trust-region KL weighted by `(1 − ESS)`).
@@ -95,6 +95,7 @@ $$
 
 #### Notes
 
+- **Same loss in sync and async**: because the ESS schedule is derived from each batch's own importance weights rather than from a separately-tuned staleness coefficient, the P3O loss runs unchanged in both the sync and async training engines. Other algorithms typically need extra machinery when moved from sync to async, e.g. a decoupled loss (separate ratios for the clip vs. the gradient, as in PPO/GRPO off-policy variants), a Polyak / EWMA proximal-policy snapshot (PPO-EWMA style), tighter clip ranges re-tuned for the staleness budget, or an explicit off-policy importance-weight correction. P3O self-adjusts as data freshness changes using only the current batch's ratios.
 - `clip_low` / `clip_high` are stored but **not used in the P3O loss**. They control only the `clipfrac` monitoring metric (fraction of tokens where the ratio falls outside $[1 - \text{clip\\_low}, 1 + \text{clip\\_high}]$), so you can read P3O's actual clip behavior on the same scale as a PPO clip range.
 - The constructor accepts `use_decoupled_loss` and `behave_imp_weight_cap` for backward compatibility with older configs, but they are **no-ops** in this paper-faithful formulation.
 - Tracked metrics (averaged across micro-batches): `clipfrac`, `approx_kl`, `ent_loss`, `pi_loss`, `loss_total`, `kl_ref` (KL to frozen reference), `kl_behavioral` (KL to behavior, pre-weighting), `ess_factor`.

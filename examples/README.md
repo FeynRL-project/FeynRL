@@ -49,9 +49,9 @@ For reproduction, use the single canonical `examples/<experiment>/eval.yaml` for
 | Model                 | `Qwen/Qwen2.5-1.5B-Instruct`                                                                         |
 | Training dataset      | [GSM8K](https://huggingface.co/datasets/openai/gsm8k)                                                |
 | GPU split             | 6 training GPUs / 2 rollout GPUs                                                                     |
-| Sync training config  | [`examples/qwen2.5-1.5b-instruct/train_sync.yaml`](examples/qwen2.5-1.5b-instruct/train_sync.yaml)   |
-| Async training config | [`examples/qwen2.5-1.5b-instruct/train_async.yaml`](examples/qwen2.5-1.5b-instruct/train_async.yaml) |
-| Evaluation config     | [`examples/qwen2.5-1.5b-instruct/eval.yaml`](examples/qwen2.5-1.5b-instruct/eval.yaml)               |
+| Sync training config  | [`qwen2.5-1.5b-instruct/train_sync.yaml`](qwen2.5-1.5b-instruct/train_sync.yaml)   |
+| Async training config | [`qwen2.5-1.5b-instruct/train_async.yaml`](qwen2.5-1.5b-instruct/train_async.yaml) |
+| Evaluation config     | [`qwen2.5-1.5b-instruct/eval.yaml`](qwen2.5-1.5b-instruct/eval.yaml)               |
 
 ### Training
 
@@ -76,12 +76,6 @@ python main_rl.py --config examples/qwen2.5-1.5b-instruct/train_sync.yaml
 python main_rl.py --config examples/qwen2.5-1.5b-instruct/train_async.yaml
 ```
 
-To regenerate the figure:
-
-```bash
-python examples/plot_reward_curve.py
-```
-
 ### Downstream Evaluation
 
 The trained checkpoint was evaluated using the shared protocol above.
@@ -97,7 +91,7 @@ Relative to the base model, this corresponds to a modest improvement of **+0.2 p
 
 ### Reproducing Evaluation
 
-Use the canonical config [`examples/qwen2.5-1.5b-instruct/eval.yaml`](examples/qwen2.5-1.5b-instruct/eval.yaml). Update `model.name`, `run.checkpoint_dir`, and any tracking/output settings you need, then substitute `{benchmark}` in the templated fields and point `data.test_files_path` at the benchmark parquet you want to evaluate.
+Use the canonical config [`qwen2.5-1.5b-instruct/eval.yaml`](qwen2.5-1.5b-instruct/eval.yaml). Update `model.name`, `run.checkpoint_dir`, and any tracking/output settings you need, then substitute `{benchmark}` in the templated fields and point `data.test_files_path` at the benchmark parquet you want to evaluate.
 
 ```bash
 python main_eval.py --config examples/qwen2.5-1.5b-instruct/eval.yaml
@@ -133,10 +127,9 @@ python main_eval.py --config examples/qwen2.5-1.5b-instruct/eval.yaml
 | Model                   | `Qwen/Qwen3-4B-Thinking-2507`                                                                          |
 | Training dataset        | [DeepScaler](https://huggingface.co/datasets/agentica-org/DeepScaleR-Preview-Dataset)                  |
 | GPU split               | 4 training GPUs / 4 rollout GPUs                                                                       |
-| Primary training config | [`examples/qwen3-4b-thinking-2507/train.yaml`](examples/qwen3-4b-thinking-2507/train.yaml)             |
-| Sync training config    | [`examples/qwen3-4b-thinking-2507/train_sync.yaml`](examples/qwen3-4b-thinking-2507/train_sync.yaml)   |
-| Async training config   | [`examples/qwen3-4b-thinking-2507/train_async.yaml`](examples/qwen3-4b-thinking-2507/train_async.yaml) |
-| Evaluation config       | [`examples/qwen3-4b-thinking-2507/eval.yaml`](examples/qwen3-4b-thinking-2507/eval.yaml)               |
+| Sync training config    | [`qwen3-4b-thinking-2507/train_sync.yaml`](qwen3-4b-thinking-2507/train_sync.yaml)   |
+| Async training config   | [`qwen3-4b-thinking-2507/train_async.yaml`](qwen3-4b-thinking-2507/train_async.yaml) |
+| Evaluation config       | [`qwen3-4b-thinking-2507/eval.yaml`](qwen3-4b-thinking-2507/eval.yaml)               |
 
 ### Training
 
@@ -174,7 +167,7 @@ On the benchmarks shared with `base`, FeynRL improves average pass@1 by **+12.9 
 
 ### Reproducing Evaluation
 
-Use the canonical config [`examples/qwen3-4b-thinking-2507/eval.yaml`](examples/qwen3-4b-thinking-2507/eval.yaml). Update `model.name`, `run.checkpoint_dir`, and any tracking/output settings you need, then substitute `{benchmark}` in the templated fields and point `data.test_files_path` at the benchmark parquet you want to evaluate. Keep the benchmark data and prompt formatting aligned with the `wsp` evaluation setup used for the reported numbers.
+Use the canonical config [`qwen3-4b-thinking-2507/eval.yaml`](qwen3-4b-thinking-2507/eval.yaml). Update `model.name`, `run.checkpoint_dir`, and any tracking/output settings you need, then substitute `{benchmark}` in the templated fields and point `data.test_files_path` at the benchmark parquet you want to evaluate. Keep the benchmark data and prompt formatting aligned with the `wsp` evaluation setup used for the reported numbers.
 
 ```bash
 python main_eval.py --config examples/qwen3-4b-thinking-2507/eval.yaml
@@ -182,7 +175,7 @@ python main_eval.py --config examples/qwen3-4b-thinking-2507/eval.yaml
 
 ### Primary Training Settings
 
-These settings correspond to [`examples/qwen3-4b-thinking-2507/train.yaml`](examples/qwen3-4b-thinking-2507/train.yaml).
+These settings correspond to [`qwen3-4b-thinking-2507/train.yaml`](qwen3-4b-thinking-2507/train.yaml).
 
 | Parameter              | Value                                                                                 |
 | ---------------------- | ------------------------------------------------------------------------------------- |
@@ -206,7 +199,7 @@ These settings correspond to [`examples/qwen3-4b-thinking-2507/train.yaml`](exam
 
 ### Dedicated Sync/Async Comparison Settings
 
-These settings correspond to [`examples/qwen3-4b-thinking-2507/train_sync.yaml`](examples/qwen3-4b-thinking-2507/train_sync.yaml) and [`examples/qwen3-4b-thinking-2507/train_async.yaml`](examples/qwen3-4b-thinking-2507/train_async.yaml).
+These settings correspond to [`qwen3-4b-thinking-2507/train_sync.yaml`](qwen3-4b-thinking-2507/train_sync.yaml) and [`qwen3-4b-thinking-2507/train_async.yaml`](qwen3-4b-thinking-2507/train_async.yaml).
 
 | Parameter              | Value                                                                                                                    |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------ |

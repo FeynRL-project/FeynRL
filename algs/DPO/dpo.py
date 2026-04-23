@@ -151,7 +151,7 @@ class DPO:
            DistributedSampler padding duplicates exactly before reducing across ranks.
         '''
         logprobs, ref_logprobs, loss_mask = self.forward(micro_batch)
-        return self._per_sample_loss_and_metrics(logprobs, ref_logprobs, loss_mask)
+        return self.compute_per_sample_loss_and_metrics(logprobs, ref_logprobs, loss_mask)
 
     def train_step(self, micro_batch):
         '''

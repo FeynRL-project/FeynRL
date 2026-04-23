@@ -13,13 +13,25 @@ This guide covers common issues encountered while running FeynRL, including mult
 **Diagnosis and fix:**
 
 1. Run `ibdev2netdev` and `ip addr show` to map each HCA to its network interface and subnet. Management links typically have small subnets (`/30`), while data-fabric HCAs have larger subnets (`/24`, `/25`).
-2. Match the device in the error message (e.g. `on dev mlx5_3:1`) to the mapping — if it's a management HCA, exclude it:
+
+2. **Auto-detect the data-fabric HCAs via GPU topology.** The HCAs you want are the ones with a `PIX` (PCIe-switch-local) link to at least one GPU in `nvidia-smi topo -m`. This one-liner prints them in the comma-separated form NCCL expects:
+   ```bash
+   nvidia-smi topo -m | grep ^NIC | cut -f1-9 | grep PIX | cut -f1 | sed 's/NIC/mlx5_/;s/$/:1/' | paste -sd,
+   # example output: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1
+   ```
+   Any HCA *not* in this list (e.g. `mlx5_bond_0`, or an HCA that only shows `SYS`/`NODE` connections) is a management/storage link. Use the output directly as the include list, or invert it to build an exclude list.
+
+3. Match the device in the error message (e.g. `on dev mlx5_3:1`) to the mapping. Configure `nccl_ib_hca` in your run config — either include-only (drop the `^`) or exclude-only (prefix with `^`):
    ```yaml
    run:
      nccl_socket_ifname: "<interface_used_by_ray>"
-     nccl_ib_hca: "^<mgmt_hca_0>,<mgmt_hca_1>"   # exclude with ^ prefix
+     # include-only (preferred when the auto-detect list is reliable):
+     nccl_ib_hca: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1"
+     # or exclude-only (when you'd rather blacklist management HCAs):
+     # nccl_ib_hca: "^<mgmt_hca_0>,<mgmt_hca_1>"
    ```
-3. To quickly confirm the issue, disable IB and fall back to TCP: `export NCCL_IB_DISABLE=1`
+
+4. To quickly confirm the issue, disable IB and fall back to TCP: `export NCCL_IB_DISABLE=1`
 
 ---
 
@@ -41,7 +53,7 @@ This guide covers common issues encountered while running FeynRL, including mult
    ```
 3. **Debug NCCL**: If hangs occur during training (not rollout), add `NCCL_DEBUG=INFO` to the environment:
    ```bash
-   NCCL_DEBUG=INFO python main_rl.py --config-file ./configs/rl_args.yaml --experiment_id debug_run
+   NCCL_DEBUG=INFO python main_rl.py --config_file ./configs/rl_args.yaml --experiment_id debug_run
    ```
 4. **Network Connectivity**: Ensure all nodes can communicate over the specified ports.
 
@@ -62,15 +74,6 @@ vLLM is memory-intensive. If you encounter OOM:
 
 ## Weight Synchronization & Loading
 
-### Strict on-policy error (`policy_version != loaded_version`)
-**Possible causes:**
-- **Sync Failure**: Weight sync (`direct` or `disk`) failed silently in a previous epoch, so rollout engines still hold stale weights.
-- **Strict Mode**: `force_strict_on_policy: True` in the config makes the engine reject any version mismatch.
-
-**How to diagnose:**
-1. Search the logs for earlier `[WeightSync]` warnings; these indicate a failed sync attempt.
-2. If the problem persists, switch to `weight_sync_method: disk` in `rl_args.yaml` as a fallback (slower but more robust).
-
 ### vLLM reload/update failures
 **Possible causes:**
 - **Missing Files**: Checkpoint directory is missing `config.json` or tokenizer files; vLLM cannot load a model without them.
@@ -83,11 +86,16 @@ vLLM is memory-intensive. If you encounter OOM:
    # expect: config.json, tokenizer.json, tokenizer_config.json, model*.safetensors
    ```
 2. **Use Shared Storage**: For multi-node, use a **shared filesystem** for `checkpoint_dir`.
-3. **Sync Check**: If using `weight_sync_method: direct`, disk checkpoints are only written at save intervals; verify the sync logs show success.
+3. **Sync Check**: With `weight_sync_method: nccl` or `direct`, disk checkpoints are only written at the periodic save schedule (or final epoch); verify the sync logs show success between saves.
 
-### Direct vs. Disk Weight Synchronization
-- **`direct` (Default)**: Gathers weights to CPU via DeepSpeed, transfers them through Ray's shared-memory object store to rollout workers, and loads them into vLLM in-place. No disk I/O is involved, making it significantly faster than the disk method.
-- **`disk`**: Saves weights to a checkpoint on disk, and rollout workers reload from the saved path. Slower due to disk I/O but more robust. Also serves as an automatic fallback if direct sync fails.
+### Weight Synchronization Methods
+The `weight_sync_method` config knob selects how training rank 0 transfers updated weights to the rollout workers. The config validator at [`configs/load.py:684-686`](../configs/load.py#L684-L686) couples this knob tightly to `overlap.enabled`: **overlap (async) mode requires `nccl`, and sync mode forbids `nccl`** (because the non-async vLLM engine has no NCCL weight-sync path).
+
+- **`nccl`** (overlap-only): Training rank 0 broadcasts weights directly to all rollout engine TP workers over a dedicated NCCL process group. Zero serialization, lowest latency. Async mode pairs this with the NCCL watchdog (`TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `NCCL_TIMEOUT=1800s`, set by [`misc/nccl_env.py`](../misc/nccl_env.py)) so wedged collectives abort cleanly instead of hanging the GPU stream.
+- **`direct`** (sync-only at runtime): Gathers weights to CPU via DeepSpeed, transfers them through Ray's shared-memory object store to rollout workers, and loads them into vLLM in-place. Async mode uses `direct` exactly once during `load_checkpoint_for_resume`, before the NCCL group is initialized.
+- **`disk`** (sync-only): Saves weights to a checkpoint on disk, and rollout workers reload from the saved path. Slowest, but the most robust.
+
+In sync mode, if `direct` fails mid-run FeynRL falls back to `disk` (save + rollout reload) so the rollout engines always receive updated weights. In async mode there is no runtime fallback; instead, fatal NCCL errors (communicator destruction, Ray timeout, dead actor) cause the job to exit immediately so you can fix the root cause.
 
 ---
 
@@ -114,29 +122,29 @@ vLLM is memory-intensive. If you encounter OOM:
 ### Loss is NaN or Inf
 **Possible causes:**
 - **Extreme importance ratios**: When the policy diverges significantly from the old policy (e.g., after too many gradient steps on the same replay data), `exp(logprobs - old_logprobs)` can overflow to `inf`. The clipping mechanism bounds the ratio in the loss, but the raw ratio may still cause issues in metrics or when padding is not properly masked.
-- **KL divergence overflow**: If the policy and reference model diverge significantly, `exp(ref_logprobs - logprobs)` in the KL computation can overflow. The code logs a `[WARNING] compute_kl_distance: extreme divergence detected` message when the max exponent exceeds 10.0.
+- **KL divergence overflow**: If the policy and reference model diverge significantly, `exp(ref_logprobs - logprobs)` in the KL computation can overflow. FeynRL clamps the exponent to $\pm 10$ in [`algs/RL/common.py:128`](../algs/RL/common.py#L128) before `torch.exp`, so a silent saturation there (rather than an `Inf` in the loss) is the tell-tale sign of this regime.
 - **Learning rate too high**: A high learning rate combined with large batch sizes can cause gradient explosions.
 - **Mixed-precision issues**: bf16/fp16 training can cause underflow/overflow in log-probability computations. The code promotes certain operations to float32 for stability, but custom reward functions or model architectures may introduce their own precision issues.
 
 **How to diagnose:**
-1. **Check logs** for `extreme divergence detected` warnings, these indicate the policy and reference model are diverging.
-2. **Monitor `approx_kl`**: A rapidly increasing `approx_kl` metric indicates the policy is changing too fast.
-3. **Reduce learning rate** or increase `clip_low`/`clip_high` to constrain updates.
-4. **Check `gradient_clipping`**: Ensure `clip_grad_norm` is set (e.g., 1.0) to prevent gradient explosions.
+1. **Monitor `approx_kl`**: A rapidly increasing `approx_kl` metric indicates the policy is changing too fast; sustained large values are the main signal that the policy and reference model are diverging.
+2. **Reduce learning rate** or increase `clip_low`/`clip_high` to constrain updates.
+3. **Check `gradient_clipping`**: Ensure `clip_grad_norm` is set (e.g., 1.0) to prevent gradient explosions.
 
 ---
 
 ### High `clipfrac` or policy collapse
 **Possible causes:**
-- **Stale replay data**: The replay buffer contains old-policy rollouts that are too far from the current policy, causing most importance ratios to be clipped.
-- **Learning rate too high**: Large policy updates cause the ratio `π/π_old` to frequently exceed the clip range `[1 - clip_low, 1 + clip_high]`.
+- **Stale replay data**: The replay buffer contains old-policy rollouts that are too far from the current policy, causing most importance ratios to be clipped (PPO/GRPO/CISPO) or pushing ESS toward 0 and zeroing out the gradient (P3O).
+- **Learning rate too high**: Large policy updates cause the ratio `π/π_old` to frequently fall outside the monitoring range `[1 - clip_low, 1 + clip_high]`.
 - **Too many `train_steps_per_epoch`**: Multiple passes over the same replay buffer compound policy shift.
 
 **How to diagnose:**
-1. **Watch `clipfrac`**: If it consistently large values, the policy is updating too aggressively relative to the replay data.
+1. **Watch `clipfrac`**: Note that for PPO/GRPO/CISPO this is the fraction of tokens where the symmetric clip is actually active, while for P3O it is a *monitoring-only* metric (P3O's actual clip is one-sided, `[0, ESS]`, derived from the data rather than from `clip_low/clip_high`). Persistently high values still indicate the policy is updating too aggressively relative to the replay data.
 2. **Watch `approx_kl`**: This measures the KL divergence between the current policy and the old policy used to collect the replay data. Large values suggest drift.
-3. **Reduce `train_steps_per_epoch`** or **reduce `lr`** to slow down policy updates.
-4. **Enable KL penalty** (`kl_coeff > 0` with a reference model) to regularize the policy.
+3. **For P3O, watch `ess_factor` and `kl_behavioral`**: As ESS drops, the policy-gradient term is suppressed and the adaptive KL term `(1 − ESS) · KL(π ‖ π_old)` takes over to pull the policy back toward the behavior distribution. A persistently low ESS combined with a large `kl_behavioral` (the pre-weighting behavioral KL, logged under that name in [`algs/P3O/p3o.py:238`](../algs/P3O/p3o.py#L238)) signals that data is too stale (reduce `overlap.max_lag`) or that updates are too aggressive (reduce `lr`).
+4. **Reduce `train_steps_per_epoch`** or **reduce `lr`** to slow down policy updates.
+5. **Enable KL-to-reference penalty** (`kl_coeff > 0` with a reference model) to regularize the policy against long-term drift from the base distribution.
 
 ---
 

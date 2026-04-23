@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import math
 from tqdm import tqdm
 from typing import Any
 import ray
@@ -97,7 +98,7 @@ class P3O(COMMON):
 
     def calculate_ess(self, ratio, mask_bool):
         '''
-            Calculate the effective sample size (ESS)
+            Calculate the effective sample size (ESS) across all ranks.
             ESS = ||w||^2_1 / ||w||^2_2 , ratio = exp(logprobs - old_logprobs)
             ESS = ESS / n where n is number of valid (non-padded) samples to normalize
             ESS would be between 1/n and 1, effectively 0 < ESS <= 1
@@ -105,12 +106,25 @@ class P3O(COMMON):
         # Only use valid (non-padded) positions. Padded positions have
         # ratio = exp(0) = 1.0 which would bias ESS toward 1.0.
         valid_ratios = ratio[mask_bool]
-        n = valid_ratios.numel()
-        if n == 0:
+
+        # local_stats_per_rank is 1D tensor of shape (3,).
+        local_stats_per_rank = torch.stack([valid_ratios.sum().to(torch.float64),
+                                            valid_ratios.pow(2).sum().to(torch.float64),
+                                            torch.tensor(float(valid_ratios.numel()), device=ratio.device, dtype=torch.float64)])
+
+        # combine across all ranks
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local_stats_per_rank, op=torch.distributed.ReduceOp.SUM)
+
+        # One sync to extract scalars after the collective.
+        sum_w, sum_w_2, total = local_stats_per_rank.tolist()
+
+        # Avoid division by zero or guard against nans.
+        if total < 0.5 or not math.isfinite(sum_w) or not math.isfinite(sum_w_2) or not math.isfinite(total):
             return 1.0
 
-        ess = (valid_ratios.sum()**2) / (valid_ratios.pow(2).sum() + 1e-8) / n
-        return ess.item()
+        ess = (sum_w**2) / (sum_w_2 + 1e-8) / total
+        return float(ess)
 
     def calculate_seq_ess(self, ratio, mask_bool):
         '''

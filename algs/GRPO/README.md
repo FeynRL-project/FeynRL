@@ -7,9 +7,9 @@ GRPO [[1]](#references) is a PPO-style policy optimization algorithm that sample
 **Training batches are not group-structured.** Common GRPO implementations build each training step around prompt-groups: generate $G$ completions per prompt, keep them together in the training batch, and compute both the normalization and the update within that group. Our implementation uniformly samples from the replay buffer instead, so each (micro-)batch is a mixture of tokens from many prompts and many generations. The group normalization still happens at rollout time and is baked into the stored `zscore`; only the training-time batching is decoupled from the group structure. We prefer this for two reasons:
 
 - **Flexibility**: groups don't need to be materialized during training, we can handle variable numbers of samples per prompt-group, and we can drop or down-weight degenerate samples (e.g., duplicate completions within a group) at rollout time without restructuring training batches.
-- **Stability**: updates driven by a broader mix of recent experiences tend to be more stable than updates confined to a single prompt's completions.
+- **Broader per-step mix**: each update sees tokens from many prompts and many generations rather than being confined to the completions from a single prompt-group.
 
-**Global token normalization instead of per-micro-batch means.** Standard GRPO typically uses `loss_sum / mask.sum()` per micro-batch. With variable-length rollouts this produces "mean of means ≠ global mean", giving disproportionate gradient weight to micro-batches with fewer valid tokens. With `normalize_loss=True`, the global valid-token count across all micro-batches and all ranks is computed before the training loop and used as the loss denominator, so every action token contributes equally regardless of which micro-batch or rank it lands on. See [RL Common README — Global Token Normalization](../RL/README.md#global-token-normalization-for-rl) and [SFT README — Loss Normalization](../SFT/README.md#loss-normalization) for the derivation.
+**Global token normalization instead of per-micro-batch means.** Standard GRPO typically uses `loss_sum / mask.sum()` per micro-batch. With variable-length rollouts this produces "mean of means ≠ global mean", giving disproportionate gradient weight to micro-batches with fewer valid tokens. With `normalize_loss=True`, the global valid-token count across all micro-batches and all ranks is computed before the training loop and used as the loss denominator, so every action token contributes equally regardless of which micro-batch or rank it lands on. See [RL Common README: Global Token Normalization](../RL/README.md#global-token-normalization-for-rl) and [SFT README: Loss Normalization](../SFT/README.md#loss-normalization) for the derivation.
 
 #### `update_only_after_full_replay=True`
 
@@ -30,7 +30,42 @@ This flag does **not** change sampling as we still sample uniformly from replay.
 
 - **Tracked metrics** (averaged across micro-batches): such as `clipfrac` (fraction of masked tokens where ratio falls outside the clip range), `approx_kl` (variance-reduced approximate KL between current and old policy), `ent_loss`, `pi_loss`, `loss_total`, `kl_ref`, etc.
 
-- **Sync vs. async considerations**: GRPO uses a **fixed** clip range $(1-\epsilon_\ell, 1+\epsilon_h)$ that does not self-adjust with data staleness. It works well in sync mode, where each update sees nearly on-policy data. In async / overlap mode, as the replay buffer mixes older policy versions, a larger fraction of tokens can fall outside the clip range and contribute no gradient (high `clipfrac`, reduced effective sample size). For heavy off-policy use, consider: tightening the clip range, using a smaller `train_steps_per_epoch` / `max_lag`, enabling a **decoupled loss** [[2]](#references) (separate importance ratios for the clip vs. the gradient, so the clip doesn't zero out the gradient on stale tokens), or switching to an algorithm with a data-driven clip such as [P3O](../P3O/README.md) [[3]](#references).
+- **Sync vs. async considerations**: GRPO uses a **fixed** clip range $(1-\epsilon_\ell, 1+\epsilon_h)$ that does not self-adjust with data staleness. In sync mode each update sees nearly on-policy data and most ratios fall inside the clip range. In async / overlap mode, as the replay buffer mixes older policy versions, a larger fraction of tokens can fall outside the clip range and contribute no gradient (higher `clipfrac`). Overlap mode therefore **auto-enables the decoupled loss** (see [Decoupled loss](#decoupled-loss-overlap-mode) below) [[2]](#references) so the clip doesn't zero out the gradient on tokens whose ratio against the rollout policy has drifted but whose ratio against the in-shard snapshot is still close to 1. For heavy off-policy use you can also tighten the clip range, lower `train_steps_per_epoch` / `overlap.max_lag`, or switch to a data-driven-clip algorithm such as [P3O](../P3O/README.md) [[3]](#references).
+
+#### Decoupled loss (overlap mode)
+
+The decoupled loss is automatically enabled when `overlap.enabled=True` (wired by `use_decoupled_loss = overlap.enabled`). It is **shared across GRPO, PPO, and CISPO**. P3O does not use it; its ESS-based one-sided clip and adaptive trust-region KL already absorb off-policy drift from the same statistic, so the proximal snapshot would be redundant. (P3O's constructor accepts `use_decoupled_loss` and `behave_imp_weight_cap` for backward compatibility but treats them as no-ops.)
+
+**Why it exists.** The standard PPO-style loss uses a single ratio between the current policy $\pi_\theta$ and the behavior policy $\pi_{\mathrm{old}}$ (the policy that generated the rollouts), and applies a symmetric clip to it:
+
+$$
+\mathcal{L}_{\mathrm{std}}(\theta) = -\mathbb{E}\Big[ \min\big(r\,A,\ \mathrm{clip}(r, 1-\epsilon_\ell, 1+\epsilon_h)\,A\big) \Big],\qquad r = \frac{\pi_\theta}{\pi_{\mathrm{old}}}.
+$$
+
+In overlap mode the replay buffer mixes multiple policy versions, so $\pi_{\mathrm{old}}$ for any given token can be several versions behind $\pi_\theta$ before the first training step even runs. Under the standard loss, tokens whose ratio against $\pi_{\mathrm{old}}$ lands outside the clip range contribute no gradient, even when the step the policy has taken *within the current training shard* is small.
+
+**The decoupled objective.** The decoupled loss [[2]](#references) separates the two roles of the ratio: the **clip** (bounding the step size the policy takes within the current shard), and the **importance-sampling correction** (reweighting the rollout data). Given a proximal policy $\pi_{\mathrm{prox}}$ that is "recent but not $\pi_{\mathrm{old}}$", the objective uses two different ratios:
+
+$$
+\mathcal{L}_{\mathrm{dec}}(\theta) = -\mathbb{E}\Big[ w \cdot \min\big(r_{\mathrm{prox}}\,A,\ \mathrm{clip}(r_{\mathrm{prox}}, 1-\epsilon_\ell, 1+\epsilon_h)\,A\big) \Big]
+$$
+
+$$
+r_{\mathrm{prox}} = \frac{\pi_\theta}{\pi_{\mathrm{prox}}},\qquad w = \mathrm{sg}\!\left(\frac{\pi_{\mathrm{prox}}}{\pi_{\mathrm{old}}}\right).
+$$
+
+- The **clip is on $r_{\mathrm{prox}}$**, i.e. how far $\pi_\theta$ has drifted from the proximal policy. Tokens whose in-shard step is small are no longer clipped just because the replay data is stale.
+- The **behavioral importance weight $w = \pi_{\mathrm{prox}} / \pi_{\mathrm{old}}$** reweights rollout samples onto the proximal distribution. It is detached (neither $\pi_{\mathrm{prox}}$ nor $\pi_{\mathrm{old}}$ carry gradient for the current $\theta$) and only rescales the per-token loss.
+
+**How $\pi_{\mathrm{prox}}$ is obtained (shard-start snapshot, differs from the paper).** The original paper [[2]](#references) defines $\pi_{\mathrm{prox}}$ as an **exponentially-weighted moving average (EWMA)** of the policy network parameters, updated every gradient step with decay rate $\beta_{\mathrm{prox}}$. This codebase uses a simpler, memory-cheaper approximation: at the start of each training shard (*after* micro-batch shuffling, *before* any optimizer step), each training rank runs `policy_forward` under `torch.no_grad()` over every micro-batch and stores the resulting detached per-token logprobs ([`algs/RL/common.py:223-245`](../RL/common.py#L223-L245)). Those logprobs are $\log \pi_{\mathrm{prox}}$ for the entire inner-update loop; the proximal policy is effectively "the policy at the start of this shard" and does not move during the inner loop. Memory cost is `num_micro × [B, T-1]` detached logprob tensors instead of a full EWMA copy of the model. The decoupled objective above is the same either way; only the definition of $\pi_{\mathrm{prox}}$ differs.
+
+**`overlap.behave_imp_weight_cap` (addition beyond the paper).** Not part of the original decoupled objective. The weight $w$ can grow large on individual tokens when $\pi_{\mathrm{prox}}$ diverges from $\pi_{\mathrm{old}}$ (for example, after many training steps on stale replay data), and a single runaway $w$ can dominate the micro-batch gradient. This codebase therefore adds an optional cap under the `overlap:` config block:
+
+$$
+w \leftarrow \min(w,\ \texttt{behave\\_imp\\_weight\\_cap}).
+$$
+
+Set to `null` for no cap (the paper's default). The config validator requires `> 1.0` when set for non-P3O algorithms (P3O ignores it). Typical values: `2.0`–`5.0`. The `behave_w_mean`, `behave_w_max`, `behave_w_min`, and `behave_w_capfrac` metrics report the distribution and cap-hit rate so you can tune this against your observed replay staleness.
 
 
 **Input:** initial policy parameters $\theta_0$, replay shards $\mathcal{B}$ (`micro_batches`)

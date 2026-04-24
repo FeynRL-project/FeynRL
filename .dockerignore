@@ -1,0 +1,24 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+
+# Data & artifacts
+*.parquet
+ckps/
+checkpoints/
+mlruns/
+wandb/
+logs/
+
+# Scratch
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Local / user-specific
+configs/murdock_configs/
+scripts/
+.clean_git.sh

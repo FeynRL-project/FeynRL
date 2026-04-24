@@ -2,7 +2,7 @@
 
 DPO [[1]](#references) optimizes a language model against a preference dataset without training a reward model or running policy-gradient rollouts. It recasts the RLHF reward objective as a classification loss on the log-ratio between the policy and a frozen reference model, evaluated on pairs of chosen / rejected completions.
 
-This implementation follows the standard DPO formulation but uses **length-normalized rewards**: instead of summing token log-ratios per completion, which biases learning toward longer sequences, it averages the masked token log-ratios over the number of supervised (unmasked) tokens in each completion. The loss is the standard DPO logistic objective on the difference between the chosen and rejected length-normalized rewards. Length normalization in preference optimization is also used by SimPO [[2]](#references). In practice, the pseudocode "minibatch" below corresponds to an effective batch assembled from micro-batches with gradient accumulation.
+This implementation follows the standard DPO formulation but applies **per-completion length normalization** to the log-ratio: instead of summing token log-ratios per completion (which biases learning toward longer sequences), it averages the masked token log-ratios over the number of supervised (unmasked) tokens in each completion. The loss is the standard DPO logistic objective on the difference between the chosen and rejected length-normalized rewards. The length-bias motivation follows SimPO [[2]](#references); note that SimPO itself uses a **reference-free** reward (average policy log-probability with an added margin $\gamma$), whereas this implementation keeps DPO's reference-model log-ratio structure and only adds length normalization on top. In practice, the pseudocode "minibatch" below corresponds to an effective batch assembled from micro-batches with gradient accumulation.
 
 #### Implementation details
 
@@ -67,7 +67,7 @@ $$
 
 ## Loss Normalization and Gradient Accumulation
 
-Unlike SFT (see [SFT README — Loss Normalization](../SFT/README.md#loss-normalization)), DPO does **not** need the global token-count fix for gradient accumulation. The reason is structural:
+Unlike SFT (see [SFT README: Loss Normalization](../SFT/README.md#loss-normalization)), DPO does **not** need the global token-count fix for gradient accumulation. The reason is structural:
 
 - **SFT** computes a per-token cross-entropy summed over variable-length sequences. When micro-batches have different numbers of valid tokens, a naive per-micro-batch mean produces "mean of means ≠ global mean", requiring a global token-count denominator computed across the entire gradient-accumulation window and all GPUs.
 
@@ -76,10 +76,10 @@ Unlike SFT (see [SFT README — Loss Normalization](../SFT/README.md#loss-normal
   Concretely, the effective gradient after DeepSpeed's internal averaging is:
 
 $$
-\nabla_{\mathrm{eff}} = \frac{1}{\texttt{ga\_steps} \times \texttt{world\_size}} \sum_{\text{rank}} \sum_{s=1}^{\texttt{ga\_steps}} \nabla \mathcal{L}_s^{\text{rank}}
+\nabla_{\mathrm{eff}} = \frac{1}{\texttt{ga-steps} \times \texttt{world-size}} \sum_{\text{rank}} \sum_{s=1}^{\texttt{ga-steps}} \nabla \mathcal{L}_s^{\text{rank}}
 $$
 
-  Since each $\mathcal{L}_s$ is already a mean over $B$ preference pairs, this gives the true mean over the full effective batch of $B \times \texttt{ga\_steps} \times \texttt{world\_size}$ pairs.
+  Since each $\mathcal{L}_s$ is already a mean over $B$ preference pairs, this gives the true mean over the full effective batch of $B \times \texttt{ga-steps} \times \texttt{world-size}$ pairs.
 
 #### References
 

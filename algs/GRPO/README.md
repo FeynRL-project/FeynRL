@@ -51,7 +51,7 @@ $$
 $$
 
 $$
-r_{\mathrm{prox}} = \frac{\pi_\theta}{\pi_{\mathrm{prox}}},\qquad w = \mathrm{sg}\!\left(\frac{\pi_{\mathrm{prox}}}{\pi_{\mathrm{old}}}\right).
+r_{\mathrm{prox}} = \frac{\pi_\theta}{\pi_{\mathrm{prox}}},\qquad w = \mathrm{sg}\left(\frac{\pi_{\mathrm{prox}}}{\pi_{\mathrm{old}}}\right).
 $$
 
 - The **clip is on $r_{\mathrm{prox}}$**, i.e. how far $\pi_\theta$ has drifted from the proximal policy. Tokens whose in-shard step is small are no longer clipped just because the replay data is stale.

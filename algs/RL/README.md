@@ -12,8 +12,10 @@ If you're implementing a new RL algorithm, you typically inherit from `COMMON` a
 
 Both methods handle causal-LM shift alignment (dropping the last position, gathering target log-probs in float32) consistently, so every algorithm sees the same `[B, T-1]` layout.
 
-### Proximal-policy snapshot (optional)
-**`snapshot_prox_logprobs`** runs `policy_forward` under `no_grad` over every micro-batch in the shard *before any optimizer step* and returns one detached `[B, T-1]` tensor per micro-batch. This is the decoupled-loss / PPO-EWMA-style "proximal policy" reference used by PPO, GRPO, and CISPO when `use_decoupled_loss=True`. P3O does not use it because it derives its trust region directly from the stored `old_logprobs`.
+### Proximal-policy snapshot (overlap mode only)
+**`snapshot_prox_logprobs`** runs `policy_forward` under `no_grad` over every micro-batch in the shard *before any optimizer step* and returns one detached `[B, T-1]` tensor per micro-batch. This is the "proximal policy" reference $\log \pi_{\mathrm{prox}}$ consumed by the **decoupled loss** that PPO, GRPO, and CISPO all auto-enable when `overlap.enabled=True` (see [`core/rl_engines.py:56`](../../core/rl_engines.py#L56): `use_decoupled_loss = overlap.enabled`). P3O does not use it because it derives its trust region directly from the stored `old_logprobs`.
+
+For the full decoupled-loss formulation, the role of the snapshot, and the `overlap.behave_imp_weight_cap` knob, see [**GRPO README: Decoupled loss (overlap mode)**](../GRPO/README.md#decoupled-loss-overlap-mode).
 
 ### KL divergence estimator
 `compute_kl_distance(logprobs, ref_logprobs)` uses the variance-reduced, always-non-negative sample-based KL estimator introduced by Schulman [[1]](#references):
@@ -22,7 +24,7 @@ $$
 \mathrm{KL}(\pi \,\|\, \pi_{\mathrm{ref}}) \approx \log(\pi/\pi_{\mathrm{ref}}) + \pi_{\mathrm{ref}}/\pi - 1.
 $$
 
-Compared to the naive estimator $\log(\pi/\pi_{\mathrm{ref}})$, this form has the same expectation but is non-negative on every sample. In practice, this makes per-token KL measurements better behaved and avoids pathological negative sample estimates.
+Compared to the naive estimator $\log(\pi/\pi_{\mathrm{ref}})$, this form has the same expectation but is non-negative on every sample (whereas $\log(\pi/\pi_{\mathrm{ref}})$ itself can be negative per-sample even though the true KL is non-negative). Per-token KL values logged as metrics therefore have the correct sign for every token.
 
 The estimator is computed in float32 for numerical stability under bf16/fp16, with the exponent clamped to $\pm 10$ to prevent overflow. All algorithms use the same estimator for both the KL-to-reference penalty and, where applicable, the KL-to-behavior trust region.
 
@@ -41,7 +43,7 @@ See [Global Token Normalization for RL](#global-token-normalization-for-rl) belo
 ### Model loading, PEFT, and engine init
 - **`load_single_model`** loads a HuggingFace causal LM backbone with the configured dtype and attention implementation, optionally wraps it with the PEFT adapter (policy/value only, not the frozen reference), and enables gradient checkpointing on the policy when requested.
 - **`apply_peft_module`** wraps the model with a LoRA adapter (the only PEFT type currently supported) when `peft_config.use_peft` is true.
-- **`init_training_engine`** seeds all ranks identically for reproducible model init, calls `load_model` (the alg-specific override), then wires up the DeepSpeed engines (policy, reference if used, and value for PPO) — passing only the trainable params to DeepSpeed so frozen weights (e.g., LoRA base) don't consume optimizer memory.
+- **`init_training_engine`** seeds all ranks identically for reproducible model init, calls `load_model` (the alg-specific override), then wires up the DeepSpeed engines (policy, reference if used, and value for PPO), passing only the trainable params to DeepSpeed so frozen weights (e.g., LoRA base) don't consume optimizer memory.
 
 ### Weight sync and checkpointing
 - **`gather_state_dict`** / **`save_checkpoint`** perform a ZeRO-3-aware full-model gather and a sharded save.

@@ -5,7 +5,8 @@ run:
   checkpoint_dir: "./ckps"
   training_gpus: 2
   rollout_gpus: 2
-  ray_address: null #"auto" if it is the same node, otherwise run ray start --head --port=6379 and assign ray_address to "auto"
+  # "auto" if it is the same node, otherwise run ray start --head --port=6379 and assign ray_address to "auto"
+  ray_address: null
   # Port for torch distributed/deepspeed rendezvous.
   ray_master_port: 29500
   seed: 42
@@ -17,11 +18,11 @@ run:
   # 0 = only at end. Only applies when weight_sync_method="direct".
   checkpoint_save_interval: 1
 
-  # NCCL config for multi-node training over InfiniBand.
-  # Leave nccl_socket_ifname and nccl_ib_hca null for single-node or when NCCL auto-detection works.
-  # Set nccl_socket_ifname to the network interface carrying inter-node traffic (e.g., "eth0", "bond0"). run ip addr | grep addr
+  # NCCL fabric config. Leave null for auto-detect (works for single-node and
+  # most multi-node setups). Only set if fabric init fails. See docs/TROUBLESHOOTING.md.
+  # nccl_socket_ifname -> e.g. "eth0", "bond0". Find via `ip addr | grep addr`
+  # nccl_ib_hca -> e.g. "mlx5_0:1". Find via `ibstat | grep "CA '"`
   nccl_socket_ifname: null
-  # Set nccl_ib_hca to the InfiniBand HCA device (e.g., "mlx5_0", "mlx5_0:1"). run ibstat | grep "CA '" to find it
   nccl_ib_hca: null
   # Port for NCCL weight sync rendezvous (default: ray_master_port + 100)
   nccl_sync_port: null

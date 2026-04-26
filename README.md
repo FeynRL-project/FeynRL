@@ -84,9 +84,9 @@ The repository is organized so that algorithmic changes usually stay local:
 
 **[Installation & Setup](docs/INSTALL.md)** — Configure your environment and dependencies.
 
-**[Usage & Examples](docs/HOWTO.md)** — Learn how to launch jobs and run experiments.
+**[Quickstart & How-To](docs/HOWTO.md)** — Learn how to launch jobs and run experiments.
 
-**[Reported Results](examples/RESULTS.md)** — Reference experiment results and the canonical example configs used to reproduce them.
+**[Experiments](examples/README.md)** — Reference experiment results and the canonical example configs used to reproduce them.
 
 **[Configuration Reference](configs/README.md)** — Full parameter guide for RL, SFT, DPO, and evaluation configs.
 

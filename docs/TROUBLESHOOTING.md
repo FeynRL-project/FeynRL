@@ -2,6 +2,38 @@
 
 This guide covers common issues encountered while running FeynRL, including multi-node scaling, memory management, and training stability.
 
+## Recommended defaults (auto-detect)
+
+These knobs can stay at their `null` defaults whenever Ray and NCCL auto-detection works: always for single-node, and typically for multi-node too on well-configured fabrics:
+```yaml
+run:
+  ray_address: null
+  nccl_socket_ifname: null
+  nccl_ib_hca: null
+  nccl_sync_port: null
+```
+Only set them explicitly if fabric init fails (see Multi-Node & Scaling Issues below).
+
+## NCCL error or hang at `init_weight_nccl_group`
+
+Typical symptom is an `[EarlyFailure]` within seconds of starting weight sync, with a `RuntimeError: NCCL error: internal error` raised from `PyNcclCommunicator.__init__` → `ncclCommInitRank`. Less commonly the job hangs silently or loops on `[Heartbeat] ... 0/N done`.
+
+Root cause: an upstream vLLM issue triggered by combining `nccl_sync_backend: "nccl"` with `rollout.batch_invariant: True`. Either of these works around it:
+```yaml
+# Option 1 — keep NCCL weight sync, disable batch invariance
+rollout:
+  batch_invariant: False
+run:
+  nccl_sync_backend: "nccl"
+# Option 2 — keep batch invariance, switch weight sync to gloo
+run:
+  nccl_sync_backend: "gloo"
+rollout:
+  batch_invariant: True
+```
+
+---
+
 ## Multi-Node & Scaling Issues
 
 ### NCCL InfiniBand connection timeout
@@ -14,7 +46,7 @@ This guide covers common issues encountered while running FeynRL, including mult
 
 1. Run `ibdev2netdev` and `ip addr show` to map each HCA to its network interface and subnet. Management links typically have small subnets (`/30`), while data-fabric HCAs have larger subnets (`/24`, `/25`).
 
-2. **Auto-detect the data-fabric HCAs via GPU topology.** The HCAs you want are the ones with a `PIX` (PCIe-switch-local) link to at least one GPU in `nvidia-smi topo -m`. This one-liner prints them in the comma-separated form NCCL expects:
+2. **Auto-detect the data-fabric HCAs via GPU topology.** The HCAs you want are the ones with a `PIX` (PCIe-switch-local) link to at least one GPU in `nvidia-smi topo -m`. This one-liner prints them in the comma-separated form NCCL expects (the `-f1-9` assumes an 8-GPU box; widen the range if you have more GPUs):
    ```bash
    nvidia-smi topo -m | grep ^NIC | cut -f1-9 | grep PIX | cut -f1 | sed 's/NIC/mlx5_/;s/$/:1/' | paste -sd,
    # example output: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1
@@ -89,7 +121,7 @@ vLLM is memory-intensive. If you encounter OOM:
 3. **Sync Check**: With `weight_sync_method: nccl` or `direct`, disk checkpoints are only written at the periodic save schedule (or final epoch); verify the sync logs show success between saves.
 
 ### Weight Synchronization Methods
-The `weight_sync_method` config knob selects how training rank 0 transfers updated weights to the rollout workers. The config validator at [`configs/load.py:684-686`](../configs/load.py#L684-L686) couples this knob tightly to `overlap.enabled`: **overlap (async) mode requires `nccl`, and sync mode forbids `nccl`** (because the non-async vLLM engine has no NCCL weight-sync path).
+The `weight_sync_method` config knob selects how training rank 0 transfers updated weights to the rollout workers. The config validator at [`configs/load.py:680-686`](../configs/load.py#L680-L686) couples this knob tightly to `overlap.enabled`: **overlap (async) mode requires `nccl`, and sync mode forbids `nccl`** (because the non-async vLLM engine has no NCCL weight-sync path).
 
 - **`nccl`** (overlap-only): Training rank 0 broadcasts weights directly to all rollout engine TP workers over a dedicated NCCL process group. Zero serialization, lowest latency. Async mode pairs this with the NCCL watchdog (`TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `NCCL_TIMEOUT=1800s`, set by [`misc/nccl_env.py`](../misc/nccl_env.py)) so wedged collectives abort cleanly instead of hanging the GPU stream.
 - **`direct`** (sync-only at runtime): Gathers weights to CPU via DeepSpeed, transfers them through Ray's shared-memory object store to rollout workers, and loads them into vLLM in-place. Async mode uses `direct` exactly once during `load_checkpoint_for_resume`, before the NCCL group is initialized.

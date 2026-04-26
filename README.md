@@ -90,6 +90,8 @@ The repository is organized so that algorithmic changes usually stay local:
 
 **[Configuration Reference](configs/README.md)** — Full parameter guide for RL, SFT, DPO, and evaluation configs.
 
+**[Troubleshooting](docs/TROUBLESHOOTING.md)** — Diagnose and fix common issues.
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please see our **[Contributing Guidelines](CONTRIBUTING.md)** for details on how to get involved.

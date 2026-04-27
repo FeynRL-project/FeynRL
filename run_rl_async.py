@@ -299,8 +299,10 @@ def drain_results(results_queue, replay_buffer):
             break
 
         merged, stats = merge_rollout_with_stats([result_list])
-        replay_buffer.add_batch_seqs(merged)
+        # Accumulate stats first so a raise from add_batch_seqs (e.g. malformed
+        # shard) doesn't drop the shard's stats.
         rollout_stats.accumulate(acc, stats)
+        replay_buffer.add_batch_seqs(merged)
         drained += 1
 
     return drained, acc
@@ -408,8 +410,10 @@ def wait_for_round_completion(results_queue, replay_buffer, rollout_acc, target_
             continue
 
         merged, stats = merge_rollout_with_stats([result_list])
-        replay_buffer.add_batch_seqs(merged)
+        # Accumulate stats first so a raise from add_batch_seqs doesn't drop
+        # the shard's stats.
         rollout_stats.accumulate(rollout_acc, stats)
+        replay_buffer.add_batch_seqs(merged)
         shards += 1
 
     return shards
@@ -735,23 +739,25 @@ def run_round(epoch, training_engines, rollout_engines,
                                step=global_step)
             tracker.log_metrics({"train/step_time_sec": step_time}, step=global_step)
 
-            # Stream rollout stats if we accumulated anything this round.
-            if rollout_acc['total_samples_generated'] > 0:
+            # rollout/* fires once at end-of-epoch, so this is to record the intermediate states.
+            # Since at step=K-1 this snapshot is a strict subset of the rollout/* row written
+            # shortly after, we skip the last step.
+            if rollout_acc['total_samples_generated'] > 0 and step < steps_per_epoch - 1:
                 rollout_snapshot = rollout_stats.summarize(rollout_acc,
                                                            rollout_time=time.time() - round_start_time)
-                rollout_log = {f"rollout/{k}": v for k, v in rollout_snapshot.items()}
-                rollout_log["rollout/replay_buffer_size"] = len(replay_buffer)
-                rollout_log["rollout/policy_lag"] = policy_version - rollout_policy_version
-                rollout_log["rollout/shards_produced"] = producer.shards_produced
+                rollout_log = {f"rollout_inprogress/{k}": v for k, v in rollout_snapshot.items()}
+                rollout_log["rollout_inprogress/replay_buffer_size"] = len(replay_buffer)
+                rollout_log["rollout_inprogress/policy_lag"] = policy_version - rollout_policy_version
+                rollout_log["rollout_inprogress/shards_produced"] = producer.shards_produced
                 if qsize is not None:
-                    rollout_log["rollout/results_queue_qsize"] = qsize
+                    rollout_log["rollout_inprogress/results_queue_qsize"] = qsize
 
                 # Actual staleness of items currently in the buffer, policy_lag above is always 0 under inline sync.
                 buf_versions = [it["policy_version"] for it in replay_buffer.items]
                 if buf_versions:
-                    rollout_log["rollout/buffer_lag_max"]         = policy_version - min(buf_versions)
-                    rollout_log["rollout/buffer_lag_mean"]        = policy_version - (sum(buf_versions) / len(buf_versions))
-                    rollout_log["rollout/buffer_unique_versions"] = len(set(buf_versions))
+                    rollout_log["rollout_inprogress/buffer_lag_max"]         = policy_version - min(buf_versions)
+                    rollout_log["rollout_inprogress/buffer_lag_mean"]        = policy_version - (sum(buf_versions) / len(buf_versions))
+                    rollout_log["rollout_inprogress/buffer_unique_versions"] = len(set(buf_versions))
 
                 tracker.log_metrics(rollout_log, step=global_step)
 
@@ -787,6 +793,38 @@ def run_round(epoch, training_engines, rollout_engines,
         sync_ms = (time.time() - sync_start) * 1000.0
         if tracker:
             tracker.log_metrics({"nccl/inline_sync_ms": sync_ms}, step=global_step)
+
+    else:
+        # Since last epoch skips perform_inline_sync, we need to drain in-flight
+        # rollouts here so rollout/* doesn't under-count the tail.
+        logger.info(f"[Epoch {epoch+1}] Final-epoch drain START "
+                    f"(stopping producer, draining in-flight rollouts)")
+        try:
+            producer.stop()
+            stop_engines_and_drain(prompt_queue=prompt_queue,
+                                   num_rollout_engines=len(rollout_engines),
+                                   logger=logger)
+            ok, _ = wait_for_pull_loops(pull_refs=pull_refs,
+                                        prompt_queue=prompt_queue,
+                                        results_queue=results_queue,
+                                        replay_buffer=replay_buffer,
+                                        rollout_acc=rollout_acc,
+                                        num_rollout_engines=len(rollout_engines),
+                                        timeout=rollout_timeout,
+                                        logger=logger,
+                                        push_pills=False)
+
+            if not ok:
+                logger.warning(f"[Epoch {epoch+1}] Pull loop drain timed out; "
+                               f"rollout stats may be incomplete due to wedged engine.")
+
+            final_drained, final_acc = drain_results(results_queue, replay_buffer)
+            if final_drained > 0:
+                rollout_stats.accumulate(rollout_acc, final_acc)
+
+        except Exception as e:
+            logger.warning(f"[Epoch {epoch+1}] Final-epoch rollout drain raised: "
+                           f"{e}; rollout stats for this epoch may be incomplete.")
 
     # Step 5: Summarize rollout stats for the round
     generation_time = time.time() - round_start_time

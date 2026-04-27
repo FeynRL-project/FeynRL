@@ -1,0 +1,50 @@
+run:
+  experiment_id: "test_sl_run"
+  project_name: "test-leanrl"
+  logger_type : "mlflow"
+  tracking_uri: "" 
+  checkpoint_dir: "./launch_tests/results/checkpoints_sl"
+  seed: 42
+
+train:
+  alg_name: "sft"
+  optimizer_name: "adamw"
+  lr: 1e-6
+  adam_epsilon: 1e-8
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.1
+  clip_grad_norm: 1.0
+  lr_scheduler: "WarmupCosineLR"
+  total_number_of_epochs: 1
+  micro_batches_per_epoch: 1
+  dynamic_ratio_every_step: False
+  train_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 1
+  val_batch_size_per_gpu: 1
+  normalize_loss: True
+
+model:
+  name: "google/gemma-3-1b-it"
+  dtype: "bfloat16"
+  trust_remote_code: False
+  attn_implementation: "flash_attention_2"
+  gradient_checkpointing: True
+
+peft:
+  use_peft: False
+
+data:
+  train_ratios: {"train_sl": 1.0}
+  train_files_path: ["launch_tests/data/train_sl.parquet"]
+  val_files_path: ["launch_tests/data/val_sl.parquet"]
+  num_workers: 0
+  max_seq_len: 256
+  prompt_key: "prompt"
+  answer_key: "answer"
+
+deepspeed:
+  zero_optimization:
+    stage: 3
+  steps_per_print: 1
+  wall_clock_breakdown: false

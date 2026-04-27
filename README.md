@@ -78,6 +78,7 @@ The repository is organized so that algorithmic changes usually stay local:
 
 ## 📢 News
 
+- ![Date](https://img.shields.io/badge/2026--04--27-green) FeynRL is now publicly announced! Since the preview, we've added a new async engine and a collection of tricks and ideas, many not easily found elsewhere, that materially improve training stability and reliability. Thanks to everyone who tried the preview and shared feedback.
 - ![Date](https://img.shields.io/badge/2026--03--03-purple) We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
 
 ## 📖 How to Use FeynRL

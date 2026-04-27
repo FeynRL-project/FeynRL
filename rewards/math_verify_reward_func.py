@@ -6,7 +6,6 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeo
 from math_verify.errors import TimeoutException
 from math_verify.grader import verify
 from math_verify.parser import ExprExtractionConfig, ExtractionTarget, LatexExtractionConfig, parse
-from math_verify.utils import timeout
 
 # Adapted from https://github.com/verl-project/verl/blob/d9d94b4da93fbacc06bb546629171c67c0a674aa/verl/utils/reward_score/math_reward.py
 
@@ -61,15 +60,14 @@ def math_metric(gold_extraction_target: Sequence[ExtractionTarget] = (ExprExtrac
             A sample level metric that extracts and compares mathematical expressions.
     '''
 
-    @timeout(30)
     def get_str_preds_with_timeout(extracted_predictions: list[list[str]], extracted_golds: list[list[str]]) -> tuple[list[str], list[str]]:
         golds = [str(gold) for golds in extracted_golds for gold in golds]
         predictions = [str(pred) for preds in extracted_predictions for pred in preds]
         return (golds, predictions)
 
     def sample_level_fn(golds: list[str], predictions: list[str]) -> tuple[float, Optional[tuple[list[str], list[str]]]]:
-        extracted_predictions = [parse(pred, pred_extraction_target) for pred in predictions]
-        extracted_golds = [parse(gold, gold_extraction_target, parsing_timeout=30) for gold in golds]
+        extracted_predictions = [parse(pred, pred_extraction_target, parsing_timeout=None) for pred in predictions]
+        extracted_golds = [parse(gold, gold_extraction_target, parsing_timeout=None) for gold in golds]
 
         # Assert on empty gold and warn on empty pred
         if any(len(g) == 0 for g in extracted_golds):
@@ -83,7 +81,7 @@ def math_metric(gold_extraction_target: Sequence[ExtractionTarget] = (ExprExtrac
             logger.warning("Timeout when adding extracted predictions and golds to specific")
 
         return (
-            aggregation_function([(1.0 if any(verify(gold, pred, precision, timeout_seconds=30) for gold in extracted_golds) else 0.0) for pred in extracted_predictions]),
+            aggregation_function([(1.0 if any(verify(gold, pred, precision, timeout_seconds=None) for gold in extracted_golds) else 0.0) for pred in extracted_predictions]),
             str_preds,
         )
 

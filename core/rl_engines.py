@@ -874,3 +874,116 @@ def clear_pending_nccl_state_dict(rank0_engine, logger=None):
         if logger is not None:
             logger.warning(f"[clear_pending_nccl_state_dict] best-effort cleanup failed "
                            f"(CPU memory may leak on this retry): {e}")
+
+def format_rollout_lens_ratios(rollout_acc, samples):
+    '''
+        Print response_len percentiles and finish-reason ratios from a
+        rollout-stats accumulator. Returns (lens_str, ratios_str).
+        Returns dashes when no samples have been seen yet so heartbeats
+        printed before the first shard arrives don't crash on np.percentile.
+        len_cap%   = sequences whose generation hit max_tokens
+                     (finish_reason==length). The actionable signal:
+                     high values mean max_tokens is binding and it should be lowered.
+        eos%       = sequences that ended cleanly on EOS.
+        seq_drop%  = sequences whose prompt+response > max_seq_len, which
+                     would be silently dropped by replay_buffer.
+        Empty completions (response_len==0) are NOT in samples, they're filtered at the rollout engine
+        before the accumulator sees them as shown in [postprocess].
+    '''
+    lens = rollout_acc['all_response_lens']
+    if lens:
+        arr = np.asarray(lens)
+        p50, p95 = np.percentile(arr, [50, 95])
+        lens_str = f"p50/p95/max={int(p50)}/{int(p95)}/{int(arr.max())}"
+
+    else:
+        lens_str = "p50/p95/max=-/-/-"
+
+    if samples > 0:
+        len_cap_pct  = 100.0 * rollout_acc['total_truncated']     / samples
+        eos_pct      = 100.0 * rollout_acc['total_eos']           / samples
+        seq_drop_pct = 100.0 * rollout_acc['total_seq_truncated'] / samples
+        ratios_str = f"len_cap={len_cap_pct:.0f}%, eos={eos_pct:.0f}%"
+        if seq_drop_pct > 0:
+            ratios_str += f", seq_drop={seq_drop_pct:.0f}%"
+
+    else:
+        ratios_str = "len_cap=-, eos=-"
+
+    return lens_str, ratios_str
+
+def make_rollout_heartbeat_state(acc, heartbeat_s=30.0):
+    '''
+        Build state dict consumed by log_rollout_heartbeat.
+        Snapshots acc[total_tokens] so the first heartbeat correctly
+        reports tokens generated during the wait, not pre-existing total.
+    '''
+    now = time.time()
+    return {'t_start':       now,
+            'last_time':     now,
+            'last_tokens':   acc['total_tokens'],
+            'heartbeat_s':   float(heartbeat_s)}
+
+
+def is_rollout_heartbeat_due(state):
+    '''
+        True if state[heartbeat_s] has elapsed since the last emit.
+    '''
+    return time.time() - state['last_time'] >= state['heartbeat_s']
+
+
+def log_rollout_heartbeat(state, label, header, acc, replay_buffer,
+                          items_added_at_start, results_queue, logger):
+    '''
+        Emit a rollout-heartbeat log line and reset the per-window state.
+        Caller is responsible for verifying the heartbeat is due
+        (is_rollout_heartbeat_due(state)) before invoking; this function
+        emits unconditionally.
+            - state: dict from make_rollout_heartbeat_state(); mutated in place.
+            - label: short tag for the log line, e.g.
+                     "wait_for_pull_loops heartbeat".
+            - header: pre-formatted caller-specific fragment (engines_pending,
+                      shards/target, rate, etc.). Goes between the elapsed
+                      timestamp and the common body fields.
+            - acc: rollout-stats accumulator whose fields drive the body
+                   (tok/s, response_len percentiles, finish-reason ratios).
+            - items_added_at_start: replay_buffer.total_items_added value at
+                                    the start of the wait, for delta reporting.
+        Caller should reset its own per-window counters AFTER this call
+        (e.g., last_drained = total_drained_shards) so the next window's
+        rate calculation starts from a fresh baseline.
+    '''
+    now          = time.time()
+    window       = now - state['last_time']
+    window_tok_s = (acc['total_tokens'] - state['last_tokens']) / max(window, 1e-9)
+    items_added  = replay_buffer.total_items_added - items_added_at_start
+    samples      = acc['total_samples_generated']
+    lens_summary, ratios_summary = format_rollout_lens_ratios(acc, samples)
+    logger.info(f"[{label}] elapsed={now - state['t_start']:.0f}s, "
+                f"{header}, "
+                f"items_added={items_added}, "
+                f"tok/s={window_tok_s:.0f}, "
+                f"resp_len[{lens_summary}], "
+                f"{ratios_summary}, "
+                f"results_qsize={results_queue.qsize()}")
+
+    state['last_time']   = now
+    state['last_tokens'] = acc['total_tokens']
+
+def log_drain_summary(t_start, acc, replay_buffer, items_added_at_start,
+                      total_drained_shards, logger,
+                      label="wait_for_pull_loops"):
+    '''
+        Final summary line for a drain phase reporting the whole-window aggregate.
+        Used by wait_for_pull_loops on successful exit.
+    '''
+    duration     = time.time() - t_start
+    samples      = acc['total_samples_generated']
+    tokens_total = acc['total_tokens']
+    items_added  = replay_buffer.total_items_added - items_added_at_start
+    lens_summary, ratios_summary = format_rollout_lens_ratios(acc, samples)
+    logger.info(f"[{label}] Drain summary: dur={duration:.0f}s, "
+                f"shards={total_drained_shards}, items_added={items_added}, "
+                f"samples={samples}, tokens={tokens_total}, "
+                f"tok/s={tokens_total/max(duration, 1e-9):.0f}, "
+                f"resp_len[{lens_summary}], {ratios_summary}")

@@ -33,7 +33,11 @@ from core.rl_engines import (Algorithm_Registry,
                             broadcast_and_finalize_nccl,
                             check_rollout_engines_health,
                             clear_pending_nccl_state_dict,
-                            log_driver_heartbeat)
+                            log_driver_heartbeat,
+                            make_rollout_heartbeat_state,
+                            is_rollout_heartbeat_due,
+                            log_rollout_heartbeat,
+                            log_drain_summary)
 
 # Sentinel value pushed into prompt_queue to signal an engine to stop same as
 # VLLMRolloutEngineAsync.run_pull_loop. One poison pill per engine causes exactly
@@ -337,9 +341,22 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
                                f"during drain loop.")
                 break
 
-    deadline = time.time() + timeout
-    pending  = list(pull_refs)
+    deadline             = time.time() + timeout
+    pending              = list(pull_refs)
     total_drained_shards = 0
+    t_start              = time.time()
+    last_drained         = 0
+    items_added_at_start = replay_buffer.total_items_added
+
+    # Drain-only accumulator: in addition to the caller's rollout_acc (which spans the whole round),
+    # we keep a separate tally so heartbeat/summary metrics reflect this drain window only, not stats
+    # inherited from the earlier wait_for_round_completion phase of the same round.
+    drain_only_acc = rollout_stats.new_accumulator()
+    hb_state       = make_rollout_heartbeat_state(drain_only_acc)
+
+    # Map each pull_ref to its engine index so per-engine completion can be logged as each pull loop exits.
+    ref_to_engine = {ref: i for i, ref in enumerate(pull_refs)}
+    pending_set   = set(pending)
     while pending:
         # Retry undelivered pills non-blocking. Each successful put lets one
         # more engine see its pill and exit.
@@ -353,6 +370,24 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
         drained, drain_acc = drain_results(results_queue, replay_buffer)
         total_drained_shards += drained
         rollout_stats.accumulate(rollout_acc, drain_acc)
+        rollout_stats.accumulate(drain_only_acc, drain_acc)
+
+        if is_rollout_heartbeat_due(hb_state):
+            window = time.time() - hb_state['last_time']
+            delta  = total_drained_shards - last_drained
+            rate   = delta / max(window, 1e-9)
+            header = (f"engines_pending={len(pending)}/{num_rollout_engines}, "
+                      f"shards_drained={total_drained_shards} "
+                      f"(+{delta} in last {window:.0f}s, {rate:.2f}/s)")
+            log_rollout_heartbeat(state=hb_state,
+                                  label="wait_for_pull_loops heartbeat",
+                                  header=header,
+                                  acc=drain_only_acc,
+                                  replay_buffer=replay_buffer,
+                                  items_added_at_start=items_added_at_start,
+                                  results_queue=results_queue,
+                                  logger=logger)
+            last_drained = total_drained_shards
 
         time_left = deadline - time.time()
         if time_left <= 0:
@@ -364,6 +399,14 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
         # (full queue) can't exit until we free space.
         _, pending = ray.wait(pending, num_returns=len(pending), timeout=min(time_left, 0.5))
 
+        # Detect engines that finished since the last iteration, log per-engine drain time
+        # so a slow outlier is visible (vs. a global slowdown).
+        new_pending_set = set(pending)
+        for ref in pending_set - new_pending_set:
+            logger.info(f"[wait_for_pull_loops] engine {ref_to_engine[ref]} "
+                        f"drained at elapsed={time.time() - t_start:.0f}s")
+        pending_set = new_pending_set
+
     try:
         # 10s is a sanity bound.
         ray_get_with_timeout(refs=pull_refs, timeout=10, description="pull loop final check", logger=logger)
@@ -371,9 +414,15 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
         logger.error(f"[wait_for_pull_loops] Pull loop raised: {e}")
         return False, total_drained_shards
 
+    log_drain_summary(t_start=t_start,
+                      acc=drain_only_acc,
+                      replay_buffer=replay_buffer,
+                      items_added_at_start=items_added_at_start,
+                      total_drained_shards=total_drained_shards,
+                      logger=logger)
     return True, total_drained_shards
 
-def wait_for_round_completion(results_queue, replay_buffer, rollout_acc, target_shards, timeout, pull_refs):
+def wait_for_round_completion(results_queue, replay_buffer, rollout_acc, target_shards, timeout, pull_refs, logger):
     '''
         Blocking drain into replay_buffer until target_shards arrive. Shard count is used
         because sequences dropped at max_seq_len make item counts lossy, while shard count
@@ -383,8 +432,11 @@ def wait_for_round_completion(results_queue, replay_buffer, rollout_acc, target_
         Also raises RuntimeError if a pull loop exits mid-wait (dead engine -> shards will never arrive).
         Returns target_shards on success.
     '''
-    deadline = time.time() + timeout
-    shards = 0
+    deadline             = time.time() + timeout
+    shards               = 0
+    last_shards          = 0
+    items_added_at_start = replay_buffer.total_items_added
+    hb_state             = make_rollout_heartbeat_state(rollout_acc)
     while shards < target_shards:
         # Surface dead pull loops fast, a crashed engine will never produce more shards.
         ready, _ = ray.wait(pull_refs, num_returns=len(pull_refs), timeout=0)
@@ -402,6 +454,22 @@ def wait_for_round_completion(results_queue, replay_buffer, rollout_acc, target_
                                f"(2) add more rollout GPUs or reduce rollout.tensor_parallel_size, "
                                f"(3) reduce rollout.rollout_samples_per_epoch, "
                                f"(4) reduce rollout.max_tokens.")
+
+        if is_rollout_heartbeat_due(hb_state):
+            window = time.time() - hb_state['last_time']
+            delta  = shards - last_shards
+            rate   = delta / max(window, 1e-9)
+            header = (f"shards={shards}/{target_shards} "
+                      f"(+{delta} in last {window:.0f}s, {rate:.2f}/s)")
+            log_rollout_heartbeat(state=hb_state,
+                                  label="wait_for_round_completion heartbeat",
+                                  header=header,
+                                  acc=rollout_acc,
+                                  replay_buffer=replay_buffer,
+                                  items_added_at_start=items_added_at_start,
+                                  results_queue=results_queue,
+                                  logger=logger)
+            last_shards = shards
 
         try:
             # Bound per-get wait so we periodically re-check pull_refs and deadline.
@@ -494,12 +562,16 @@ def perform_inline_sync(epoch, training_engines, rollout_engines,
         shards_from_residual_drain, drain_acc = drain_results(results_queue=results_queue, replay_buffer=replay_buffer)
         rollout_stats.accumulate(rollout_acc, drain_acc)
 
+        t_complete_start = time.time()
         param_metadata = complete_nccl_gather(gather_futures=gather_futures,
                                               version=policy_version,
                                               logger=logger,
                                               sync_timeout=sync_timeout)
-        logger.info(f"[Epoch {epoch+1}] Gather done in {time.time()-t_gather_start:.2f}s "
-                    f"({len(param_metadata)} params)")
+        t_complete = time.time() - t_complete_start
+        t_drain   = t_complete_start - t_gather_start
+        logger.info(f"[Epoch {epoch+1}] Gather done in {t_drain+t_complete:.2f}s "
+                    f"(drain_wait={t_drain:.2f}s, gather={t_complete:.2f}s, "
+                    f"{len(param_metadata)} params)")
 
         broadcast_and_finalize_nccl(training_engines=training_engines,
                                     rollout_engines=rollout_engines,
@@ -618,7 +690,8 @@ def run_round(epoch, training_engines, rollout_engines,
                                                 rollout_acc=rollout_acc,
                                                 target_shards=wait_target,
                                                 timeout=rollout_timeout,
-                                                pull_refs=pull_refs)
+                                                pull_refs=pull_refs,
+                                                logger=logger)
     drain_time = time.time() - drain_start
     logger.info(f"[Epoch {epoch+1}] Drain: {shards_received}/{wait_target} "
                 f"shards in {drain_time:.2f}s, buffer={len(replay_buffer)}")

@@ -698,6 +698,12 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if max_tokens > max_seq_len:
                 raise ValueError("max_tokens must be < max_seq_len as max_seq_len equals to len(prompt + generation) and max_tokens equals to len(generation)")
 
+            # When rollout.max_model_len is set explicitly, it must be >= data.max_seq_len.
+            max_model_len = config.rollout.max_model_len
+            if max_model_len is not None and max_model_len < max_seq_len:
+                raise ValueError(f"rollout.max_model_len ({max_model_len}) must be >= "
+                                 f"data.max_seq_len ({max_seq_len}).")
+
             # Training step count
             if config.train.train_steps_per_epoch is None or config.train.train_steps_per_epoch < 1:
                 raise ValueError(f"train_steps_per_epoch must be >= 1 for RL, got {config.train.train_steps_per_epoch}")

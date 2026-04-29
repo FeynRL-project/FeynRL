@@ -164,6 +164,11 @@ class VLLMRolloutEngineAsync(Base):
                              seed=self.seed,
                              worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
                              disable_log_stats=True,
+                             # Reuse prompt KV across n_samples and shared prefixes.
+                             # Set explicit (vLLM 0.19 default is True). Weight updates
+                             # don't auto-invalidate, see update_weights_direct + finalize_weight_nccl
+                             # for the reset_prefix_cache calls.
+                             enable_prefix_caching=True,
                              )
         if self.max_model_len is not None:
             engine_kwargs["max_model_len"] = self.max_model_len
@@ -316,6 +321,9 @@ class VLLMRolloutEngineAsync(Base):
         batch_best_of_k_reward_sum = 0.0
         batch_reward_std_sum = 0.0
 
+        # total_attempted counts empty and non-empty responses
+        total_attempted = 0
+
         # If the reward function exposes a batch interface, score all
         # (prompt, response) pairs in one call so the reward function
         # can submit all work to its process pool before blocking.
@@ -366,6 +374,9 @@ class VLLMRolloutEngineAsync(Base):
                 # correct_threshold must be collected from all responses, including empty
                 # correct_threshold is required in pass@k calculation
                 group_stats['correct_threshold'].append(correct_threshold)
+
+                # Count every response even empty ones.
+                total_attempted += 1
 
                 if response_len > 0:
                     # is_per_token is False, then rewards_resp will only have value for the last element
@@ -479,6 +490,13 @@ class VLLMRolloutEngineAsync(Base):
                      f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
                      f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
                      f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}")
+
+        # Count empty responses to monitor for KV-cache pressure
+        n_empty = total_attempted - len(rollout_samples)
+        if n_empty > 0:
+            self.log(f"[postprocess] {n_empty}/{total_attempted} empty completions "
+                     f"({100.0*n_empty/max(1,total_attempted):.0f}%) — "
+                     f"vLLM returned response_len=0 (likely KV-cache pressure / preemption)")
 
         return rollout_samples
 
@@ -636,6 +654,18 @@ class VLLMRolloutEngineAsync(Base):
                                    f"param counts: {results}. Weights may be out of sync.")
 
         self.loaded_version = version
+        # Invalidate prefix cache so V+1 weights aren't mixed with V cached K/V.
+        # reset_running_requests=True converts vLLM 0.19's silent no-op (default)
+        # into success-or-raise. On failure, re-raise with a fingerprint matched
+        # by is_nccl_fatal_error so the driver hard-fails instead of continuing
+        # with biased rollouts.
+        reset_fn = getattr(self.async_engine, 'reset_prefix_cache', None)
+        if reset_fn is not None:
+            try:
+                self.run_async(reset_fn(reset_running_requests=True))
+            except Exception as e:
+                raise RuntimeError(f"reset_prefix_cache failed after weight update to v{version} "
+                                   f"(engine {self.engine_id}): {e}") from e
         self.log(f"Weights updated to version {version}")
         return True
 
@@ -875,6 +905,21 @@ class VLLMRolloutEngineAsync(Base):
 
         self._nccl_tp_params_received = 0
         self.loaded_version = version
+        # Invalidate prefix cache for the same reason as in update_weights_direct
+        # — NCCL TP>1 path also mutates the live model in place. See
+        # update_weights_direct for the full reasoning behind
+        # reset_running_requests=True and the hard-fail wrap.
+        reset_fn = getattr(self.async_engine, 'reset_prefix_cache', None)
+        if reset_fn is not None:
+            try:
+                self.run_async(reset_fn(reset_running_requests=True))
+            except Exception as e:
+                raise RuntimeError(
+                    f"reset_prefix_cache failed after weight update to v{version} "
+                    f"(engine {self.engine_id}, NCCL TP>1 path): {e}. Stale prefix "
+                    f"cache would produce mixed-version rollouts (V's weights × "
+                    f"V-1's K/V); aborting to prevent silent training-data corruption."
+                ) from e
         self.log(f"NCCL weight sync finalized to version {version} ({received} params)")
         return True
 

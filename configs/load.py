@@ -268,6 +268,8 @@ class Rollout(BaseModel):
     rollout_samples_per_epoch: int | None = None
     batch_invariant: bool = False
     max_model_len: int | None = None
+    # Online quantization for the rollout engine. Only the sync engine supports this and only "fp8".
+    quantization: str | None = None
 
 class Config(BaseModel):
     '''
@@ -681,6 +683,18 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 raise ValueError(f"overlap.enabled=True requires weight_sync_method='nccl' "
                                  f"(got '{weight_sync_method}'). The async engine no longer "
                                  f"supports direct/disk weight sync.")
+
+            # rollout.quantization is sync-only and only "fp8"
+            if config.rollout.quantization is not None:
+                if overlap_enabled:
+                    raise ValueError(f"rollout.quantization={config.rollout.quantization!r} is "
+                                     f"only supported by the sync rollout engine. Set overlap.enabled=False "
+                                     f"or remove rollout.quantization.")
+
+                if config.rollout.quantization != "fp8":
+                    raise ValueError(f"rollout.quantization={config.rollout.quantization!r} not supported. "
+                                     f"Only 'fp8' is supported for the sync rollout engine.")
+
             if weight_sync_method == "nccl" and not overlap_enabled:
                 raise ValueError("weight_sync_method 'nccl' requires overlap.enabled=True "
                                  "(sync rollout engine does not support nccl)")

@@ -133,6 +133,8 @@ rollout:
   # https://docs.vllm.ai/en/stable/examples/offline_inference/reproducibility/
   batch_invariant: False
   max_model_len: null
+  # Sync engine only and only "fp8".
+  quantization: null
 
 model:
   name: "google/gemma-3-1b-it"

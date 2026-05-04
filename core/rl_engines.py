@@ -168,9 +168,11 @@ def create_rollout_engines(params, reward_fnc, eos_id):
                                                          ).remote(**kwargs))
 
         else:
+            # quantization is for sync-only mode.
+            sync_kwargs = {**kwargs, "quantization": params.rollout.quantization}
             engines.append(VLLMRolloutEngine.options(num_gpus=tp,
                                                     runtime_env={"env_vars": rollout_env_vars}
-                                                    ).remote(**kwargs))
+                                                    ).remote(**sync_kwargs))
 
     return engines
 

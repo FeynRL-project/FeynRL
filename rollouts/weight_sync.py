@@ -32,12 +32,13 @@ class WeightSyncExtension:
 
         num_params = len(state_dict)
 
+        model = self.model_runner.model
         # Sanity-check that state_dict keys have some overlap with model params.
         # vllm fuses some layers internally (e.g. q_proj + k_proj + v_proj -> qkv_proj,
         # gate_proj + up_proj -> gate_up_proj), so a strict 1:1 match is not expected.
         # load_weights handles the remapping, but if zero keys match, the naming
         # convention is completely wrong and load_weights would silently no-op.
-        model_params = set(name for name, _ in self.model_runner.model.named_parameters())
+        model_params = set(name for name, _ in model.named_parameters())
         matched = sum(1 for k in state_dict if k in model_params)
         if matched == 0 and num_params > 0:
             raise RuntimeError(f"Weight sync failed: none of the {num_params} state_dict keys "
@@ -46,7 +47,17 @@ class WeightSyncExtension:
                                f"Sample state_dict keys: {list(state_dict.keys())[:3]}, "
                                f"sample model params: {list(model_params)[:3]}")
 
-        self.model_runner.model.load_weights(weights=state_dict.items())
+        # When the engine was loaded with online quantization (e.g. fp8), live
+        # weight params are quantized with frozen scales. vllm's layerwise
+        # path restores -> loads -> re-quantizes.
+        quant = getattr(self.vllm_config.model_config, "quantization", None)
+        if quant is not None:
+            self.load_weights_layerwise_reload(model, state_dict)
+            self.log_quant_reload_summary(model, num_params, quant)
+
+        else:
+            model.load_weights(weights=state_dict.items())
+
         torch.cuda.synchronize()
         return num_params
 
@@ -55,10 +66,39 @@ class WeightSyncExtension:
             Return a hash of a specific parameter for verification.
             Useful for confirming weights were updated correctly.
             param_name: name of the parameter to hash.
+
+            For FP8-quantized weights the raw FP8 storage is dequantized
+            (weight_fp8 * weight_scale, mirroring fp8.py's batch-invariant
+            path) so the hash is comparable to a bf16 reference computed by
+            the trainer. Quantization noise still introduces small drift, so
+            this remains an approximate check.
         '''
-        for name, param in self.model_runner.model.named_parameters():
+        model = self.model_runner.model
+        for name, param in model.named_parameters():
             if name == param_name or param_name in name:
-                return param.data.float().sum().item()
+                data = param.data
+                if data.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    module_path = name.rpartition(".")[0]
+                    module = model.get_submodule(module_path) if module_path else model
+                    w_bf16 = data.to(torch.bfloat16)
+                    scale = getattr(module, "weight_scale", None)
+                    scale_inv = getattr(module, "weight_scale_inv", None)
+                    if scale is not None:
+                        s = scale.data.to(torch.bfloat16)
+                        if s.numel() == 1:
+                            deq = w_bf16 * s
+                        elif s.dim() == 1 and s.shape[0] == w_bf16.shape[0]:
+                            deq = w_bf16 * s.unsqueeze(1)
+                        else:
+                            deq = w_bf16 * s
+                    elif scale_inv is not None:
+                        # Block quant: per-block scale. Approximate the hash with
+                        # the mean scale so it stays the right order of magnitude.
+                        deq = w_bf16 * scale_inv.data.to(torch.bfloat16).mean()
+                    else:
+                        deq = w_bf16
+                    return deq.float().sum().item()
+                return data.float().sum().item()
         return None
 
     def init_weight_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend):
@@ -183,3 +223,88 @@ class WeightSyncExtension:
             except Exception:
                 pass
             self.weight_sync_group = None
+
+    def load_weights_layerwise_reload(self, model, state_dict):
+        '''
+            Load bf16 weights into a quantized engine via vllm's layerwise reload:
+            restore -> load -> re-quantize per layer. Logger is silenced because
+            finalize warns for every container module with no direct params
+            (benign — leaves re-quantize during the load itself).
+        '''
+        import logging
+        from vllm.model_executor.model_loader.reload import (initialize_layerwise_reload,
+                                                             finalize_layerwise_reload,)
+
+        reload_logger = logging.getLogger("vllm.model_executor.model_loader.reload.layerwise")
+        prev_level = reload_logger.level
+        reload_logger.setLevel(logging.ERROR)
+        try:
+            with torch.device(self.device):
+                initialize_layerwise_reload(model)
+                model.load_weights(weights=state_dict.items())
+                finalize_layerwise_reload(model, self.vllm_config.model_config)
+
+        finally:
+            reload_logger.setLevel(prev_level)
+
+    def log_quant_reload_summary(self, model, num_params, quant):
+        '''
+            TP-rank-0 only: log FP8 param count + sample after reload.
+            fp8_params=0 means quantization silently fell back to full precision.
+        '''
+        tp_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if tp_rank != 0:
+            return
+
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        fp8_count = 0
+        sample_name = sample_dtype = sample_scale_shape = None
+
+        for n, p in model.named_parameters():
+            if p.data.dtype in fp8_dtypes:
+                fp8_count += 1
+                if sample_name is None:
+                    sample_name = n
+                    sample_dtype = p.data.dtype
+                    module_path = n.rpartition(".")[0]
+                    m = model.get_submodule(module_path) if module_path else model
+                    s = getattr(m, "weight_scale", None) or getattr(m, "weight_scale_inv", None)
+                    sample_scale_shape = tuple(s.shape) if s is not None else None
+
+        print(f"[WeightSyncExtension] FP8 layerwise reload OK | quant={quant} | "
+              f"fp8_params={fp8_count}/{num_params} | "
+              f"sample={sample_name} dtype={sample_dtype} scale_shape={sample_scale_shape}",
+              flush=True)
+
+    def get_quantization_info(self):
+        '''
+            Report what quantization the engine was loaded with and how many of
+            the live model parameters are actually FP8 vs full-precision. Called
+            once after engine creation so the orchestrator can confirm FP8 is
+            wired through end-to-end (not just configured).
+        '''
+        quant = getattr(self.vllm_config.model_config, "quantization", None)
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        fp8_count = 0
+        non_fp8_count = 0
+        sample_name = sample_dtype = sample_scale_shape = None
+        model = self.model_runner.model
+        for n, p in model.named_parameters():
+            if p.data.dtype in fp8_dtypes:
+                fp8_count += 1
+                if sample_name is None:
+                    sample_name = n
+                    sample_dtype = str(p.data.dtype)
+                    module_path = n.rpartition(".")[0]
+                    m = model.get_submodule(module_path) if module_path else model
+                    s = getattr(m, "weight_scale", None) or getattr(m, "weight_scale_inv", None)
+                    sample_scale_shape = tuple(s.shape) if s is not None else None
+            else:
+                non_fp8_count += 1
+
+        return {"quantization": quant,
+                "fp8_params": fp8_count,
+                "non_fp8_params": non_fp8_count,
+                "sample_name": sample_name,
+                "sample_dtype": sample_dtype,
+                "sample_scale_shape": sample_scale_shape,}

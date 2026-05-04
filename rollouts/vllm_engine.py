@@ -38,6 +38,7 @@ class VLLMRolloutEngine(Base):
                  max_model_len: int | None = None,
                  engine_id: int = 0,
                  batch_invariant: bool = False,
+                 quantization: Optional[str] = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -84,6 +85,8 @@ class VLLMRolloutEngine(Base):
         self.model_dtype = model_dtype
         self.loaded_version = -1
         self.trust_remote_code = trust_remote_code
+        # Online quantization for vllm and only "fp8" is supported.
+        self.quantization = quantization
         self.vllm_engine = None
         self.refresh_model(model_path, 0)
         self.sampling_params = self.make_sampling_params()
@@ -181,8 +184,22 @@ class VLLMRolloutEngine(Base):
         if self.batch_invariant:
             llm_kwargs["attention_backend"] = "FLASH_ATTN"
 
+        if self.quantization is not None:
+            llm_kwargs["quantization"] = self.quantization
+
         self.vllm_engine = LLM(**llm_kwargs)
         self.log(f"Successfully loaded vllm model from {self.model_path}")
+
+        # collective_rpc returns one dict per TP worker and all shards should agree
+        # on quantization scheme and have similar FP8 counts.
+        if self.quantization is not None:
+            try:
+                infos = self.vllm_engine.collective_rpc("get_quantization_info")
+                if infos:
+                    self.log(f"Engine quantization: {infos[0]}")
+
+            except Exception as e:
+                self.log(f"get_quantization_info skipped: {e}")
 
     def update_weights_direct(self, state_dict: dict, version: int) -> bool:
         '''

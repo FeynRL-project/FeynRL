@@ -232,10 +232,13 @@ class P4O(COMMON):
             approx_kl_t_b = logratio_b + ratio_inv_b - 1.0
             approx_kl_b   = (approx_kl_t_b.to(dtype=dtype) * mask).sum() / denom
 
+            # mc entropy proxy at the realized token: -log pi(a|s)
+            ent_mc = -(logprobs * mask).sum() / denom
+
             # save the metrics for debugging
             metrics = {'clipfrac': clipfrac.item(),
                        'approx_kl_b': approx_kl_b.item(),
-                       'ent_loss': (ent_sum / denom).item(),
+                       'ent_mc': ent_mc.item(),
                        'pi_loss': (pi_sum / denom).item(),
                        'loss_total': (loss_total_sum / denom).item(),
                        'kl_ref': (kl_sum_ref / denom).item(),

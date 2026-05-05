@@ -28,6 +28,7 @@ class P3O(COMMON):
                  deepspeed_config: Any,
                  gradient_checkpointing: bool,
                  seed: int,
+                 train_steps_per_epoch: int,
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
@@ -69,6 +70,11 @@ class P3O(COMMON):
         # treating the entire buffer as a single batch.
         self.update_only_after_full_replay = update_after_full_replay
         self.normalize_loss = normalize_loss
+
+        # for decoupled loss, cache pi_prox once per epoch (not used in p3o for now).
+        self.train_steps_per_epoch = int(train_steps_per_epoch)
+        self.cached_prox_logprobs  = None
+        self.cached_prox_nan_masks = None
 
         self.ready = False
         self.init_training_engine()

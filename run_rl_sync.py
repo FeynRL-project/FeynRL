@@ -6,6 +6,7 @@ import ray
 import time
 import shutil
 
+import configs.load as cfg
 # imports local methods, classes, etc.
 from misc.utils import load_algorithm, ray_get_with_timeout, set_random_seeds
 from rollouts.replay_buffer import ReplayBuffer
@@ -22,11 +23,13 @@ from core.rl_engines import (Algorithm_Registry,
                             sync_weights_direct,
                             refresh_rollout_engine,
                             reinit_nccl_weight_sync_group)
+from rollouts.external_policy import ExternalPolicyEngine
 
 def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
                    replay_buffer, policy_version, rollout_policy_version, global_step,
                    n_samples, train_batch_size, steps_per_epoch, seed,
-                   rollout_timeout, train_step_timeout, tracker, logger):
+                   rollout_timeout, train_step_timeout, tracker, logger,
+                   external_engines=None):
     '''
         Sequential epoch: [collect_rollouts] -> [prepare_training_batches] -> [train]]
     '''
@@ -43,7 +46,8 @@ def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
                                        replay_buffer=replay_buffer,
                                        n_samples=n_samples,
                                        logger=logger,
-                                       rollout_timeout=rollout_timeout)
+                                       rollout_timeout=rollout_timeout,
+                                       external_engines=external_engines)
 
     # 3. Prepare training batches
     logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")
@@ -189,9 +193,54 @@ def main(args, config):
     else:
         raise ValueError("Reward function not specified")
 
-    rollout_engines = create_rollout_engines(params=config,
-                                             reward_fnc=reward_fnc,
-                                             eos_id=tokenizer.eos_token_id)
+    ########
+    # 5b. Load policy-mixing config and build external engines (sync engine only)
+    ########
+    mixing_cfg = cfg.load_mixing_config(
+        config.policy_mixing.configs if config.policy_mixing else None
+    )
+    external_engines = []
+    n_main_samples = config.rollout.n_samples
+
+    if mixing_cfg.policies:
+        n_ext_total = sum(p.n_samples for p in mixing_cfg.policies)
+        n_main_samples = config.rollout.n_samples - n_ext_total
+        if n_main_samples < 1:
+            raise ValueError(
+                f"Sum of external policy n_samples ({n_ext_total}) must be "
+                f"< rollout.n_samples ({config.rollout.n_samples})"
+            )
+        for spec in mixing_cfg.policies:
+            external_engines.append(ExternalPolicyEngine(
+                base_url=spec.base_url,
+                model=spec.model,
+                n_samples=spec.n_samples,
+                tokenizer=tokenizer,
+                reward_func=reward_fnc,
+                reward_broadcast=config.reward.broadcast,
+                eos_id=tokenizer.eos_token_id,
+                max_tokens=spec.max_tokens if spec.max_tokens is not None else config.rollout.max_tokens,
+                temperature=spec.temperature if spec.temperature is not None else config.rollout.temperature,
+                max_seq_len=config.data.max_seq_len,
+                api_key=spec.api_key,
+                max_concurrent=spec.max_concurrent,
+                request_timeout=spec.request_timeout,
+            ))
+            logger.info(
+                f"[PolicyMixing] External engine: model={spec.model} "
+                f"base_url={spec.base_url} n_samples={spec.n_samples}"
+            )
+        logger.info(
+            f"[PolicyMixing] {len(external_engines)} external engine(s), "
+            f"main engine n_samples reduced: {config.rollout.n_samples} -> {n_main_samples}"
+        )
+
+    rollout_engines = create_rollout_engines(
+        params=config,
+        reward_fnc=reward_fnc,
+        eos_id=tokenizer.eos_token_id,
+        n_samples_override=n_main_samples if external_engines else None,
+    )
     num_rollout_engines = len(rollout_engines)
     logger.info(f"Created {num_rollout_engines} rollout engines with TP={config.rollout.tensor_parallel_size}")
 
@@ -342,7 +391,8 @@ def main(args, config):
                                 rollout_timeout=rollout_timeout,
                                 train_step_timeout=train_step_timeout,
                                 tracker=tracker,
-                                logger=logger)
+                                logger=logger,
+                                external_engines=external_engines or None)
 
         # Unpack result
         global_step            = result['global_step']
@@ -370,8 +420,37 @@ def main(args, config):
                     f"unique_response_ratio={rollout_metrics['unique_response_ratio']:.4f}, "
                     f"{time_str}, tps={rollout_metrics['tokens_per_sec']:.2f}")
 
+        if "_main" in rollout_metrics:
+            m = rollout_metrics["_main"]
+            logger.info(
+                f"[Epoch {epoch + 1}] Rollout [main_policy]: {m['total_samples_generated']} samples, "
+                f"avg_reward={m['avg_reward']:.4f}, reward_std={m['reward_std']:.4f}, "
+                f"avg_response_len={m['avg_response_len']:.1f}, "
+                f"truncated_ratio={m['truncated_ratio']:.4f}, "
+                f"eos_ratio={m['eos_ratio']:.4f}, "
+                f"mean_logprob={m['mean_logprob']:.4f}, "
+                f"unique_response_ratio={m['unique_response_ratio']:.4f}"
+            )
+            e = rollout_metrics["_ext"]
+            logger.info(
+                f"[Epoch {epoch + 1}] Rollout [ext_policy]: {e['total_samples_generated']} samples, "
+                f"avg_reward={e['avg_reward']:.4f}, reward_std={e['reward_std']:.4f}, "
+                f"avg_response_len={e['avg_response_len']:.1f}, "
+                f"truncated_ratio={e['truncated_ratio']:.4f}, "
+                f"eos_ratio={e['eos_ratio']:.4f}, "
+                f"mean_logprob={e['mean_logprob']:.4f}, "
+                f"unique_response_ratio={e['unique_response_ratio']:.4f}"
+            )
+
         if tracker:
-            rollout_log = {"rollout/" + k: v for k, v in rollout_metrics.items()}
+            rollout_log = {
+                "rollout/" + k: v
+                for k, v in rollout_metrics.items()
+                if not k.startswith("_")
+            }
+            if "_main" in rollout_metrics:
+                rollout_log.update({"rollout/main/" + k: v for k, v in rollout_metrics["_main"].items()})
+                rollout_log.update({"rollout/ext/"  + k: v for k, v in rollout_metrics["_ext"].items()})
             tracker.log_metrics(rollout_log, step=global_step)
 
         # Log training summary

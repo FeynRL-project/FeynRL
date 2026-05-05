@@ -107,6 +107,15 @@ reward:
   broadcast: False
   reward_func: dummy_reward_func
 
+# Policy mixing (sync engine only).
+# Set configs to a path (string) or list of paths pointing to external-policy
+# config files (e.g. configs/mixing_args.yaml).  Each file follows the
+# PolicyMixingConfig schema: a `policies` list where every entry specifies
+# base_url, model, n_samples, and optionally api_key / temperature / max_tokens.
+# null disables mixing entirely and leaves all existing behaviour unchanged.
+policy_mixing:
+  configs: null
+
 rollout:
   temperature: 1.0
   # max number of tokens to generate per output sequence

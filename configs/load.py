@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Any
+from typing import Dict, Any, List
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
 import yaml
 import sys
@@ -140,6 +140,7 @@ class Data(BaseModel):
     prompt_key: str
     answer_key: str
     solution_key: str | None = None
+    enable_thinking: bool | None = None
 
 class Model(BaseModel):
     '''
@@ -271,6 +272,44 @@ class Rollout(BaseModel):
     # Online quantization for the rollout engine. Only the sync engine supports this and only "fp8".
     quantization: str | None = None
 
+
+class ExternalPolicySpec(BaseModel):
+    '''
+        Specification for one external policy used in policy mixing.
+        temperature and max_tokens default to the rollout config values when None.
+    '''
+    model_config = ConfigDict(extra='forbid')
+    base_url: str
+    model: str
+    n_samples: int
+    api_key: str = "dummy"
+    temperature: float | None = None   # None → inherit rollout.temperature
+    max_tokens: int | None = None      # None → inherit rollout.max_tokens
+    max_concurrent: int = 16           # max parallel requests to this endpoint
+    request_timeout: float = 300.0     # per-request timeout in seconds
+
+
+class PolicyMixingConfig(BaseModel):
+    '''
+        Top-level schema for a mixing_args.yaml file.
+        policies is a list so multiple external endpoints can contribute
+        completions; they are queried concurrently at rollout time.
+    '''
+    model_config = ConfigDict(extra='forbid')
+    policies: List[ExternalPolicySpec] = Field(default_factory=list)
+
+
+class PolicyMixing(BaseModel):
+    '''
+        Inline policy-mixing section of rl_args.yaml.
+        configs accepts a single path string or a list of paths, each pointing
+        to a file that follows the PolicyMixingConfig schema.
+        null / empty list disables mixing with no change to existing behaviour.
+    '''
+    model_config = ConfigDict(extra='forbid')
+    configs: str | List[str] | None = None
+
+
 class Config(BaseModel):
     '''
         This is the main configuration class for the experiment where it puts all the sub-configurations
@@ -286,6 +325,8 @@ class Config(BaseModel):
     reward: Reward | None = None
     rollout: Rollout | None = None
     overlap: Overlap | None = None
+    # Policy mixing (sync engine only): path(s) to external-policy config files
+    policy_mixing: PolicyMixing | None = None
     # Reference model DeepSpeed config
     deepspeed_ref: DeepSpeedRef | None = None
     # Value model DeepSpeed config
@@ -523,6 +564,36 @@ class Config(BaseModel):
             self.train.value_clip_grad_norm = v_clip
 
             self.deepspeed_value = value_ds
+
+def load_mixing_config(configs: str | List[str] | None) -> PolicyMixingConfig:
+    '''
+        Load and merge one or more external-policy config files.
+        configs may be a single path string, a list of paths, or None.
+        All `policies` lists from the referenced files are combined into one
+        PolicyMixingConfig.  Returns an empty config when configs is None,
+        preserving full backward compatibility.
+    '''
+    if not configs:
+        return PolicyMixingConfig()
+
+    paths = [configs] if isinstance(configs, str) else list(configs)
+    all_policies: List[ExternalPolicySpec] = []
+
+    for path in paths:
+        try:
+            with open(path, "r") as f:
+                raw = yaml.safe_load(f) or {}
+            file_cfg = PolicyMixingConfig(**raw)
+            all_policies.extend(file_cfg.policies)
+        except FileNotFoundError:
+            print(f"[PolicyMixing] ERROR: config file not found: {path}")
+            sys.exit(1)
+        except (yaml.YAMLError, ValidationError) as exc:
+            print(f"[PolicyMixing] ERROR parsing {path}: {exc}")
+            sys.exit(1)
+
+    return PolicyMixingConfig(policies=all_policies)
+
 
 def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int, world_size: int | None = None):
     '''

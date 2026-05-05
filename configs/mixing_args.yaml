@@ -1,0 +1,31 @@
+# Policy mixing configuration (optional).
+# Pass via --mixing_config configs/mixing_args.yaml to enable.
+# Omit --mixing_config entirely to run with only the main policy (default).
+#
+# Each entry in `policies` defines one external policy endpoint.
+# All external policies receive the same full prompt batch and their
+# completions are merged with the main engine's completions before
+# reward normalisation.  External engines run concurrently.
+#
+# Constraint: sum(policy.n_samples) must be < rollout.n_samples
+# (the main engine generates the remainder).
+#
+# Fields per policy:
+#   base_url    : OpenAI-compatible API root (with or without /v1 suffix)
+#   model       : model name or path as recognised by the server
+#   n_samples   : completions per prompt from this policy
+#   api_key     : default "dummy" (vLLM accepts any key)
+#   temperature     : null → inherit rollout.temperature from rl_args.yaml
+#   max_tokens      : null → inherit rollout.max_tokens  from rl_args.yaml
+#   max_concurrent  : max parallel HTTP requests to this endpoint (default 16)
+#   request_timeout : per-request timeout in seconds (default 300)
+
+policies:
+  - base_url: "http://localhost:8080"
+    model: "/path/to/model"
+    n_samples: 4
+    api_key: "dummy"
+    temperature: null
+    max_tokens: null
+    max_concurrent: 16
+    request_timeout: 300

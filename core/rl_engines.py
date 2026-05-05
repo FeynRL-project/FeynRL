@@ -99,13 +99,20 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
     return ray_runners
 
-def create_rollout_engines(params, reward_fnc, eos_id):
+def create_rollout_engines(params, reward_fnc, eos_id, n_samples_override=None):
     '''
         This function is responsible for setting up distributed
         inference/rollout/generation engine.
+
+        n_samples_override : when policy mixing is enabled the main engine
+            generates fewer samples per prompt (rollout.n_samples minus the
+            external share).  Pass the adjusted count here; None uses the
+            value from params.rollout.n_samples.
     '''
     tp = int(params.rollout.tensor_parallel_size)
     rollout_gpus = int(params.run.rollout_gpus)
+
+    n_samples = n_samples_override if n_samples_override is not None else params.rollout.n_samples
 
     kwargs = { # model related arguments
               "model_path":params.model.name,
@@ -117,7 +124,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               # rollout generation related arguments
               "temperature":params.rollout.temperature,
               "max_tokens":params.rollout.max_tokens,
-              "n_samples":params.rollout.n_samples,
+              "n_samples":n_samples,
               "top_p":params.rollout.top_p,
               "top_k":params.rollout.top_k,
               "ignore_eos":params.rollout.ignore_eos,
@@ -203,6 +210,7 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                                                 steps_per_epoch=num_batches,
                                                 shuffle_within_batch=True,
                                                 dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                enable_thinking=params.data.enable_thinking,
                                                 )
     # Seed each DataLoader worker deterministically so any randomness
     # inside __getitem__ / collate_fn is reproducible across runs.
@@ -322,6 +330,60 @@ def merge_rollout_with_stats(rollout_lists):
 
     return rollout_merged, stats
 
+def renormalize_groups(all_samples, reward_broadcast: bool):
+    '''
+        Re-compute z-score normalisation over merged prompt groups.
+
+        Groups samples by prompt_ids, then recomputes token_zscores /
+        pred_zscores using Bessel-corrected std over the full merged group.
+        Call this after combining main-policy and external-policy samples so
+        that the advantage estimates reflect the complete comparison set.
+
+        all_samples : flat list of sample dicts (main + external combined).
+        reward_broadcast : if True, broadcast the scalar z-score across all
+                           response token positions (mirrors VLLMRolloutEngine).
+    '''
+    groups = {}
+    for s in all_samples:
+        key = tuple(s['prompt_ids'])
+        groups.setdefault(key, []).append(s)
+
+    result = []
+    for prompt_key, group in groups.items():
+        prompt_len = len(prompt_key)
+        n = len(group)
+        rewards_list = [s['token_rewards'][-1].item() for s in group]
+
+        if n > 1:
+            rewards_arr = np.array(rewards_list, dtype=np.float64)
+            mean_r = float(rewards_arr.mean())
+            std_r  = float(np.sqrt(((rewards_arr - mean_r) ** 2).sum() / max(n - 1, 1)))
+        else:
+            mean_r = 0.0
+            std_r  = 1.0
+
+        for s in group:
+            scalar_r = s['token_rewards'][-1].item()
+            z = (scalar_r - mean_r) / (std_r + 1e-8)
+            seq_len = len(s['input_ids'])
+
+            token_zscores = torch.zeros(seq_len, dtype=torch.float32)
+            token_zscores[-1] = float(z)
+            if reward_broadcast:
+                token_zscores[prompt_len:] = float(z)
+            s['token_zscores'] = token_zscores
+
+            pred_start = prompt_len - 1
+            pred_end   = seq_len - 1
+            pred_zscores = torch.zeros(seq_len, dtype=torch.float32)
+            pred_zscores[pred_start:pred_end] = token_zscores[prompt_len:]
+            s['pred_zscores'] = pred_zscores
+
+            result.append(s)
+
+    return result
+
+
 def collect_rollouts(dataloader,
                      rollout_engines,
                      epoch,
@@ -329,14 +391,28 @@ def collect_rollouts(dataloader,
                      replay_buffer,
                      n_samples,
                      logger,
-                     rollout_timeout):
+                     rollout_timeout,
+                     external_engines=None):
 
     '''
         This function is used to run rollout engine and generate rollouts/samples.
+
+        external_engines : optional list of ExternalPolicyEngine instances.
+            When provided (non-empty), all engines are called concurrently on
+            the full prompt batch while the main vLLM engines process their
+            shards.  Samples from all sources are merged per prompt group and
+            re-normalised before entering the replay buffer.
+            Pass None or [] (default) to use the original single-policy path.
     '''
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     num_rollout_engines = len(rollout_engines)
     rollout_start_time = time.time()
     acc = rollout_stats.new_accumulator()
+    mixing_active = bool(external_engines)
+    if mixing_active:
+        acc_main = rollout_stats.new_accumulator()
+        acc_ext  = rollout_stats.new_accumulator()
 
     # rollout_samples_per_epoch is the number of PROMPTS, not total completions.
     # example: rollout_gpus=2, rollout_batch_size_per_gpu=12, n_samples=3, rollout_samples_per_epoch = 25
@@ -349,9 +425,13 @@ def collect_rollouts(dataloader,
     total_prompts = num_batches_per_epoch * batch_size
     prompts_per_engine = batch_size // num_rollout_engines
 
+    if mixing_active:
+        ext_tag = " + " + "+".join(str(e.n_samples) for e in external_engines) + " ext"
+    else:
+        ext_tag = ""
     logger.info(f"[Rollout] {total_prompts} prompts ({num_batches_per_epoch} batches x {batch_size} prompts/batch), "
                 f"{num_rollout_engines} engines ({prompts_per_engine} prompts/engine/batch), "
-                f"{n_samples} samples/prompt, "
+                f"{n_samples}{ext_tag} samples/prompt, "
                 f"~{total_prompts * n_samples} expected samples in replay buffer")
 
     for rollout_batch in dataloader:
@@ -360,25 +440,54 @@ def collect_rollouts(dataloader,
         if not rollout_shards:
             continue
 
-        # 2. schedule rollout generation
-        rollout_samples = []
+        # 2. schedule main rollout generation (async Ray calls)
+        rollout_refs = []
         for i, shard in enumerate(rollout_shards):
-            rollout_samples.append(rollout_engines[i].generate.remote(prompts=shard,
-                                                                      current_iter=epoch,
-                                                                      policy_version=policy_version))
+            rollout_refs.append(rollout_engines[i].generate.remote(prompts=shard,
+                                                                    current_iter=epoch,
+                                                                    policy_version=policy_version))
 
-        # 3. gather rollouts. This is a blocking call means all engines must
-        # finish generating rollouts before we can proceed.
-        rollout_lists = ray_get_with_timeout(refs=rollout_samples,
+        # 3. run all external engines concurrently while main GPU engines generate.
+        #    Each external engine receives the full prompt batch so every prompt
+        #    is covered by all policies.
+        ext_samples = []
+        if mixing_active:
+            with ThreadPoolExecutor(max_workers=len(external_engines)) as pool:
+                futures = {
+                    pool.submit(eng.generate, rollout_batch, epoch, policy_version): eng
+                    for eng in external_engines
+                }
+                for future in as_completed(futures):
+                    eng = futures[future]
+                    try:
+                        ext_samples.extend(future.result())
+                    except Exception as exc:
+                        logger.warning(f"[PolicyMixing] External engine {eng.model} failed: {exc}")
+
+        # 4. gather main rollouts (blocking)
+        rollout_lists = ray_get_with_timeout(refs=rollout_refs,
                                              timeout=rollout_timeout,
                                              description=f"rollout generation (epoch {epoch+1})",
                                              logger=logger)
 
-        # 4. merge rollouts across all engines and collect stats
-        rollout_merged, stats = merge_rollout_with_stats(rollout_lists)
+        # 5. merge and re-normalise over the full combined group per prompt
+        if mixing_active:
+            all_main = [s for rl in rollout_lists for s in rl]
+            reward_broadcast = external_engines[0].reward_broadcast
+            all_samples = renormalize_groups(all_main + ext_samples,
+                                             reward_broadcast=reward_broadcast)
+            rollout_merged, stats = merge_rollout_with_stats([all_samples])
+            # per-source stats (rewards unchanged by renormalize_groups)
+            _, stats_main = merge_rollout_with_stats([all_main])
+            _, stats_ext  = merge_rollout_with_stats([ext_samples])
+            rollout_stats.accumulate(acc_main, stats_main)
+            rollout_stats.accumulate(acc_ext,  stats_ext)
+        else:
+            rollout_merged, stats = merge_rollout_with_stats(rollout_lists)
+
         rollout_stats.accumulate(acc, stats)
 
-        # 5. now add them to replay buffer
+        # 6. add to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
     if len(replay_buffer) == 0:
@@ -387,7 +496,12 @@ def collect_rollouts(dataloader,
     if acc['total_samples_generated'] == 0:
         logger.warning("No samples generated during rollout phase!")
 
-    return rollout_stats.summarize(acc, rollout_time=time.time() - rollout_start_time)
+    elapsed = time.time() - rollout_start_time
+    result = rollout_stats.summarize(acc, rollout_time=elapsed)
+    if mixing_active:
+        result["_main"] = rollout_stats.summarize(acc_main, rollout_time=elapsed)
+        result["_ext"]  = rollout_stats.summarize(acc_ext,  rollout_time=elapsed)
+    return result
 
 def weighted_sampler_by_recency(replay_buffer,
                                 recency_decay: float,

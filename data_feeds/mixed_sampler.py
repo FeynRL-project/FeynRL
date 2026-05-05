@@ -231,6 +231,7 @@ def create_prompt_dataset_and_sampler(data_paths,
                                       dynamic_ratio_every_step,
                                       steps_per_epoch,
                                       shuffle_within_batch=True,
+                                      enable_thinking=None,
                                       ):
     '''
         Creates a concat dataset and MixedDatasetSampler for rollout generation.
@@ -248,7 +249,8 @@ def create_prompt_dataset_and_sampler(data_paths,
                               solution_key=solution_key,
                               max_seq_len=max_seq_len,
                               tokenizer=tokenizer,
-                              data_path=d_path)
+                              data_path=d_path,
+                              enable_thinking=enable_thinking)
 
         all_datasets.append(dataset)
         len_datasets[dname] = len(dataset)

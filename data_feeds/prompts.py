@@ -6,12 +6,13 @@ class PromptsFeed(Dataset):
     '''
         Returns tokenized prompt ids as a list[int] which can be a variable length.
     '''
-    def __init__(self, 
+    def __init__(self,
                 prompt_key: str,
                 tokenizer,
                 max_seq_len: int,
                 data_path: str,
                 solution_key: str = None,
+                enable_thinking: bool = None,
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
         assert max_seq_len > 0, "max_seq_len must be > 0"
@@ -30,9 +31,10 @@ class PromptsFeed(Dataset):
         else:
             self.solution_key = None
 
-        self.max_seq_len = int(max_seq_len)
-        self.tokenizer   = tokenizer
-        self.data_path   = data_path
+        self.max_seq_len      = int(max_seq_len)
+        self.tokenizer        = tokenizer
+        self.data_path        = data_path
+        self.enable_thinking  = enable_thinking
         self._load_data()
 
     def _load_data(self):
@@ -69,12 +71,19 @@ class PromptsFeed(Dataset):
         if not message or (isinstance(message, list) and len(message) == 0):
             raise ValueError(f"Sample {idx}:{sample}: Prompt cannot be empty")
 
+        thinking_kwargs = (
+            {"enable_thinking": self.enable_thinking}
+            if self.enable_thinking is not None
+            else {}
+        )
+
         # Tokenize prompt for vLLM rollout
         prompt_ids = self.tokenizer.apply_chat_template(
                                         conversation=message,
                                         add_generation_prompt=True,
                                         tokenize=True,
                                         return_tensors=None,
+                                        **thinking_kwargs,
                                         )
         if not isinstance(prompt_ids, list) or len(prompt_ids) == 0:
             raise ValueError(f"Sample {idx}:{sample}: tokenization produced empty prompt_ids")
@@ -91,6 +100,7 @@ class PromptsFeed(Dataset):
                                         tokenize=False,
                                         return_tensors=None,
                                         skip_special_tokens=False,
+                                        **thinking_kwargs,
                                         )
         if self.solution_key:
             solution = sample[self.solution_key]

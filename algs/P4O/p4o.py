@@ -27,12 +27,12 @@ class P4O(COMMON):
                  deepspeed_config: Any,
                  gradient_checkpointing: bool,
                  seed: int,
+                 train_steps_per_epoch: int,
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
                  use_decoupled_loss: bool = False,
                  behave_imp_weight_cap: float = None,
-                 train_steps_per_epoch: int = 1,
                  ):
 
         self.alg_name = self.__class__.__name__

@@ -4,7 +4,6 @@ import math
 from tqdm import tqdm
 from typing import Any
 import ray
-import random
 
 # load follwoings from common.py:
 # load_single_model, init_training_engine, policy_forward,
@@ -33,6 +32,7 @@ class P4O(COMMON):
                  peft_config: Any = None,
                  use_decoupled_loss: bool = False,
                  behave_imp_weight_cap: float = None,
+                 train_steps_per_epoch: int = 1,
                  ):
 
         self.alg_name = self.__class__.__name__
@@ -69,6 +69,12 @@ class P4O(COMMON):
         # treating the entire buffer as a single batch.
         self.update_only_after_full_replay = update_after_full_replay
         self.normalize_loss = normalize_loss
+
+        # Following are used to snapshot pi_prox once per epoch on the first train_step
+        # and reuse the cached snapshot across the remaining iterations.
+        self.train_steps_per_epoch = int(train_steps_per_epoch)
+        self.cached_prox_logprobs  = None
+        self.cached_prox_nan_masks = None
 
         self.ready = False
         self.init_training_engine()
@@ -255,14 +261,10 @@ class P4O(COMMON):
 
         device = self.policy_engine.device
 
-        # Shuffle so each steps_per_epoch iteration micro_batches are processed in a
-        # different sequence to avoid systematic bias from GA boundary placement.
-        # Use a local RNG seeded deterministically so the shuffle is reproducible
-        # across runs regardless of how many times train_step has been called.
-        call_idx = getattr(self, '_train_step_calls', 0)
-        self._train_step_calls = call_idx + 1
-        local_rng = random.Random(f"{self.seed}_{engine_id}_{call_idx}")
-        local_rng.shuffle(micro_batches)
+        # Snapshot pi_prox once per epoch and pair-shuffle with micro_batches.
+        micro_batches, prox_logprobs, prox_nan_masks = self.snapshot_prox_for_epoch(micro_batches=micro_batches,
+                                                                                    engine_id=engine_id,
+                                                                                    device=device)
 
         # 1. Models to train mode
         self.policy_engine.train()
@@ -301,13 +303,6 @@ class P4O(COMMON):
 
         # Weight health check before any update and exit immediately if weights are already nan
         self.check_weights_health(engine_id, "BEFORE training step")
-
-        # Snapshot pi_prox under current policy BEFORE any optimizer step.
-        # eval() disables dropout for the snapshot and train() restores it for the inner update loop.
-        self.policy_engine.eval()
-        # [B, T-1] as policy_forward shifts internally.
-        prox_logprobs, prox_nan_masks = self.snapshot_prox_logprobs(micro_batches=micro_batches, engine_id=engine_id, device=device)
-        self.policy_engine.train()
 
         # track metrics across all micro-batches
         all_metrics = []
@@ -446,5 +441,8 @@ class P4O(COMMON):
 
         # check weights health after update to avoid nan in the next step
         self.check_weights_health(engine_id, "AFTER training step")
+
+        # Free the prox cache if we just finished the last iteration of the epoch.
+        self.release_prox_cache_if_epoch_end()
 
         return aggregated_metrics

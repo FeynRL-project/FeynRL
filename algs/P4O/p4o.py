@@ -53,7 +53,7 @@ class P4O(COMMON):
 
         # policy related parameters
         self.kl_coeff = float(kl_coeff)
-        # p3o does not use clip_low and clip_high in loss calculation
+        # p4o does not use clip_low and clip_high in loss calculation
         self.clip_low = float(clip_low)
         self.clip_high = float(clip_high)
         self.ent_coeff = float(entropy_coeff)
@@ -61,7 +61,7 @@ class P4O(COMMON):
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
 
-        # params for decoupled ppo clipped loss which is not used in p3o for now.
+        # params for decoupled ppo clipped loss which is not used in p4o for now.
         self.use_decoupled_loss = use_decoupled_loss
         self.behave_imp_weight_cap = float(behave_imp_weight_cap) if behave_imp_weight_cap is not None else None
 
@@ -126,26 +126,6 @@ class P4O(COMMON):
         ess = (sum_w**2) / (sum_w_2 + 1e-8) / total
         return float(ess)
 
-    def calculate_seq_ess(self, ratio, mask_bool):
-        '''
-            Per-sequence ESS: each sequence gets its own ESS value.
-            ratio, mask_bool: [B, T]
-            Returns: [B, 1] tensor with ESS values in (0, 1], broadcastable to [B, T].
-        '''
-        # Zero out padded positions so they don't contribute to sums.
-        # [B, T]
-        w = torch.where(mask_bool, ratio, torch.zeros_like(ratio))
-        # [B, 1]
-        n = mask_bool.sum(dim=-1, keepdim=True).to(torch.float32).clamp(min=1.0)
-        # [B, 1]
-        sum_w  = w.sum(dim=-1, keepdim=True)
-        sum_w2 = w.pow(2).sum(dim=-1, keepdim=True)
-        ess = sum_w.pow(2) / (sum_w2 + 1e-8) / n
-
-        # Sequences with no valid tokens get ESS=1.0 (no capping).
-        ess = torch.where(n > 0.5, ess, torch.ones_like(ess))
-        return ess.clamp(min=0.0, max=1.0)
-
     def compute_policy_loss(self,
                             logprobs: torch.Tensor,
                             old_logprobs: torch.Tensor,
@@ -153,17 +133,22 @@ class P4O(COMMON):
                             mask: torch.Tensor,
                             entropies: torch.Tensor,
                             ref_logprobs: torch.Tensor,
+                            prox_logprobs: torch.Tensor,
                             ):
         '''
-            logprobs: [B, T-1]
-            old_logprobs, advantages, mask: [B, T - 1]
-            entropies: [B, T-1]
-            ref_logprobs: [B, T-1]
-            Compute policy loss:
-                1. ratio = exp(logprobs - old_logprobs)
-                2. ess = ||w||^2_1 / ||w||^2_2 / n
-                3. rho = clip(ratio, 0, ess) (detached weighting factor)
-                4. loss = -(rho.detach() * logprobs * adv) * mask + (1 - ess) * kl_divergence(logprobs, old_logprobs)
+            logprobs, old_logprobs, advantages, mask: [B, T-1]
+            entropies, ref_logprobs, prox_logprobs:   [B, T-1]
+            Compute P4O policy loss:
+                1. ratio_b    = exp(logprobs - old_logprobs)        # behavioral IS ratio
+                2. ratio_prox = exp(logprobs - prox_logprobs)       # prox IS ratio
+                3. ess_b      = ||w_b||^2_1 / ||w_b||^2_2 / n       # global token-ESS over ratio_b
+                4. ess_prox   = ||w_prox||^2_1 / ||w_prox||^2_2 / n # global token-ESS over ratio_prox
+                5. rho        = min(ratio_b, ess_b, ess_prox)       # detached IS weight (three-way min)
+                6. loss = -sg(rho) * logprobs * adv * mask
+                          + (1 - ess_b)    * KL(pi || pi_b)
+                          + (1 - ess_prox) * KL(pi || pi_prox)
+                          + kl_coeff * KL(pi || pi_ref)             # optional, gated on ref_model + kl_coeff > 0
+                          - ent_coeff * H(pi)                       # optional, gated on ent_coeff > 0
             Returns:
                 loss_total_sum: scalar tensor, raw sum of masked losses (no normalization).
                 denom: local token count in this micro-batch (for metrics and fallback normalization).
@@ -182,22 +167,32 @@ class P4O(COMMON):
         denom = mask.sum().clamp(min=1.0)
 
         # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
-        raw_logratio = (logprobs - old_logprobs).to(torch.float32)
+        raw_logratio_b = (logprobs - old_logprobs).to(torch.float32)
         # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
-        logratio     = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
-        ratio        = torch.exp(logratio)
-        ess_factor   = self.calculate_ess(ratio=ratio, mask_bool=mask_bool)
+        logratio_b     = torch.where(mask_bool, raw_logratio_b, torch.zeros_like(raw_logratio_b))
+        ratio_b        = torch.exp(logratio_b)
+        ess_b          = self.calculate_ess(ratio=ratio_b, mask_bool=mask_bool)
 
         # 3. calculate the KL between policy and old model (behavioral policy) for the KL term in the loss
-        kl_dist_behavioral = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=old_logprobs)
-        kl_dist_behavioral = torch.where(mask_bool, kl_dist_behavioral, torch.zeros_like(kl_dist_behavioral))
-        kl_sum_behavioral  = (kl_dist_behavioral * mask).sum()
+        kl_dist_b = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=old_logprobs)
+        kl_dist_b = torch.where(mask_bool, kl_dist_b, torch.zeros_like(kl_dist_b))
+        kl_sum_b  = (kl_dist_b * mask).sum()
 
-        # 4. P3O loss as raw sum: rho.detach() * log(pi) * advantage
-        # Unlike PPO, P3O clips the importance ratio and uses it as a weighting
-        # coefficient for the policy's log-probability more like policy gradient.
-        rho = torch.clamp(ratio, min=0, max=ess_factor)
-        pi_sum = -(rho.detach() * logprobs * adv * mask).sum()
+        # 4. calculate ratio = pi / pi_prox = exp(logprobs - old_logprobs)
+        raw_logratio_prox = (logprobs - prox_logprobs).to(torch.float32)
+        logratio_prox     = torch.where(mask_bool, raw_logratio_prox, torch.zeros_like(raw_logratio_prox))
+        ratio_prox        = torch.exp(logratio_prox)
+        ess_prox          = self.calculate_ess(ratio=ratio_prox, mask_bool=mask_bool)
+
+        # 5. calculate the KL between policy and prox for the KL term in the loss
+        kl_dist_prox = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=prox_logprobs)
+        kl_dist_prox = torch.where(mask_bool, kl_dist_prox, torch.zeros_like(kl_dist_prox))
+        kl_sum_prox  = (kl_dist_prox * mask).sum()
+
+        # 6. P4O loss as raw sum:  min(ratio_b, min(ess_b, ess_prox)).detach() * log(pi) * advantage
+        ess_cap      = min(ess_b, ess_prox)
+        rho_min_b    = torch.clamp(ratio_b, min=0, max=ess_cap)
+        pi_sum       = -(rho_min_b.detach() * logprobs * adv * mask).sum()
 
         # 4. compute entropy loss (raw sum)
         if entropies is not None and self.ent_coeff > 0.0:
@@ -209,34 +204,40 @@ class P4O(COMMON):
             kl_dist_ref = torch.where(mask_bool, kl_dist_ref, torch.zeros_like(kl_dist_ref))
             kl_sum_ref  = (kl_dist_ref * mask).sum()
 
-        # if ess factor is 1, we don't nee much KL_old as current policy and behavioral policy
-        # are close to each other. However, if ess_facotr is clsoe to 0, we need to use KL_old
-        # to enforce the trust region as the policy has diverged a lot.
-        loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum_ref +  (1 - ess_factor) * kl_sum_behavioral
+        # When an ESS factor is ~1, the current policy is close to that anchor (behavioral
+        # or prox), so the corresponding KL pull-back is down-weighted to ~0. As an ESS
+        # factor approaches 0, the policy has diverged from that anchor and the (1 - ess)
+        # weight ramps up the KL penalty to enforce a trust region. The two terms are
+        # independent: ess_b governs the pull toward pi_old, ess_prox governs the pull
+        # toward the pre-update snapshot.
+        loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum_ref + (1 - ess_b) * kl_sum_b + (1 - ess_prox) * kl_sum_prox
 
         # 5. useful metrics. here per-token means using local denom for interpretability
         with torch.no_grad():
             # first term too large ==> policy changed too much upward
             # second term too small ==> policy changed too much downward
-            clipped_mask = (ratio > (1.0 + self.clip_high)) | (ratio < (1.0 - self.clip_low))
+            clipped_mask = (ratio_b > (1.0 + self.clip_high)) | (ratio_b < (1.0 - self.clip_low))
             # fraction of masked tokens that ratio out of ranges
             clipfrac = (clipped_mask.to(dtype=dtype) * mask).sum() / denom
 
             # approx KL (var-reduced): log(pi/pi_old) + pi_old/pi - 1
             # logratio = log(pi/pi_old)
-            ratio_inv = torch.exp(-logratio)
-            approx_kl_t = logratio + ratio_inv - 1.0
-            approx_kl = (approx_kl_t.to(dtype=dtype) * mask).sum() / denom
+            ratio_inv_b   = torch.exp(-logratio_b)
+            approx_kl_t_b = logratio_b + ratio_inv_b - 1.0
+            approx_kl_b   = (approx_kl_t_b.to(dtype=dtype) * mask).sum() / denom
 
             # save the metrics for debugging
             metrics = {'clipfrac': clipfrac.item(),
-                       'approx_kl': approx_kl.item(),
+                       'approx_kl_b': approx_kl_b.item(),
                        'ent_loss': (ent_sum / denom).item(),
                        'pi_loss': (pi_sum / denom).item(),
                        'loss_total': (loss_total_sum / denom).item(),
                        'kl_ref': (kl_sum_ref / denom).item(),
-                       'kl_behavioral': (kl_sum_behavioral / denom).item(),
-                       'ess_factor': ess_factor,
+                       'kl_b': (kl_sum_b / denom).item(),
+                       'kl_prox':  (kl_sum_prox / denom).item(),
+                       'ess_b': ess_b,
+                       'ess_prox': ess_prox,
+                       'ess_cap': ess_cap,
                        }
 
         return loss_total_sum, denom, metrics
@@ -272,7 +273,7 @@ class P4O(COMMON):
         # 3. create progress bar
         num_micro = len(micro_batches)
 
-        # torch.distributed.get_rank() would be the same thing as engine_idå
+        # torch.distributed.get_rank() would be the same thing as engine_id
         if engine_id == 0:
             progress_bar = tqdm(micro_batches, total=num_micro, desc="[Alg:{}] Training Step in rank {}".format(self.alg_name, engine_id))
 
@@ -300,6 +301,13 @@ class P4O(COMMON):
 
         # Weight health check before any update and exit immediately if weights are already nan
         self.check_weights_health(engine_id, "BEFORE training step")
+
+        # Snapshot pi_prox under current policy BEFORE any optimizer step.
+        # eval() disables dropout for the snapshot and train() restores it for the inner update loop.
+        self.policy_engine.eval()
+        # [B, T-1] as policy_forward shifts internally.
+        prox_logprobs, prox_nan_masks = self.snapshot_prox_logprobs(micro_batches=micro_batches, engine_id=engine_id, device=device)
+        self.policy_engine.train()
 
         # track metrics across all micro-batches
         all_metrics = []
@@ -353,21 +361,34 @@ class P4O(COMMON):
                 ref_logprobs, ref_nan = self.sanitize_logprobs(logprobs=ref_logprobs, engine_id=engine_id, step=step, num_micro=num_micro)
                 mask = mask * (~ref_nan).to(mask.dtype)
 
+            # apply masking to the prox logprobs
+            prox_nan_mask = prox_nan_masks[step]
+            mask          = mask * (~prox_nan_mask).to(mask.dtype)
+            prox_lp_step  = prox_logprobs[step]
+
+
             # Compute policy loss using the current policy.
             loss_total_sum, local_denom, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
                                                                                old_logprobs=old_logprobs,
                                                                                advantages=advs,
                                                                                mask=mask,
                                                                                entropies=pi_entropies,
-                                                                               ref_logprobs=ref_logprobs)
+                                                                               ref_logprobs=ref_logprobs,
+                                                                               prox_logprobs=prox_lp_step,
+                                                                               )
 
             # store metrics
             all_metrics.append(pi_metrics)
             if engine_id == 0:
                 progress_bar.set_postfix({"pi_loss": f"{pi_metrics['pi_loss']:.4f}",
                                           "clipfrac": f"{pi_metrics['clipfrac']:.3f}",
-                                          "approx_kl": f"{pi_metrics['approx_kl']:.4f}",
-                                          "kl_ref": f"{pi_metrics['kl_ref']:.4f}"
+                                          "approx_kl_b": f"{pi_metrics['approx_kl_b']:.4f}",
+                                          "kl_ref": f"{pi_metrics['kl_ref']:.4f}",
+                                          "kl_b": f"{pi_metrics['kl_b']:.4f}",
+                                          "kl_prox": f"{pi_metrics['kl_prox']:.4f}",
+                                          "ess_b": f"{pi_metrics['ess_b']:.4f}",
+                                          "ess_prox": f"{pi_metrics['ess_prox']:.4f}",
+                                          "ess_cap": f"{pi_metrics['ess_cap']:.4f}",
                                           })
 
             # Scale loss for backward pass.

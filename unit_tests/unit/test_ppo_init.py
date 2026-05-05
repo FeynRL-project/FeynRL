@@ -43,6 +43,7 @@ def test_ppo_init_and_engine():
             deepspeed_config=deepspeed_config,
             gradient_checkpointing=False,
             seed=42,
+            train_steps_per_epoch=1,
             value_model_path="mock/value",
             tau=0.95,
             gamma=0.99
@@ -72,7 +73,7 @@ def test_ppo_init_and_engine():
         # Mock forward/loss methods called inside train_step
         ppo.policy_forward = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1, 3), torch.zeros(1, 3)))
         ppo.value_forward = MagicMock(return_value=(torch.zeros(1, 3), torch.zeros(1)))
-        ppo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(1.0), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_loss': 0.0, 'pi_loss': 1.0, 'loss_total': 1.0}))
+        ppo.compute_policy_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(1.0), {'clipfrac': 0.1, 'approx_kl': 0.01, 'kl_ref': 0.0, 'ent_mc': 0.0, 'pi_loss': 1.0, 'loss_total': 1.0}))
         ppo.compute_value_loss = MagicMock(return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(1.0), {'loss_v': 1.0}))
         
         # Setup engine mocks

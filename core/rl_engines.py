@@ -19,6 +19,7 @@ Algorithm_Registry = {# supported algorithms
                       'cispo': ('algs.CISPO.cispo', 'CISPO'),
                       'p3o':   ('algs.P3O.p3o', 'P3O'),
                       'ppo':   ('algs.PPO.ppo', 'PPO'),
+                      'p4o':   ('algs.P4O.p4o', 'P4O'),
                      }
 
 def create_training_engines(params, alg, world_size, master_addr, master_port):
@@ -55,6 +56,8 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                # decoupled loss when async overlap engine is used
                'use_decoupled_loss': params.overlap.enabled if params.overlap else False,
                'behave_imp_weight_cap': params.overlap.behave_imp_weight_cap if params.overlap else None,
+
+               'train_steps_per_epoch': params.train.train_steps_per_epoch,
     }
 
     # ppo arguments
@@ -64,6 +67,7 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
         kwargs['tau'] = params.train.tau
         kwargs['gamma'] = params.train.gamma
         kwargs['deepspeed_value_config'] = params.deepspeed_value
+
     # setup ray runners
     ray_runners = []
     cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())

@@ -43,6 +43,7 @@ def test_ppo_init_and_engine():
             deepspeed_config=deepspeed_config,
             gradient_checkpointing=False,
             seed=42,
+            train_steps_per_epoch=1,
             value_model_path="mock/value",
             tau=0.95,
             gamma=0.99

@@ -39,6 +39,7 @@ def test_cispo_init_and_engine():
             deepspeed_config=deepspeed_config,
             gradient_checkpointing=False,
             seed=42,
+            train_steps_per_epoch=1,
         )
         
         assert cispo.ready is True

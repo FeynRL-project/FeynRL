@@ -144,109 +144,131 @@ class P4O(COMMON):
         '''
             logprobs, old_logprobs, advantages, mask: [B, T-1]
             entropies, ref_logprobs, prox_logprobs:   [B, T-1]
-            Compute P4O policy loss:
-                1. ratio_b    = exp(logprobs - old_logprobs)        # behavioral IS ratio
-                2. ratio_prox = exp(logprobs - prox_logprobs)       # prox IS ratio
-                3. ess_b      = ||w_b||^2_1 / ||w_b||^2_2 / n       # global token-ESS over ratio_b
-                4. ess_prox   = ||w_prox||^2_1 / ||w_prox||^2_2 / n # global token-ESS over ratio_prox
-                5. rho        = min(ratio_b, ess_b, ess_prox)       # detached IS weight (three-way min)
-                6. loss = -sg(rho) * logprobs * adv * mask
-                          + (1 - ess_b)    * KL(pi || pi_b)
-                          + (1 - ess_prox) * KL(pi || pi_prox)
-                          + kl_coeff * KL(pi || pi_ref)             # optional, gated on ref_model + kl_coeff > 0
-                          - ent_coeff * H(pi)                       # optional, gated on ent_coeff > 0
-            Returns:
-                loss_total_sum: scalar tensor, raw sum of masked losses (no normalization).
-                denom: local token count in this micro-batch (for metrics and fallback normalization).
-                metrics: dict, per-token mean metrics using local denom for interpretability.
+            P4O loss with adaptive mixture trust region:
+                ratio_b   = exp(logprobs - old_logprobs)
+                ess_b, ess_prox = global token-ESS over ratio_b, ratio_prox
+                ess_mix   = min(ess_b, ess_prox)
+                rho       = min(ratio_b, ess_mix)
+                pi_mix    = (w_b * pi_b + w_prox * pi_prox) / (w_b + w_prox)
+                            # adaptive blend with w_b = (1 - ess_b), w_prox = (1 - ess_prox)
+                loss = -sg(rho) * logprobs * adv * mask
+                     + (1 - ess_mix) * KL(pi || pi_mix)                    # gated on (1 - ess_mix) > 1e-6
+                     + kl_coeff * KL(pi || pi_ref)                         # optional
+                     - ent_coeff * H(pi)                                   # optional
+            Returns (loss_total_sum, denom, metrics).
         '''
         device = logprobs.device
-        dtype = logprobs.dtype
-        ent_sum = torch.tensor(0.0, device=device, dtype=dtype)
-        kl_sum_ref  = torch.tensor(0.0, device=device, dtype=dtype)
+        dtype  = logprobs.dtype
+        ent_sum    = torch.tensor(0.0, device=device, dtype=dtype)
+        kl_sum_ref = torch.tensor(0.0, device=device, dtype=dtype)
 
-        # 1. make sure advantages are detached and
-        # convert to float32 for stability under bf16/fp16
+        # advantages detached + fp32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
         mask_bool = (mask.to(device=device) > 0.5)
-        mask = mask_bool.to(dtype=dtype)
+        mask  = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
-        # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
+        # Behavioral ratio + ESS. Zero out pads before exp to avoid inf*0 -> nan.
         raw_logratio_b = (logprobs - old_logprobs).to(torch.float32)
-        # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
         logratio_b     = torch.where(mask_bool, raw_logratio_b, torch.zeros_like(raw_logratio_b))
         ratio_b        = torch.exp(logratio_b)
         ess_b          = self.calculate_ess(ratio=ratio_b, mask_bool=mask_bool)
 
-        # 3. calculate the KL between policy and old model (behavioral policy) for the KL term in the loss
-        kl_dist_b = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=old_logprobs)
-        kl_dist_b = torch.where(mask_bool, kl_dist_b, torch.zeros_like(kl_dist_b))
-        kl_sum_b  = (kl_dist_b * mask).sum()
-
-        # 4. calculate ratio = pi / pi_prox = exp(logprobs - old_logprobs)
+        # Proximal ratio + ESS
         raw_logratio_prox = (logprobs - prox_logprobs).to(torch.float32)
         logratio_prox     = torch.where(mask_bool, raw_logratio_prox, torch.zeros_like(raw_logratio_prox))
         ratio_prox        = torch.exp(logratio_prox)
         ess_prox          = self.calculate_ess(ratio=ratio_prox, mask_bool=mask_bool)
 
-        # 5. calculate the KL between policy and prox for the KL term in the loss
-        kl_dist_prox = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=prox_logprobs)
-        kl_dist_prox = torch.where(mask_bool, kl_dist_prox, torch.zeros_like(kl_dist_prox))
-        kl_sum_prox  = (kl_dist_prox * mask).sum()
+        # Behavioral and proximal KL, only for diagnostic purposes.
+        with torch.no_grad():
+            kl_dist_b = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=old_logprobs)
+            kl_dist_b = torch.where(mask_bool, kl_dist_b, torch.zeros_like(kl_dist_b))
+            kl_sum_b  = (kl_dist_b * mask).sum()
 
-        # 6. P4O loss as raw sum:  min(ratio_b, min(ess_b, ess_prox)).detach() * log(pi) * advantage
-        ess_cap      = min(ess_b, ess_prox)
-        rho_min_b    = torch.clamp(ratio_b, min=0, max=ess_cap)
-        pi_sum       = -(rho_min_b.detach() * logprobs * adv * mask).sum()
+            kl_dist_prox = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=prox_logprobs)
+            kl_dist_prox = torch.where(mask_bool, kl_dist_prox, torch.zeros_like(kl_dist_prox))
+            kl_sum_prox  = (kl_dist_prox * mask).sum()
 
-        # 4. compute entropy loss (raw sum)
+        # clip based on ess
+        ess_mix   = min(ess_b, ess_prox)
+        rho_min_b = torch.clamp(ratio_b, min=0, max=ess_mix)
+        pi_sum    = -(rho_min_b.detach() * logprobs * adv * mask).sum()
+
+        # Calculate adaptive mixture trust region.
+        # max(0, ...) guards against fp noise from the ess all-reduce pushing
+        # ess slightly above 1.0. We take log(w + eps_log) below so a negative
+        # weight would error out.
+        w_b      = max(0.0, 1.0 - ess_b)
+        w_prox   = max(0.0, 1.0 - ess_prox)
+        w_total  = w_b + w_prox
+
+        # Skip the entire graph when both anchors are essentially fresh since
+        # the contribution would be negligible and backward would walk it just to multiply by ~0.
+        eps_gate = 1e-6
+        if (1.0 - ess_mix) > eps_gate:
+            # eps_log avoids log(0) when one weight is exactly 0; the live anchor
+            # dominates the logsumexp and log_mix collapses to that anchor's logprob.
+            eps_log = 1e-30
+            log_mix = torch.logsumexp(torch.stack([math.log(w_b    + eps_log) + old_logprobs.to(torch.float32),
+                                                   math.log(w_prox + eps_log) + prox_logprobs.to(torch.float32),
+                                                  ], dim=0), dim=0,) - math.log(w_total)
+
+            kl_dist_mix = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=log_mix)
+            kl_dist_mix = torch.where(mask_bool, kl_dist_mix, torch.zeros_like(kl_dist_mix))
+            kl_sum_mix  = (kl_dist_mix * mask).sum()
+            kl_mix_loss = (1.0 - ess_mix) * kl_sum_mix
+
+        else:
+            kl_sum_mix  = torch.tensor(0.0, device=device, dtype=dtype)
+            kl_mix_loss = torch.tensor(0.0, device=device, dtype=dtype)
+
         if entropies is not None and self.ent_coeff > 0.0:
             ent_sum = (entropies * mask).sum()
 
         if ref_logprobs is not None and self.kl_coeff > 0.0:
             kl_dist_ref = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=ref_logprobs)
-            # avoid calculating kl for padded tokens.
             kl_dist_ref = torch.where(mask_bool, kl_dist_ref, torch.zeros_like(kl_dist_ref))
             kl_sum_ref  = (kl_dist_ref * mask).sum()
 
-        # When an ESS factor is ~1, the current policy is close to that anchor (behavioral
-        # or prox), so the corresponding KL pull-back is down-weighted to ~0. As an ESS
-        # factor approaches 0, the policy has diverged from that anchor and the (1 - ess)
-        # weight ramps up the KL penalty to enforce a trust region. The two terms are
-        # independent: ess_b governs the pull toward pi_old, ess_prox governs the pull
-        # toward the pre-update snapshot.
-        loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum_ref + (1 - ess_b) * kl_sum_b + (1 - ess_prox) * kl_sum_prox
+        loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum_ref + kl_mix_loss
 
-        # 5. useful metrics. here per-token means using local denom for interpretability
+        # Per-token means use local denom for interpretability.
         with torch.no_grad():
-            # first term too large ==> policy changed too much upward
-            # second term too small ==> policy changed too much downward
             clipped_mask = (ratio_b > (1.0 + self.clip_high)) | (ratio_b < (1.0 - self.clip_low))
-            # fraction of masked tokens that ratio out of ranges
             clipfrac = (clipped_mask.to(dtype=dtype) * mask).sum() / denom
 
-            # approx KL (var-reduced): log(pi/pi_old) + pi_old/pi - 1
-            # logratio = log(pi/pi_old)
+            # var-reduced approx KL: log(pi/pi_old) + pi_old/pi - 1
             ratio_inv_b   = torch.exp(-logratio_b)
             approx_kl_t_b = logratio_b + ratio_inv_b - 1.0
             approx_kl_b   = (approx_kl_t_b.to(dtype=dtype) * mask).sum() / denom
 
-            # mc entropy proxy at the realized token: -log pi(a|s)
+            # MC entropy proxy at the realized token: -log pi(a|s)
             ent_mc = -(logprobs * mask).sum() / denom
 
-            # save the metrics for debugging
-            metrics = {'clipfrac': clipfrac.item(),
+            # Both 0 signals "trust region inactive this step".
+            if w_total > 0.0:
+                mix_w_b_norm    = w_b    / w_total
+                mix_w_prox_norm = w_prox / w_total
+
+            else:
+                mix_w_b_norm    = 0.0
+                mix_w_prox_norm = 0.0
+
+            metrics = {'clipfrac':    clipfrac.item(),
                        'approx_kl_b': approx_kl_b.item(),
-                       'ent_mc': ent_mc.item(),
-                       'pi_loss': (pi_sum / denom).item(),
-                       'loss_total': (loss_total_sum / denom).item(),
-                       'kl_ref': (kl_sum_ref / denom).item(),
-                       'kl_b': (kl_sum_b / denom).item(),
-                       'kl_prox':  (kl_sum_prox / denom).item(),
-                       'ess_b': ess_b,
-                       'ess_prox': ess_prox,
-                       'ess_cap': ess_cap,
+                       'ent_mc':      ent_mc.item(),
+                       'pi_loss':     (pi_sum / denom).item(),
+                       'loss_total':  (loss_total_sum / denom).item(),
+                       'kl_ref':      (kl_sum_ref / denom).item(),
+                       'kl_b':        (kl_sum_b / denom).item(),
+                       'kl_prox':     (kl_sum_prox / denom).item(),
+                       'kl_mix':      (kl_sum_mix / denom).item(),
+                       'ess_b':       ess_b,
+                       'ess_prox':    ess_prox,
+                       'ess_mix':     ess_mix,
+                       'mix_w_b':     mix_w_b_norm,
+                       'mix_w_prox':  mix_w_prox_norm,
                        }
 
         return loss_total_sum, denom, metrics
@@ -384,9 +406,10 @@ class P4O(COMMON):
                                           "kl_ref": f"{pi_metrics['kl_ref']:.4f}",
                                           "kl_b": f"{pi_metrics['kl_b']:.4f}",
                                           "kl_prox": f"{pi_metrics['kl_prox']:.4f}",
+                                          "kl_mix": f"{pi_metrics['kl_mix']:.4f}",
                                           "ess_b": f"{pi_metrics['ess_b']:.4f}",
                                           "ess_prox": f"{pi_metrics['ess_prox']:.4f}",
-                                          "ess_cap": f"{pi_metrics['ess_cap']:.4f}",
+                                          "ess_mix": f"{pi_metrics['ess_mix']:.4f}",
                                           })
 
             # Scale loss for backward pass.

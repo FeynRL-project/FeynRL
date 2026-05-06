@@ -148,6 +148,91 @@ python main_rl.py --config_file ./configs/rl_args.yaml --experiment_id exp4
 
 ---
 
+## Running with Docker
+
+Two Dockerfiles live under `docker/`:
+
+| Path                        | Image tag         | FlashAttention       | Target GPUs                   |
+| --------------------------- | ----------------- | -------------------- | ----------------------------- |
+| `docker/default/Dockerfile` | `feynrl:default` | `flash-attn==2.8.3` | Ampere / Ada (A100, L40S, …)  |
+| `docker/hopper/Dockerfile`  | `feynrl:hopper`  | `flash-attn-4`      | Hopper / Blackwell (H100, B200) — experimental |
+
+> The `hopper` image has not yet been validated against FeynRL's SFT/RL smoke
+> tests; use `default` until that validation lands.
+
+### Build
+
+From the repo root:
+
+```bash
+# Ampere / Ada
+docker build -f docker/default/Dockerfile -t feynrl:default .
+
+# Hopper / Blackwell (experimental)
+docker build -f docker/hopper/Dockerfile  -t feynrl:hopper  .
+```
+
+### SFT with Docker
+
+```bash
+docker run --gpus all --ipc=host --net=host \
+  -v /path/to/hf_cache:/root/.cache/huggingface \
+  -w /FeynRL \
+  feynrl:default \
+  torchrun --nproc_per_node=4 main_sl.py \
+    --config_file ./configs/sl_args.yaml \
+    --experiment_id myexp1
+```
+
+### RL with Docker
+
+```bash
+docker run --gpus all --ipc=host --net=host \
+  -v /path/to/hf_cache:/root/.cache/huggingface \
+  -w /FeynRL \
+  feynrl:default \
+  python main_rl.py \
+    --config_file ./configs/rl_args.yaml \
+    --experiment_id exp3
+```
+
+**Notes**
+
+* `--gpus all` exposes all GPUs. Use `--gpus '"device=0,1,2,3"'` to select specific GPUs.
+* `--ipc=host` is required for PyTorch shared memory.
+* Mount your HuggingFace cache to avoid re-downloading models.
+* Mount a volume for checkpoints if you want to persist them: `-v /path/to/ckps:/FeynRL/ckps`
+
+### Slurm (enroot + pyxis)
+
+**Assumptions.** The example below targets a Slurm cluster with
+[enroot](https://github.com/NVIDIA/enroot) and the
+[pyxis](https://github.com/NVIDIA/pyxis) SPANK plugin installed, and worker
+nodes that expose GPUs to containers (NVIDIA Container Toolkit or equivalent).
+On sites without pyxis, fall back to a plain `enroot start …` wrapped in
+`srun`; the image conversion step is the same.
+
+Convert the image to an enroot squashfs once per cluster:
+
+```bash
+# From a host that can see both your Docker daemon and the shared fs
+enroot import -o /path/to/shared/feynrl-default.sqsh dockerd://feynrl:default
+```
+
+Then reference it from `srun`/`sbatch`:
+
+```bash
+srun --container-image=/path/to/shared/feynrl-default.sqsh \
+     --container-mounts=$HOME/.cache/huggingface:/root/.cache/huggingface,$PWD:/FeynRL \
+     --container-workdir=/FeynRL \
+     --gpus-per-node=8 \
+     python main_rl.py --config_file ./configs/rl_args.yaml --experiment_id exp3
+```
+
+Adjust partition, account, node count, and mounts for your site.
+
+---
+
 ## Troubleshooting
 
 For troubleshooting common issues related to DeepSpeed, Ray, multi-node scaling, and training stability, please refer to the [Troubleshooting Guide](../docs/TROUBLESHOOTING.md).

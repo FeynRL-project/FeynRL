@@ -126,3 +126,10 @@ wandb/
 configs/murdock_configs/
 scripts/
 .clean_git.sh
+
+# Data files
+*.parquet
+
+# Checkpoints & experiment artifacts
+ckps/
+mlruns/

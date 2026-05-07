@@ -27,26 +27,18 @@ FeynRL supports three methods for syncing weights from the training engine to th
 2. **Direct Sync**: Weights are gathered from training engines via DeepSpeed's ZeRO gather and pushed to rollout workers through Ray's shared-memory object store. No disk I/O, but involves serialization.
 3. **Disk Sync**: Weights are saved as a checkpoint to disk, and rollout workers reload from the saved path. Slowest, but the most robust.
 
-In **sync mode** (`run_rl_sync.py`), all three methods are available and FeynRL automatically falls back from NCCL to direct to disk if a sync fails. In **overlap mode** (`run_rl_async.py`), the config validator forces `weight_sync_method: nccl` and there is **no runtime fallback chain** — async mode pairs NCCL with a watchdog (`TORCH_NCCL_ASYNC_ERROR_HANDLING=1`) that aborts wedged collectives so the job fails fast with a clear error rather than silently retrying on a destroyed communicator. (`direct` is still used by `load_checkpoint_for_resume` exactly once, before the NCCL group has been initialized.)
+In **sync mode** (`run_rl_sync.py`), `weight_sync_method` must be `"direct"` or `"disk"` — the config validator at [`configs/load.py:684-686`](../configs/load.py#L684-L686) rejects `"nccl"` in sync mode because the non-async vLLM engine has no NCCL weight-sync path. If `"direct"` fails mid-run, FeynRL falls back to a `"disk"` save + rollout reload so the rollout engines always receive updated weights. In **overlap mode** (`run_rl_async.py`), the config validator forces `weight_sync_method: nccl` and there is **no runtime fallback chain** — async mode pairs NCCL with a watchdog (`TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `NCCL_TIMEOUT=1800`, set by [`misc/nccl_env.py`](../misc/nccl_env.py)) that aborts wedged collectives so the job fails fast with a clear error rather than silently retrying on a destroyed communicator. (`direct` is still used by `load_checkpoint_for_resume` exactly once, before the NCCL group has been initialized.)
 
 ### 🔁 Training↔Rollout Scheduling
 FeynRL supports two execution modes, dispatched from `main_rl.py` based on `config.overlap.enabled`:
 
-1. **Synchronous** (`run_rl_sync.py`): Each epoch generates all rollouts (blocking), trains on them, syncs weights, and repeats. Fully on-policy, simple to debug, and the right choice when data freshness matters more than throughput. Sync mode supports the full NCCL→direct→disk fallback chain for weight sync.
+1. **Synchronous** (`run_rl_sync.py`): Each epoch generates all rollouts (blocking), trains on them, syncs weights, and repeats. Fully on-policy, simple to debug, and the right choice when data freshness matters more than throughput. Sync mode supports the `direct` → `disk` fallback chain for weight sync (the validator forbids `nccl` in sync mode; see [`configs/load.py:684-686`](../configs/load.py#L684-L686)).
 
-2. **Overlap / async** (`run_rl_async.py`): Generation and training run concurrently on separate GPU pools within the same epoch. This mode significantly reduces GPU idle time. It works as follows:
-
-   - **Queue-pull architecture**: At the start of each epoch the driver fills a shared Ray `prompt_queue` with all sharded prompt batches plus one POISON_PILL sentinel per rollout engine. Each rollout engine runs a long-lived `run_pull_loop` that pulls shards from the queue and pushes results to a bounded `results_queue`. There is no central dispatcher as engines self-schedule, so a fast engine naturally processes more shards than a slow one. The driver drains `results_queue` between training steps and rebuilds DeepSpeed shards from the replay buffer as new samples arrive.
-   - **Pipelined generation**: Inside `run_pull_loop`, one shard is always in flight on vLLM via `submit_generation`/`complete_generation`, so new prompts join the running continuous batch before the previous shard's tail finishes. This eliminates the shard-boundary throughput gap.
-   - **Mid-epoch weight sync**: Triggered either by ESS (Effective Sample Size, for P3O) when it drops below `ess_sync_threshold`, or by a fixed step interval (`fixed_sync_interval`, required for PPO/GRPO/CISPO since they don't expose ESS). When triggered, `perform_inline_sync` drains the prompt queue, pushes poison pills, waits for in-flight `generate()` calls to finish, runs the three-phase NCCL sync (gather → broadcast → finalize, with sender- and receiver-side NaN/Inf checks and partial-load detection), then requeues leftover shards and relaunches the pull loops with the new policy version.
-   - **Staleness control**: A configurable `max_lag` bounds how many policy versions the rollout data can lag behind. End-of-epoch sync fires when `lag ≥ max_lag`; otherwise it is skipped. The replay buffer evicts samples older than `policy_version - max_lag` at the end of each epoch, retaining recent samples across epochs and eliminating the cold-start bubble.
-   - **Pre-launched next epoch**: After end-of-epoch sync but before `save_checkpoint`, the driver pre-launches the next epoch's queues and pull loops so rollout engines generate the next epoch's data while the driver writes the checkpoint to disk, hiding the 5-60s save bubble.
-   - **NCCL-only at runtime**: Async mode forces `weight_sync_method: nccl` via the config validator. There is no runtime fallback to direct/disk. Instead, FeynRL pairs NCCL with the watchdog (`TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `NCCL_TIMEOUT=1800`) and pattern-matches fatal NCCL errors (communicator destruction, Ray timeout, actor death) to fail fast rather than retry on a broken communicator.
-   - **Hang resistance**: Two-stage health check (`ping` runs in a separate Ray concurrency group to bypass the mailbox FIFO; `ping_mailbox` runs in the default group to detect wedged actors); explicit POISON_PILL sentinels at the queue tail eliminate polling timeouts; bounded `results_queue` provides natural back-pressure; every distributed wait is bounded by `init_timeout`, `train_step_timeout`, `sync_timeout`, or `rollout_timeout`.
+2. **Overlap / async** (`run_rl_async.py`): Generation and training run concurrently on separate GPU pools, so neither waits for the other to finish. Rollout engines stream samples into a bounded replay buffer while training consumes from it; weights are synced once per epoch via NCCL. This significantly reduces GPU idle time when generation is the bottleneck. Off-policy drift is bounded by `overlap.max_lag` (max policy-version distance between the buffer's oldest and newest samples). Async mode requires `weight_sync_method: nccl` and pairs it with an NCCL watchdog so wedged collectives fail fast instead of hanging. Our async engine design is inspired by PipelineRL [[1]](#references), but FeynRL diverges in two significant ways: it keeps a bounded replay buffer with version-based eviction whereas PipelineRL is purely streaming with no replay; and it syncs once per epoch whereas PipelineRL applies weight updates mid-sequence. PipelineRL stays as on-policy as possible; FeynRL deliberately works with older, off-policy data because controlled off-policy reuse can be a valuable training signal in itself.
 
    **When to use each mode:**
    - Use **overlap (async) mode** when generation is the bottleneck (large models, long sequences) and you want to fill training GPU idle time with useful work.
-   - Use **sync mode** when you need strict on-policy data, are debugging, when training and generation take roughly the same time, or when you want the NCCL→direct→disk fallback chain.
+   - Use **sync mode** when you need strict on-policy data, are debugging, when training and generation take roughly the same time, or when you want the `direct` → `disk` weight-sync fallback chain (sync-only).
 
 ## 🧩 Modularity & Extensibility
 
@@ -58,22 +50,31 @@ FeynRL supports two execution modes, dispatched from `main_rl.py` based on `conf
 
 ```text
 FeynRL/
-├── algs/               # Implementation of various algorithms such as PPO, GRPO, CISPO, DPO, SFT
+├── algs/               # Implementation of various algorithms such as PPO, GRPO, CISPO, P3O, DPO, SFT
 ├── configs/            # YAML configuration files and Pydantic schema validation
+├── core/               # RL training/rollout engine primitives (NCCL gather/broadcast, dataloaders)
 ├── data_feeds/         # Data loading, mixed-dataset sampling, and dataset construction
 ├── data_prep/          # Scripts for processing raw datasets
 ├── docs/               # Documentation files (Installation, FAQ, Architecture, Troubleshooting)
-├── experiments/        # Experiment configurations and documentation
-├── misc/               # Utility modules (logging, trackers, helpers)
+├── examples/           # End-to-end recipes for different tasks with full results
+├── misc/               # Utility modules (logging, trackers, NCCL helpers)
 ├── rewards/            # Reward functions for RL training
-├── rollouts/           # vLLM-powered rollout engine and weight synchronization
-├── main_rl.py          # Entry point for Reinforcement Learning training
+├── rollouts/           # vLLM-powered rollout engine, replay buffer, and weight synchronization
+├── unit_tests/         # Unit and integration tests
+├── main_rl.py          # Entry point for RL (dispatches to run_rl_sync or run_rl_async)
 ├── main_sl.py          # Entry point for Supervised Fine-Tuning (SFT)
 ├── main_cl.py          # Entry point for Preference Learning (e.g., DPO)
 ├── main_eval.py        # Entry point for standalone model evaluation
+├── run_rl_sync.py      # Sync training↔rollout loop
+├── run_rl_async.py     # Overlap (async) training↔rollout loop
 ├── requirements.txt    # Project dependencies
+├── pyproject.toml      # Project metadata and build config
 ├── CONTRIBUTING.md     # Contribution guidelines
 ├── LICENSE             # Project license
 ├── .gitignore          # Git ignore rules
 └── README.md           # Main project landing page
 ```
+
+## References
+
+[1] A. Piché, E. Kamalloo, R. Pardinas, X. Chen, and D. Bahdanau. *PipelineRL: Faster On-policy Reinforcement Learning for Long Sequence Generation.* arXiv:2509.19128, 2025. [https://arxiv.org/abs/2509.19128](https://arxiv.org/abs/2509.19128). Code: [https://github.com/ServiceNow/PipelineRL](https://github.com/ServiceNow/PipelineRL).

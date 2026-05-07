@@ -30,6 +30,7 @@ class PPO(COMMON):
                  deepspeed_config: Any,
                  gradient_checkpointing: bool,
                  seed: int,
+                 train_steps_per_epoch: int,
                  ref_model_path: str = None,
                  deepspeed_ref_config: Any = None,
                  peft_config: Any = None,
@@ -38,7 +39,6 @@ class PPO(COMMON):
                  tau: float = None,
                  gamma: float = None,
                  deepspeed_value_config: Any = None,
-                 alpha: float = None,
                  use_decoupled_loss: bool = False,
                  behave_imp_weight_cap: float = None,
                  ):
@@ -76,13 +76,18 @@ class PPO(COMMON):
 
         # params for decoupled ppo
         self.use_decoupled_loss = use_decoupled_loss
-        self.alpha = float(alpha) if alpha is not None else None
         self.behave_imp_weight_cap = float(behave_imp_weight_cap) if behave_imp_weight_cap is not None else None
 
         # if true, it means the update is done after seeing all samples in the reply buffer
         # treating the entire buffer as a single batch.
         self.update_only_after_full_replay = update_after_full_replay
         self.normalize_loss = normalize_loss
+
+        # Following are used to snapshot pi_prox once per epoch on the first train_step
+        # and reuse the cached snapshot across the remaining iterations.
+        self.train_steps_per_epoch  = int(train_steps_per_epoch)
+        self.cached_prox_logprobs   = None
+        self.cached_prox_nan_masks  = None
 
         self.ready = False
         self.init_training_engine()
@@ -226,19 +231,21 @@ class PPO(COMMON):
                             mask: torch.Tensor,
                             entropies: torch.Tensor,
                             ref_logprobs: torch.Tensor,
+                            prox_logprobs: torch.Tensor = None,
                             ):
         '''
             logprobs: [B, T-1]
             old_logprobs, advantages, mask: [B, T - 1]
             entropies: [B, T-1]
             ref_logprobs: [B, T-1]
+            prox_logprobs: [B, T-1]
             Compute policy loss:
                 1. ratio = exp(logprobs - old_logprobs)
                 2. loss = -(min(ratio * adv, clip_adv * adv)) * mask
             Returns:
-                loss_total_sum: scalar tensor — raw sum of masked losses (no normalization).
-                denom: float — local token count in this micro-batch.
-                metrics: dict — per-token mean metrics using local denom for interpretability.
+                loss_total_sum: scalar tensor, raw sum of masked losses (no normalization).
+                denom: local token count in this micro-batch (for metrics and fallback normalization).
+                metrics: dict, per-token mean metrics using local denom for interpretability.
         '''
         device = logprobs.device
         dtype = logprobs.dtype
@@ -258,16 +265,13 @@ class PPO(COMMON):
             # 2. Decoupled policy loss (https://arxiv.org/abs/2110.00641)
             # loss = - E[ (pi_prox/pi_behav) * min(r_prox * A, clip(r_prox) * A)]
             # where r_prox = pi / pi_prox
-            # log pi_prox = alpha * log pi_theta + (1-alpha) * log pi_behav
-            logp_prox = self.alpha * logprobs.detach() + (1 - self.alpha) * old_logprobs
-
-            # r_prox = pi / pi_prox
-            raw_logratio_prox = (logprobs - logp_prox).to(torch.float32)
+            # pr_prox = pi / pi_prox
+            raw_logratio_prox = (logprobs - prox_logprobs).to(torch.float32)
             logratio_prox     = torch.where(mask_bool, raw_logratio_prox, torch.zeros_like(raw_logratio_prox))
             r_prox            = torch.exp(logratio_prox)
 
-            # Behavioral is weight: w = pi_prox / pi_behav
-            raw_log_w = (logp_prox - old_logprobs).to(torch.float32)
+            # Behavioral ratio: w = pi_prox / pi_behav
+            raw_log_w = (prox_logprobs - old_logprobs).to(torch.float32)
             log_w     = torch.where(mask_bool, raw_log_w, torch.zeros_like(raw_log_w))
             behave_w  = torch.exp(log_w)
             if self.behave_imp_weight_cap is not None:
@@ -319,10 +323,13 @@ class PPO(COMMON):
             approx_kl_t = logratio + ratio_inv - 1.0
             approx_kl = (approx_kl_t.to(dtype=dtype) * mask).sum() / denom
 
+            # mc entropy proxy at the realized token: -log pi(a|s).
+            ent_mc = -(logprobs * mask).sum() / denom
+
             # save the metrics for debugging
             metrics = {'clipfrac': clipfrac.item(),
                        'approx_kl': approx_kl.item(),
-                       'ent_loss': (ent_sum / denom).item(),
+                       'ent_mc': ent_mc.item(),
                        'pi_loss': (pi_sum / denom).item(),
                        'loss_total': (loss_total_sum / denom).item(),
                        'kl_ref': (kl_sum / denom).item(),}
@@ -509,19 +516,39 @@ class PPO(COMMON):
         self.policy_engine.zero_grad()
         self.value_engine.zero_grad()
 
-        # 4. Zip micro_batches with precomputed_gae so they stay aligned
-        # like same iteration order, same length.
+        # 4. Build a paired list (micro_batch, gae, prox_lp, prox_nan) and
+        # pair-shuffle as a unit so all four stay aligned through the per-iter
+        # shuffle. When use_decoupled_loss is False, the prox slots are None
+        # placeholders.
         num_micro = len(micro_batches)
-        paired = list(zip(micro_batches, precomputed_gae))
-
-        # Shuffle so each steps_per_epoch iteration micro_batches are processed in a
-        # different sequence to avoid systematic bias from GA boundary placement.
-        # Use a local RNG seeded deterministically so the shuffle is reproducible
-        # across runs regardless of how many times train_step has been called.
-        call_idx = getattr(self, '_train_step_calls', 0)
+        call_idx               = getattr(self, '_train_step_calls', 0)
         self._train_step_calls = call_idx + 1
+
+        if self.use_decoupled_loss:
+            # Snapshot pi_prox once per epoch on first train_step. eval()
+            # disables dropout for the snapshot; train() restored before loop.
+            iter_in_epoch = call_idx % self.train_steps_per_epoch
+            if iter_in_epoch == 0 or self.cached_prox_logprobs is None:
+                self.policy_engine.eval()
+                self.cached_prox_logprobs, self.cached_prox_nan_masks = self.snapshot_prox_logprobs(micro_batches=micro_batches,
+                                                                                                    engine_id=engine_id,
+                                                                                                    device=device)
+                self.policy_engine.train()
+            paired = list(zip(micro_batches, precomputed_gae, self.cached_prox_logprobs, self.cached_prox_nan_masks))
+
+        else:
+            paired = list(zip(micro_batches, precomputed_gae, [None] * num_micro, [None] * num_micro))
+
         local_rng = random.Random(f"{self.seed}_{engine_id}_{call_idx}")
         local_rng.shuffle(paired)
+
+        # Rebind micro_batches to the post-shuffle order so the per-group
+        # token denominators below are computed over the same groups the
+        # inner loop will actually iterate. Without this rebind, ga_denoms[k]
+        # would correspond to original positions [k*ga, (k+1)*ga) but the
+        # inner loop's k-th GA group consumes shuffled positions, biasing
+        # the per-step gradient scaling.
+        micro_batches = [p[0] for p in paired]
 
         # torch.distributed.get_rank() would be the same thing as engine_id
         if engine_id == 0:
@@ -557,7 +584,7 @@ class PPO(COMMON):
         all_metrics_policy = []
         all_metrics_value = []
         consecutive_nan_steps = 0
-        for step, (micro_batch, (returns, advs)) in enumerate(progress_bar):
+        for step, (micro_batch, (returns, advs), prox_lp_step, prox_nan_mask) in enumerate(progress_bar):
             is_last = (step == (num_micro - 1))
             # If update_only_after_full_replay is True, we only update at the very end
             # of the shard. Otherwise, we respect ga_pi.
@@ -604,14 +631,18 @@ class PPO(COMMON):
                 ref_logprobs, ref_nan = self.sanitize_logprobs(logprobs=ref_logprobs, engine_id=engine_id, step=step, num_micro=num_micro)
                 mask = mask * (~ref_nan).to(mask.dtype)
 
-            # Compute policy loss using the current policy.
+            # prox_lp_step / prox_nan_mask come pre-aligned from the 4-way
+            # pair-shuffle above (None when use_decoupled_loss is False).
+            if prox_lp_step is not None:
+                mask = mask * (~prox_nan_mask).to(mask.dtype)
+
             loss_total_sum, local_denom, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
                                                                                old_logprobs=old_logprobs,
                                                                                advantages=advs,
                                                                                mask=mask,
                                                                                entropies=pi_entropies,
-                                                                               ref_logprobs=ref_logprobs)
-
+                                                                               ref_logprobs=ref_logprobs,
+                                                                               prox_logprobs=prox_lp_step)
             # store metrics
             all_metrics_policy.append(pi_metrics)
 
@@ -723,5 +754,8 @@ class PPO(COMMON):
 
         # check weights health after update
         self.check_weights_health(engine_id, "AFTER training step")
+
+        # Free the prox cache if we just finished the last iteration of the epoch.
+        self.release_prox_cache_if_epoch_end()
 
         return aggregated_metrics

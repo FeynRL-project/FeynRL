@@ -46,6 +46,15 @@ def is_nccl_fatal_error(exc):
                       # path).
                       "ray actor died",
                       "actor died",
+                      # Three sites wrap reset_prefix_cache failures:
+                      # - rollouts/vllm_engine.py        : update_weights_direct
+                      # - rollouts/vllm_engine_async.py  : update_weights_direct
+                      # - rollouts/vllm_engine_async.py  : finalize_weight_nccl
+                      # A failed reset means the engine has new weights but stale
+                      # prompt-prefix KV from the previous policy and further
+                      # generations would mix V+1 weights with V's K/V and silently
+                      # bias pi_old.
+                      "reset_prefix_cache failed after weight update",
                       )
     msg = str(exc).lower()
     return any(p in msg for p in fatal_patterns)

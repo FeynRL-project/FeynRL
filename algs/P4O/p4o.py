@@ -4,7 +4,6 @@ import math
 from tqdm import tqdm
 from typing import Any
 import ray
-import random
 
 # load follwoings from common.py:
 # load_single_model, init_training_engine, policy_forward,
@@ -12,7 +11,7 @@ import random
 from algs.RL.common import COMMON
 
 @ray.remote
-class P3O(COMMON):
+class P4O(COMMON):
     def __init__(self,
                  model_path: str,
                  model_dtype: torch.dtype,
@@ -54,7 +53,7 @@ class P3O(COMMON):
 
         # policy related parameters
         self.kl_coeff = float(kl_coeff)
-        # p3o does not use clip_low and clip_high in loss calculation
+        # p4o does not use clip_low and clip_high in loss calculation
         self.clip_low = float(clip_low)
         self.clip_high = float(clip_high)
         self.ent_coeff = float(entropy_coeff)
@@ -62,7 +61,7 @@ class P3O(COMMON):
         # use cross entropy loss for policy gradient
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
 
-        # params for decoupled ppo clipped loss which is not used in p3o for now.
+        # params for decoupled ppo clipped loss which is not used in p4o for now.
         self.use_decoupled_loss = use_decoupled_loss
         self.behave_imp_weight_cap = float(behave_imp_weight_cap) if behave_imp_weight_cap is not None else None
 
@@ -71,7 +70,8 @@ class P3O(COMMON):
         self.update_only_after_full_replay = update_after_full_replay
         self.normalize_loss = normalize_loss
 
-        # for decoupled loss, cache pi_prox once per epoch (not used in p3o for now).
+        # Following are used to snapshot pi_prox once per epoch on the first train_step
+        # and reuse the cached snapshot across the remaining iterations.
         self.train_steps_per_epoch = int(train_steps_per_epoch)
         self.cached_prox_logprobs  = None
         self.cached_prox_nan_masks = None
@@ -132,26 +132,6 @@ class P3O(COMMON):
         ess = (sum_w**2) / (sum_w_2 + 1e-8) / total
         return float(ess)
 
-    def calculate_seq_ess(self, ratio, mask_bool):
-        '''
-            Per-sequence ESS: each sequence gets its own ESS value.
-            ratio, mask_bool: [B, T]
-            Returns: [B, 1] tensor with ESS values in (0, 1], broadcastable to [B, T].
-        '''
-        # Zero out padded positions so they don't contribute to sums.
-        # [B, T]
-        w = torch.where(mask_bool, ratio, torch.zeros_like(ratio))
-        # [B, 1]
-        n = mask_bool.sum(dim=-1, keepdim=True).to(torch.float32).clamp(min=1.0)
-        # [B, 1]
-        sum_w  = w.sum(dim=-1, keepdim=True)
-        sum_w2 = w.pow(2).sum(dim=-1, keepdim=True)
-        ess = sum_w.pow(2) / (sum_w2 + 1e-8) / n
-
-        # Sequences with no valid tokens get ESS=1.0 (no capping).
-        ess = torch.where(n > 0.5, ess, torch.ones_like(ess))
-        return ess.clamp(min=0.0, max=1.0)
-
     def compute_policy_loss(self,
                             logprobs: torch.Tensor,
                             old_logprobs: torch.Tensor,
@@ -159,93 +139,136 @@ class P3O(COMMON):
                             mask: torch.Tensor,
                             entropies: torch.Tensor,
                             ref_logprobs: torch.Tensor,
+                            prox_logprobs: torch.Tensor,
                             ):
         '''
-            logprobs: [B, T-1]
-            old_logprobs, advantages, mask: [B, T - 1]
-            entropies: [B, T-1]
-            ref_logprobs: [B, T-1]
-            Compute policy loss:
-                1. ratio = exp(logprobs - old_logprobs)
-                2. ess = ||w||^2_1 / ||w||^2_2 / n
-                3. rho = clip(ratio, 0, ess) (detached weighting factor)
-                4. loss = -(rho.detach() * logprobs * adv) * mask + (1 - ess) * kl_divergence(logprobs, old_logprobs)
-            Returns:
-                loss_total_sum: scalar tensor, raw sum of masked losses (no normalization).
-                denom: local token count in this micro-batch (for metrics and fallback normalization).
-                metrics: dict, per-token mean metrics using local denom for interpretability.
+            logprobs, old_logprobs, advantages, mask: [B, T-1]
+            entropies, ref_logprobs, prox_logprobs:   [B, T-1]
+            P4O loss with adaptive mixture trust region:
+                ratio_b   = exp(logprobs - old_logprobs)
+                ess_b, ess_prox = global token-ESS over ratio_b, ratio_prox
+                ess_mix   = min(ess_b, ess_prox)
+                rho       = min(ratio_b, ess_mix)
+                pi_mix    = (w_b * pi_b + w_prox * pi_prox) / (w_b + w_prox)
+                            # adaptive blend with w_b = (1 - ess_b), w_prox = (1 - ess_prox)
+                loss = -sg(rho) * logprobs * adv * mask
+                     + (1 - ess_mix) * KL(pi || pi_mix)                    # gated on (1 - ess_mix) > 1e-6
+                     + kl_coeff * KL(pi || pi_ref)                         # optional
+                     - ent_coeff * H(pi)                                   # optional
+            Returns (loss_total_sum, denom, metrics).
         '''
         device = logprobs.device
-        dtype = logprobs.dtype
-        ent_sum = torch.tensor(0.0, device=device, dtype=dtype)
-        kl_sum_ref  = torch.tensor(0.0, device=device, dtype=dtype)
+        dtype  = logprobs.dtype
+        ent_sum    = torch.tensor(0.0, device=device, dtype=dtype)
+        kl_sum_ref = torch.tensor(0.0, device=device, dtype=dtype)
 
-        # 1. make sure advantages are detached and
-        # convert to float32 for stability under bf16/fp16
+        # advantages detached + fp32 for stability under bf16/fp16
         adv = advantages.detach().to(torch.float32)
         mask_bool = (mask.to(device=device) > 0.5)
-        mask = mask_bool.to(dtype=dtype)
+        mask  = mask_bool.to(dtype=dtype)
         denom = mask.sum().clamp(min=1.0)
 
-        # 2. calculate ratio = pi / pi_old = exp(logprobs - old_logprobs)
-        raw_logratio = (logprobs - old_logprobs).to(torch.float32)
-        # Ignore invalid (padded) positions before exp to avoid inf * 0 -> nan.
-        logratio     = torch.where(mask_bool, raw_logratio, torch.zeros_like(raw_logratio))
-        ratio        = torch.exp(logratio)
-        ess_factor   = self.calculate_ess(ratio=ratio, mask_bool=mask_bool)
+        # Behavioral ratio + ESS. Zero out pads before exp to avoid inf*0 -> nan.
+        raw_logratio_b = (logprobs - old_logprobs).to(torch.float32)
+        logratio_b     = torch.where(mask_bool, raw_logratio_b, torch.zeros_like(raw_logratio_b))
+        ratio_b        = torch.exp(logratio_b)
+        ess_b          = self.calculate_ess(ratio=ratio_b, mask_bool=mask_bool)
 
-        # 3. calculate the KL between policy and old model (behavioral policy) for the KL term in the loss
-        kl_dist_behavioral = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=old_logprobs)
-        kl_dist_behavioral = torch.where(mask_bool, kl_dist_behavioral, torch.zeros_like(kl_dist_behavioral))
-        kl_sum_behavioral  = (kl_dist_behavioral * mask).sum()
+        # Proximal ratio + ESS
+        raw_logratio_prox = (logprobs - prox_logprobs).to(torch.float32)
+        logratio_prox     = torch.where(mask_bool, raw_logratio_prox, torch.zeros_like(raw_logratio_prox))
+        ratio_prox        = torch.exp(logratio_prox)
+        ess_prox          = self.calculate_ess(ratio=ratio_prox, mask_bool=mask_bool)
 
-        # 4. P3O loss as raw sum: rho.detach() * log(pi) * advantage
-        # Unlike PPO, P3O clips the importance ratio and uses it as a weighting
-        # coefficient for the policy's log-probability more like policy gradient.
-        rho = torch.clamp(ratio, min=0, max=ess_factor)
-        pi_sum = -(rho.detach() * logprobs * adv * mask).sum()
+        # Behavioral and proximal KL, only for diagnostic purposes.
+        with torch.no_grad():
+            kl_dist_b = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=old_logprobs)
+            kl_dist_b = torch.where(mask_bool, kl_dist_b, torch.zeros_like(kl_dist_b))
+            kl_sum_b  = (kl_dist_b * mask).sum()
 
-        # 4. compute entropy loss (raw sum)
+            kl_dist_prox = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=prox_logprobs)
+            kl_dist_prox = torch.where(mask_bool, kl_dist_prox, torch.zeros_like(kl_dist_prox))
+            kl_sum_prox  = (kl_dist_prox * mask).sum()
+
+        # clip based on ess
+        ess_mix   = min(ess_b, ess_prox)
+        rho_min_b = torch.clamp(ratio_b, min=0, max=ess_mix)
+        pi_sum    = -(rho_min_b.detach() * logprobs * adv * mask).sum()
+
+        # Calculate adaptive mixture trust region.
+        # max(0, ...) guards against fp noise from the ess all-reduce pushing
+        # ess slightly above 1.0. We take log(w + eps_log) below so a negative
+        # weight would error out.
+        w_b      = max(0.0, 1.0 - ess_b)
+        w_prox   = max(0.0, 1.0 - ess_prox)
+        w_total  = w_b + w_prox
+
+        # Skip the entire graph when both anchors are essentially fresh since
+        # the contribution would be negligible and backward would walk it just to multiply by ~0.
+        eps_gate = 1e-6
+        if (1.0 - ess_mix) > eps_gate:
+            # eps_log avoids log(0) when one weight is exactly 0; the live anchor
+            # dominates the logsumexp and log_mix collapses to that anchor's logprob.
+            eps_log = 1e-30
+            log_mix = torch.logsumexp(torch.stack([math.log(w_b    + eps_log) + old_logprobs.to(torch.float32),
+                                                   math.log(w_prox + eps_log) + prox_logprobs.to(torch.float32),
+                                                  ], dim=0), dim=0,) - math.log(w_total)
+
+            kl_dist_mix = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=log_mix)
+            kl_dist_mix = torch.where(mask_bool, kl_dist_mix, torch.zeros_like(kl_dist_mix))
+            kl_sum_mix  = (kl_dist_mix * mask).sum()
+            kl_mix_loss = (1.0 - ess_mix) * kl_sum_mix
+
+        else:
+            kl_sum_mix  = torch.tensor(0.0, device=device, dtype=dtype)
+            kl_mix_loss = torch.tensor(0.0, device=device, dtype=dtype)
+
         if entropies is not None and self.ent_coeff > 0.0:
             ent_sum = (entropies * mask).sum()
 
         if ref_logprobs is not None and self.kl_coeff > 0.0:
             kl_dist_ref = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=ref_logprobs)
-            # avoid calculating kl for padded tokens.
             kl_dist_ref = torch.where(mask_bool, kl_dist_ref, torch.zeros_like(kl_dist_ref))
             kl_sum_ref  = (kl_dist_ref * mask).sum()
 
-        # if ess factor is 1, we don't nee much KL_old as current policy and behavioral policy
-        # are close to each other. However, if ess_facotr is clsoe to 0, we need to use KL_old
-        # to enforce the trust region as the policy has diverged a lot.
-        loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum_ref +  (1 - ess_factor) * kl_sum_behavioral
+        loss_total_sum = pi_sum - self.ent_coeff * ent_sum + self.kl_coeff * kl_sum_ref + kl_mix_loss
 
-        # 5. useful metrics. here per-token means using local denom for interpretability
+        # Per-token means use local denom for interpretability.
         with torch.no_grad():
-            # first term too large ==> policy changed too much upward
-            # second term too small ==> policy changed too much downward
-            clipped_mask = (ratio > (1.0 + self.clip_high)) | (ratio < (1.0 - self.clip_low))
-            # fraction of masked tokens that ratio out of ranges
+            clipped_mask = (ratio_b > (1.0 + self.clip_high)) | (ratio_b < (1.0 - self.clip_low))
             clipfrac = (clipped_mask.to(dtype=dtype) * mask).sum() / denom
 
-            # approx KL (var-reduced): log(pi/pi_old) + pi_old/pi - 1
-            # logratio = log(pi/pi_old)
-            ratio_inv = torch.exp(-logratio)
-            approx_kl_t = logratio + ratio_inv - 1.0
-            approx_kl = (approx_kl_t.to(dtype=dtype) * mask).sum() / denom
+            # var-reduced approx KL: log(pi/pi_old) + pi_old/pi - 1
+            ratio_inv_b   = torch.exp(-logratio_b)
+            approx_kl_t_b = logratio_b + ratio_inv_b - 1.0
+            approx_kl_b   = (approx_kl_t_b.to(dtype=dtype) * mask).sum() / denom
 
-            # mc entropy proxy at the realized token: -log pi(a|s).
+            # MC entropy proxy at the realized token: -log pi(a|s)
             ent_mc = -(logprobs * mask).sum() / denom
 
-            # save the metrics for debugging
-            metrics = {'clipfrac': clipfrac.item(),
-                       'approx_kl': approx_kl.item(),
-                       'ent_mc': ent_mc.item(),
-                       'pi_loss': (pi_sum / denom).item(),
-                       'loss_total': (loss_total_sum / denom).item(),
-                       'kl_ref': (kl_sum_ref / denom).item(),
-                       'kl_behavioral': (kl_sum_behavioral / denom).item(),
-                       'ess_factor': ess_factor,
+            # Both 0 signals "trust region inactive this step".
+            if w_total > 0.0:
+                mix_w_b_norm    = w_b    / w_total
+                mix_w_prox_norm = w_prox / w_total
+
+            else:
+                mix_w_b_norm    = 0.0
+                mix_w_prox_norm = 0.0
+
+            metrics = {'clipfrac':    clipfrac.item(),
+                       'approx_kl_b': approx_kl_b.item(),
+                       'ent_mc':      ent_mc.item(),
+                       'pi_loss':     (pi_sum / denom).item(),
+                       'loss_total':  (loss_total_sum / denom).item(),
+                       'kl_ref':      (kl_sum_ref / denom).item(),
+                       'kl_b':        (kl_sum_b / denom).item(),
+                       'kl_prox':     (kl_sum_prox / denom).item(),
+                       'kl_mix':      (kl_sum_mix / denom).item(),
+                       'ess_b':       ess_b,
+                       'ess_prox':    ess_prox,
+                       'ess_mix':     ess_mix,
+                       'mix_w_b':     mix_w_b_norm,
+                       'mix_w_prox':  mix_w_prox_norm,
                        }
 
         return loss_total_sum, denom, metrics
@@ -263,14 +286,10 @@ class P3O(COMMON):
 
         device = self.policy_engine.device
 
-        # Shuffle so each steps_per_epoch iteration micro_batches are processed in a
-        # different sequence to avoid systematic bias from GA boundary placement.
-        # Use a local RNG seeded deterministically so the shuffle is reproducible
-        # across runs regardless of how many times train_step has been called.
-        call_idx = getattr(self, '_train_step_calls', 0)
-        self._train_step_calls = call_idx + 1
-        local_rng = random.Random(f"{self.seed}_{engine_id}_{call_idx}")
-        local_rng.shuffle(micro_batches)
+        # Snapshot pi_prox once per epoch and pair-shuffle with micro_batches.
+        micro_batches, prox_logprobs, prox_nan_masks = self.snapshot_prox_for_epoch(micro_batches=micro_batches,
+                                                                                    engine_id=engine_id,
+                                                                                    device=device)
 
         # 1. Models to train mode
         self.policy_engine.train()
@@ -281,7 +300,7 @@ class P3O(COMMON):
         # 3. create progress bar
         num_micro = len(micro_batches)
 
-        # torch.distributed.get_rank() would be the same thing as engine_idå
+        # torch.distributed.get_rank() would be the same thing as engine_id
         if engine_id == 0:
             progress_bar = tqdm(micro_batches, total=num_micro, desc="[Alg:{}] Training Step in rank {}".format(self.alg_name, engine_id))
 
@@ -362,21 +381,35 @@ class P3O(COMMON):
                 ref_logprobs, ref_nan = self.sanitize_logprobs(logprobs=ref_logprobs, engine_id=engine_id, step=step, num_micro=num_micro)
                 mask = mask * (~ref_nan).to(mask.dtype)
 
+            # apply masking to the prox logprobs
+            prox_nan_mask = prox_nan_masks[step]
+            mask          = mask * (~prox_nan_mask).to(mask.dtype)
+            prox_lp_step  = prox_logprobs[step]
+
+
             # Compute policy loss using the current policy.
             loss_total_sum, local_denom, pi_metrics = self.compute_policy_loss(logprobs=pi_logprobs,
                                                                                old_logprobs=old_logprobs,
                                                                                advantages=advs,
                                                                                mask=mask,
                                                                                entropies=pi_entropies,
-                                                                               ref_logprobs=ref_logprobs)
+                                                                               ref_logprobs=ref_logprobs,
+                                                                               prox_logprobs=prox_lp_step,
+                                                                               )
 
             # store metrics
             all_metrics.append(pi_metrics)
             if engine_id == 0:
                 progress_bar.set_postfix({"pi_loss": f"{pi_metrics['pi_loss']:.4f}",
                                           "clipfrac": f"{pi_metrics['clipfrac']:.3f}",
-                                          "approx_kl": f"{pi_metrics['approx_kl']:.4f}",
-                                          "kl_ref": f"{pi_metrics['kl_ref']:.4f}"
+                                          "approx_kl_b": f"{pi_metrics['approx_kl_b']:.4f}",
+                                          "kl_ref": f"{pi_metrics['kl_ref']:.4f}",
+                                          "kl_b": f"{pi_metrics['kl_b']:.4f}",
+                                          "kl_prox": f"{pi_metrics['kl_prox']:.4f}",
+                                          "kl_mix": f"{pi_metrics['kl_mix']:.4f}",
+                                          "ess_b": f"{pi_metrics['ess_b']:.4f}",
+                                          "ess_prox": f"{pi_metrics['ess_prox']:.4f}",
+                                          "ess_mix": f"{pi_metrics['ess_mix']:.4f}",
                                           })
 
             # Scale loss for backward pass.
@@ -434,5 +467,8 @@ class P3O(COMMON):
 
         # check weights health after update to avoid nan in the next step
         self.check_weights_health(engine_id, "AFTER training step")
+
+        # Free the prox cache if we just finished the last iteration of the epoch.
+        self.release_prox_cache_if_epoch_end()
 
         return aggregated_metrics

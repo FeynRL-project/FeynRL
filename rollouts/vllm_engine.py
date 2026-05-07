@@ -38,6 +38,7 @@ class VLLMRolloutEngine(Base):
                  max_model_len: int | None = None,
                  engine_id: int = 0,
                  batch_invariant: bool = False,
+                 quantization: Optional[str] = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -84,6 +85,8 @@ class VLLMRolloutEngine(Base):
         self.model_dtype = model_dtype
         self.loaded_version = -1
         self.trust_remote_code = trust_remote_code
+        # Online quantization for vllm and only "fp8" is supported.
+        self.quantization = quantization
         self.vllm_engine = None
         self.refresh_model(model_path, 0)
         self.sampling_params = self.make_sampling_params()
@@ -171,14 +174,32 @@ class VLLMRolloutEngine(Base):
                           # attached to the vllm worker. The orchestrator in main_rl.py calls update_weights_direct on each
                           # rollout engine separately via ray remote so the weight sync happens at both levels.
                           worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
+                          # Reuse prompt KV across n_samples and shared prefixes.
+                          # Set explicit (vLLM 0.19 default is True). Weight updates
+                          # don't auto-invalidate, see update_weights_direct() for the reset_prefix_cache() call.
+                          enable_prefix_caching=True,
                           )
         if self.max_model_len is not None:
             llm_kwargs["max_model_len"] = self.max_model_len
         if self.batch_invariant:
             llm_kwargs["attention_backend"] = "FLASH_ATTN"
 
+        if self.quantization is not None:
+            llm_kwargs["quantization"] = self.quantization
+
         self.vllm_engine = LLM(**llm_kwargs)
         self.log(f"Successfully loaded vllm model from {self.model_path}")
+
+        # collective_rpc returns one dict per TP worker and all shards should agree
+        # on quantization scheme and have similar FP8 counts.
+        if self.quantization is not None:
+            try:
+                infos = self.vllm_engine.collective_rpc("get_quantization_info")
+                if infos:
+                    self.log(f"Engine quantization: {infos[0]}")
+
+            except Exception as e:
+                self.log(f"get_quantization_info skipped: {e}")
 
     def update_weights_direct(self, state_dict: dict, version: int) -> bool:
         '''
@@ -250,6 +271,20 @@ class VLLMRolloutEngine(Base):
                                    f"param counts: {results}. Weights may be out of sync.")
 
         self.loaded_version = version
+        # Invalidate prefix cache so V+1 weights aren't mixed with V cached K/V.
+        # reset_running_requests=True converts vLLM 0.19's silent no-op (default)
+        # into success-or-raise. On failure, re-raise with a fingerprint matched
+        # by is_nccl_fatal_error so the driver hard-fails instead of continuing
+        # with biased rollouts.
+        reset_fn = getattr(self.vllm_engine, 'reset_prefix_cache', None)
+        if reset_fn is not None:
+            try:
+                reset_fn(reset_running_requests=True)
+            except Exception as e:
+                raise RuntimeError(f"reset_prefix_cache failed after weight update to v{version} "
+                                   f"(engine {self.engine_id}): {e}. Stale prefix cache would "
+                                   f"produce mixed-version rollouts, so aborting to prevent silent "
+                                   f"training-data corruption." ) from e
         self.log(f"Weights updated to version {version}")
         return True
 
@@ -303,6 +338,9 @@ class VLLMRolloutEngine(Base):
                 batch_best_of_k_reward_sum = 0.0
                 batch_reward_std_sum = 0.0
 
+                # total_attempted counts empty and non-empty responses
+                total_attempted = 0
+
                 # If the reward function exposes a batch interface, score all
                 # (prompt, response) pairs in one call so the reward function
                 # can submit all work to its process pool before blocking.
@@ -354,6 +392,8 @@ class VLLMRolloutEngine(Base):
                         # correct_threshold must be collected from all responses, including empty
                         # correct_threshold is required in pass@k calculation
                         group_stats['correct_threshold'].append(correct_threshold)
+                        # Count every response even empty ones.
+                        total_attempted += 1
 
                         if response_len > 0:
                             # is_per_token is False, then rewards_resp will only have value for the last element
@@ -426,7 +466,8 @@ class VLLMRolloutEngine(Base):
                                                 "prompt_ids": prompt_ids, # list[int]
                                                 "response_text": getattr(response, "text", ""),
                                                 "response_len": response_len,
-                                                "truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                                "truncated": 1 if finish_reason == "length" else 0,
+                                                "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
                                                     })
                     self.normalize_rewards(samples=group_samples,
                                            stats=group_stats,
@@ -472,6 +513,13 @@ class VLLMRolloutEngine(Base):
                              f"avg_reward_per_prompt={batch_prompt_reward_sum / batch_num_prompts:.4f}, "
                              f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
                              f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}")
+
+                # Count empty responses to monitor for KV-cache pressure
+                n_empty = total_attempted - len(rollout_samples)
+                if n_empty > 0:
+                    self.log(f"[postprocess] {n_empty}/{total_attempted} empty completions "
+                             f"({100.0*n_empty/max(1,total_attempted):.0f}%) — "
+                             f"vLLM returned response_len=0 (likely KV-cache pressure / preemption)")
 
                 return rollout_samples
 

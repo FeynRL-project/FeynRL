@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/feynrl.png" alt="FeynRL Logo" width="300">
+  <img src="docs/feynrl.png" alt="FeynRL Logo" width="220">
 </p>
 
 <p align="center">
@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/boson-ai/FeynRL"><img src="https://img.shields.io/badge/GitHub-FeynRL-181717?style=flat-square&logo=github" alt="GitHub"></a>&nbsp;
-  <a href="https://rasoolfa.github.io"><img src="https://img.shields.io/badge/Blog-FeynRL-E65100?style=flat-square&logo=googlechrome&logoColor=white" alt="Blog"></a>&nbsp;
+  <a href="https://feynrl-project.github.io"><img src="https://img.shields.io/badge/Blog-FeynRL-E65100?style=flat-square&logo=googlechrome&logoColor=white" alt="Blog"></a>&nbsp;
   <a href="https://discord.gg/HQE9TVXCNS"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>&nbsp;
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-2E7D32?style=flat-square" alt="License"></a>
 </p>
@@ -55,14 +55,14 @@ For a detailed breakdown of the architecture, see the **[Architecture Overview](
 - 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
 - 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
 - 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes
-- 🔀 **Training-rollout scheduling**: Sync and overlap (async) modes. The overlap engine uses a queue-pull architecture: rollout engines self-schedule by pulling prompts from a shared Ray queue while training runs concurrently on already-collected data, with mid-epoch NCCL weight sync triggered by ESS (P3O) or a fixed step interval (PPO/GRPO/CISPO).
+- 🔀 **Training-rollout scheduling**: Sync and overlap (async) modes. In overlap mode, rollout generation and training run concurrently on separate GPU pools to reduce idle time, with a configurable staleness budget bounding how off-policy the replay data can drift.
 - 🔄 **Weight sync**: NCCL broadcast (sync mode supports direct/disk fallbacks; async mode is NCCL-only at runtime, with a built-in NCCL watchdog and fail-fast on communicator destruction).
 - 🧷 **Parameter-efficient fine-tuning**: LoRA via PEFT
 - 🔢 **Mixed-dataset sampling**: Configurable multi-dataset sampling with ratios within a single training run
 - 📈 **Experiment tracking**: MLflow and Weights & Biases support
 - 🏅 **Evaluation**: Standalone eval pipeline with vLLM engines
 
-For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training workers and vLLM rollout workers across nodes, and coordinates weight synchronization between them. In **sync mode**, each epoch generates all rollouts, trains on them, syncs weights, and repeats. In **overlap mode**, the driver fills a shared Ray prompt queue at the start of each epoch and rollout engines self-schedule by pulling from it; the driver drains results between training steps so generation and training run concurrently. Mid-epoch NCCL weight sync is triggered by ESS (Effective Sample Size) or a fixed step interval, and pre-launching the next epoch hides the checkpoint-save bubble. Async mode is NCCL-only at runtime; sync mode supports a three-tier NCCL/direct/disk fallback chain. SFT and DPO are simpler because they only require a single model and no rollout workers, so they run directly on DeepSpeed without Ray. All paradigms support full fine-tuning and LoRA, and plug into mixed-dataset sampling, experiment tracking, and standalone evaluation without changing the overall workflow.
+For RL, Ray orchestrates the full training loop: it schedules DeepSpeed training workers and vLLM rollout workers across nodes, and coordinates weight synchronization between them. In **sync mode**, each epoch generates all rollouts, trains on them, syncs weights, and repeats — fully on-policy and easy to reason about. In **overlap mode** (also called async mode), rollout generation and training run concurrently on separate GPU pools so training GPUs don't sit idle waiting for rollouts. Generation is continuous across epoch boundaries and checkpoint saves — the only pauses are brief drains during weight sync, which runs once at the end of every non-final epoch. A configurable staleness budget bounds how off-policy the replay data can drift. Async mode uses NCCL for weight sync; sync mode supports a three-tier NCCL/direct/disk fallback chain. SFT and DPO are simpler because they only require a single model and no rollout workers, so they run directly on DeepSpeed without Ray. All paradigms support full fine-tuning and LoRA, and plug into mixed-dataset sampling, experiment tracking, and standalone evaluation without changing the overall workflow.
 
 ## 🗂️ Codebase at a glance
 
@@ -78,15 +78,20 @@ The repository is organized so that algorithmic changes usually stay local:
 
 ## 📢 News
 
+- ![Date](https://img.shields.io/badge/2026--04--27-green) FeynRL is now publicly announced! Since the preview, we've added a new async engine and a collection of tricks and ideas, many not easily found elsewhere, that materially improve training stability and reliability. Thanks to everyone who tried the preview and shared feedback.
 - ![Date](https://img.shields.io/badge/2026--03--03-purple) We're excited to publicly release FeynRL as a preview! Some features and documentation are still evolving. We welcome feedback, bug reports, and contributions as we continue to build this together.
 
 ## 📖 How to Use FeynRL
 
 **[Installation & Setup](docs/INSTALL.md)** — Configure your environment and dependencies.
 
-**[Usage & Examples](docs/HOWTO.md)** — Learn how to launch jobs and run experiments.
+**[Quickstart & How-To](docs/HOWTO.md)** — Learn how to launch jobs and run experiments.
+
+**[Experiments](examples/README.md)** — Reference experiment results and the canonical example configs used to reproduce them.
 
 **[Configuration Reference](configs/README.md)** — Full parameter guide for RL, SFT, DPO, and evaluation configs.
+
+**[Troubleshooting](docs/TROUBLESHOOTING.md)** — Diagnose and fix common issues.
 
 ## 🤝 Contributing
 

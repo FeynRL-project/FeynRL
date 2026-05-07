@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import torch
 import torch.distributed
 import gc
@@ -15,7 +16,7 @@ from misc.metrics import compute_pass_metrics
 from misc.nccl_utils import create_nccl_process_group
 from rollouts.base import Base
 
-@ray.remote(concurrency_groups={"health": 1, "pull": 1})
+@ray.remote(concurrency_groups={"health": 1, "pull": 1, "mailbox": 1})
 class VLLMRolloutEngineAsync(Base):
     def __init__(self,
                  seed: int,
@@ -102,6 +103,12 @@ class VLLMRolloutEngineAsync(Base):
         self.loaded_version = 0
         self.sampling_params = self.make_sampling_params()
 
+        # Liveness tracking for ping_mailbox. run_pull_loop flips _pull_loop_active
+        # on entry/exit and refreshes _last_pull_progress per iteration + per successful put.
+        # ping_mailbox only checks staleness while active, so exited engines are always alive.
+        self._last_pull_progress = time.time()
+        self._pull_loop_active   = False
+
     def log(self, msg: str) -> None:
         '''
             Log message only if this is the first engine to avoid clutter.
@@ -157,6 +164,11 @@ class VLLMRolloutEngineAsync(Base):
                              seed=self.seed,
                              worker_extension_cls="rollouts.weight_sync.WeightSyncExtension",
                              disable_log_stats=True,
+                             # Reuse prompt KV across n_samples and shared prefixes.
+                             # Set explicit (vLLM 0.19 default is True). Weight updates
+                             # don't auto-invalidate, see update_weights_direct + finalize_weight_nccl
+                             # for the reset_prefix_cache calls.
+                             enable_prefix_caching=True,
                              )
         if self.max_model_len is not None:
             engine_kwargs["max_model_len"] = self.max_model_len
@@ -309,6 +321,9 @@ class VLLMRolloutEngineAsync(Base):
         batch_best_of_k_reward_sum = 0.0
         batch_reward_std_sum = 0.0
 
+        # total_attempted counts empty and non-empty responses
+        total_attempted = 0
+
         # If the reward function exposes a batch interface, score all
         # (prompt, response) pairs in one call so the reward function
         # can submit all work to its process pool before blocking.
@@ -359,6 +374,9 @@ class VLLMRolloutEngineAsync(Base):
                 # correct_threshold must be collected from all responses, including empty
                 # correct_threshold is required in pass@k calculation
                 group_stats['correct_threshold'].append(correct_threshold)
+
+                # Count every response even empty ones.
+                total_attempted += 1
 
                 if response_len > 0:
                     # is_per_token is False, then rewards_resp will only have value for the last element
@@ -431,7 +449,8 @@ class VLLMRolloutEngineAsync(Base):
                                         "prompt_ids": prompt_ids, # list[int]
                                         "response_text": getattr(response, "text", ""),
                                         "response_len": response_len,
-                                        "truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                        "truncated": 1 if finish_reason == "length" else 0,
+                                        "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
                                             })
 
             self.normalize_rewards(samples=group_samples, stats=group_stats, prompt_len=prompt_len, is_per_token=is_per_token)
@@ -472,6 +491,13 @@ class VLLMRolloutEngineAsync(Base):
                      f"avg_best_of_k_reward={batch_best_of_k_reward_sum / batch_num_prompts:.4f}, "
                      f"avg_reward_std_per_prompt={batch_reward_std_sum / batch_num_prompts:.4f}")
 
+        # Count empty responses to monitor for KV-cache pressure
+        n_empty = total_attempted - len(rollout_samples)
+        if n_empty > 0:
+            self.log(f"[postprocess] {n_empty}/{total_attempted} empty completions "
+                     f"({100.0*n_empty/max(1,total_attempted):.0f}%) — "
+                     f"vLLM returned response_len=0 (likely KV-cache pressure / preemption)")
+
         return rollout_samples
 
     @ray.method(concurrency_group="pull")
@@ -506,11 +532,24 @@ class VLLMRolloutEngineAsync(Base):
                 return
             results = self.complete_generation(future=p[0], prompts=p[1], current_iter=epoch, policy_version=policy_version)
             results_queue.put(results)
+            # Liveness: only reached after a successful put, so a blocked
+            # put leaves the timestamp stale (ping_mailbox detects that).
+            self._last_pull_progress = time.time()
             batches_done += 1
 
+        # Order matters: refresh timestamp BEFORE flipping active=True.
+        # ping_mailbox (mailbox-group thread) could otherwise read active=True
+        # with a stale timestamp from a prior pull-loop exit and false-flag
+        # the engine as wedged.
+        self._last_pull_progress = time.time()
+        self._pull_loop_active   = True
         try:
             while True:
                 shard = prompt_queue.get(block=True)
+                # Liveness signal after successful get (also covers idle waits
+                # on an empty prompt_queue, engine is alive even if blocked
+                # waiting for producer).
+                self._last_pull_progress = time.time()
                 if isinstance(shard, str) and shard == POISON:
                     break
                 # Submit the new shard FIRST (its requests join the running
@@ -523,11 +562,15 @@ class VLLMRolloutEngineAsync(Base):
                 flush(to_flush)
                 pending = (new_future, shard)
         finally:
-            # Flush the trailing pending shard. We let exceptions propagate so
-            # the driver's ray.get(pull_refs) sees real failures instead of
-            # silently losing the last shard. If the loop body already
-            # raised, Python's exception chaining will surface both.
-            flush(pending)
+            # Flush the trailing pending shard. We let exceptions propagate so the driver's
+            # ray.get(pull_refs) sees real failures instead of silently losing the last shard.
+            # If the loop body already raised, Python's exception chaining will surface both.
+            try:
+                flush(pending)
+            finally:
+                # Always clear the active flag, even if flush raised, a failed-but-exited
+                # pull loop should not be flagged as "mailbox wedged" by the driver's health check.
+                self._pull_loop_active = False
 
         return batches_done
 
@@ -611,6 +654,18 @@ class VLLMRolloutEngineAsync(Base):
                                    f"param counts: {results}. Weights may be out of sync.")
 
         self.loaded_version = version
+        # Invalidate prefix cache so V+1 weights aren't mixed with V cached K/V.
+        # reset_running_requests=True converts vLLM 0.19's silent no-op (default)
+        # into success-or-raise. On failure, re-raise with a fingerprint matched
+        # by is_nccl_fatal_error so the driver hard-fails instead of continuing
+        # with biased rollouts.
+        reset_fn = getattr(self.async_engine, 'reset_prefix_cache', None)
+        if reset_fn is not None:
+            try:
+                self.run_async(reset_fn(reset_running_requests=True))
+            except Exception as e:
+                raise RuntimeError(f"reset_prefix_cache failed after weight update to v{version} "
+                                   f"(engine {self.engine_id}): {e}") from e
         self.log(f"Weights updated to version {version}")
         return True
 
@@ -627,31 +682,29 @@ class VLLMRolloutEngineAsync(Base):
         '''
         return True
 
-    @ray.method(concurrency_group="pull")
-    def ping_mailbox(self):
+    @ray.method(concurrency_group="mailbox")
+    def ping_mailbox(self, wedge_threshold_s: float = 300.0):
         '''
-            Runs in the "pull" concurrency_group (max_concurrency=1) so it
-            queues behind any in-flight run_pull_loop. If the pull thread
-            is wedged (vllm internal hang inside complete_generation,
-            permanently stuck generate, etc.), this call times out, letting
-            the driver detect the wedge.
-            Without this group decorator, ping_mailbox would run on the
-            default actor thread which is independent of the pull thread,
-            and it would always return True even when the pull loop is
-            stuck, leading the driver to relaunch run_pull_loop behind
-            the wedged call and hang forever.
-            Combined with ping() (which runs in the "health" group and
-            bypasses all mailboxes), the driver classifies engines as:
-              ping=ok, ping_mailbox=ok       -> fully alive
-              ping=ok, ping_mailbox=timeout  -> pull thread wedged (treat as dead)
-              ping=timeout                   -> process dead
+            Runs in its own "mailbox" concurrency group, responsive regardless of run_pull_loop's state.
+            Returns True unless the pull loop is active AND its last progress was > wedge_threshold_s
+            ago (then raises, driver flags dead). Inactive engines (never started or already
+            exited) always return True — nothing to check.`
+            Note Backpressure is NOT wedged: a blocked put leaves the timestamp stale only for
+            as long as the block. If it stays stale > wedge_threshold_s, something is genuinely wrong
+            (vllm hang, downstream stall). wedge_threshold_s default 300s must exceed the worst legitimate
+            per-shard time.
+        '''
+        # If no pull loop is currently running (e.g., between sync retries or immediately
+        # after a normal exit via POISON), the staleness of the timestamp is meaningless,return True.
+        if not self._pull_loop_active:
+            return True
 
-            Driver-side timeout for this call (see check_rollout_engines_health
-            in run_rl_async.py) must exceed the longest legitimate
-            single-shard processing time, including the reward function's
-            worst-case wall-clock cap, otherwise false positives fire on
-            slow reward functions like math_verify.
-        '''
+        staleness = time.time() - self._last_pull_progress
+        if staleness > wedge_threshold_s:
+            raise RuntimeError(f"Pull loop stale for {staleness:.1f}s "
+                              f"(wedge_threshold={wedge_threshold_s:.1f}s). "
+                              f"Engine may be stuck in complete_generation or a downstream "
+                              f"consumer is not draining results_queue.")
         return True
 
     def init_nccl_group(self, master_addr, master_port, rank_offset, world_size, group_name, timeout_seconds, backend):
@@ -806,16 +859,17 @@ class VLLMRolloutEngineAsync(Base):
 
     def finalize_weight_nccl(self, version, expected_params=0):
         '''
-            After all NCCL parameters have been received, load them into vLLM.
-            For TP=1 + gloo (actor-side): loads the accumulated _nccl_state_dict
-            into vllm via the existing update_weights_direct path (pickle to
-            /dev/shm → collective_rpc("update_weights_from_state")).
-            For TP>1 or nccl backend: weights were already loaded per-parameter
-            in EngineCore via load_weights, so just update the version.
-            expected_params: total params the sender broadcast. If the received
-            count doesn't match, the load was partial and the version is NOT
-            updated to prevent generating with a corrupted model.
+            Load received NCCL params into vllm.
+            TP=1 + gloo: flush accumulated _nccl_state_dict via update_weights_direct
+            (pickle → collective_rpc).
+            TP>1 or nccl: already loaded per-param in EngineCore; just bump the version.
+            If received count != expected_params, load was partial, do NOT bump version
+            (prevents generating with a corrupted model).
         '''
+        assert not self._pull_loop_active, (f"finalize_weight_nccl (engine {self.engine_id}) called while "
+                                            f"run_pull_loop is still active. This would race the weight "
+                                            f"update against in-flight generate(). Callers must drain pull "
+                                            f"loops (poison pills + wait_for_pull_loops) before finalizing.")
         if getattr(self, '_nccl_in_actor', False) and \
            hasattr(self, '_nccl_state_dict') and self._nccl_state_dict:
             num_params = len(self._nccl_state_dict)
@@ -851,6 +905,21 @@ class VLLMRolloutEngineAsync(Base):
 
         self._nccl_tp_params_received = 0
         self.loaded_version = version
+        # Invalidate prefix cache for the same reason as in update_weights_direct
+        # — NCCL TP>1 path also mutates the live model in place. See
+        # update_weights_direct for the full reasoning behind
+        # reset_running_requests=True and the hard-fail wrap.
+        reset_fn = getattr(self.async_engine, 'reset_prefix_cache', None)
+        if reset_fn is not None:
+            try:
+                self.run_async(reset_fn(reset_running_requests=True))
+            except Exception as e:
+                raise RuntimeError(
+                    f"reset_prefix_cache failed after weight update to v{version} "
+                    f"(engine {self.engine_id}, NCCL TP>1 path): {e}. Stale prefix "
+                    f"cache would produce mixed-version rollouts (V's weights × "
+                    f"V-1's K/V); aborting to prevent silent training-data corruption."
+                ) from e
         self.log(f"NCCL weight sync finalized to version {version} ({received} params)")
         return True
 

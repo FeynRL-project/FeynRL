@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import torch
 import torch.distributed
 import numpy as np
@@ -10,7 +11,6 @@ from safetensors.torch import save_file
 from huggingface_hub import split_torch_state_dict_into_shards
 from misc.utils import set_random_seeds
 import copy
-import random
 import time
 # internal and local import
 from misc.nccl_utils import create_nccl_process_group
@@ -219,6 +219,76 @@ class COMMON:
             ga_denoms.append(max(group_denom, 1.0))
 
         return ga_denoms, dp_scale
+
+    def snapshot_prox_logprobs(self, micro_batches, engine_id, device):
+        '''
+            Snapshot pi_prox under current policy BEFORE any optimizer step.
+            Returns a list of [B, T-1] tensors, one per micro-batch, ordered to
+            match the (already-shuffled) micro_batches list so callers can index
+            by step.
+        '''
+        logprobs_prox = []
+        nan_masks     = []
+        for step, micro_batch in enumerate(micro_batches):
+            # all are [B, T]
+            input_ids = micro_batch['input_ids'].to(device, non_blocking=True)
+            att_mask  = micro_batch['attn_mask'].to(device, non_blocking=True)
+            pos_ids   = micro_batch.get('position_ids', None)
+            with torch.no_grad():
+                # curr_logprobs is [B, T-1], shift happoens inside policy_forward
+                curr_logprobs, _, _ = self.policy_forward(input_ids=input_ids,
+                                                          att_mask=att_mask,
+                                                          pos_ids=pos_ids)
+                curr_logprobs, prox_nan_mask = self.sanitize_logprobs(logprobs=curr_logprobs, engine_id=engine_id, step=step, num_micro=len(micro_batches))
+            nan_masks.append(prox_nan_mask)
+            logprobs_prox.append(curr_logprobs.detach())
+        return logprobs_prox, nan_masks
+
+    def snapshot_prox_for_epoch(self, micro_batches, engine_id, device):
+        '''
+            Snapshot pi_prox ONCE per epoch and reuse the cached snapshot
+            across the remaining iterations. Every rank gates on the same
+            iter_in_epoch, so all ranks enter or skip the snapshot together.
+            Returns:
+                (micro_batches, prox_logprobs, prox_nan_masks) all as lists of
+                length num_micro, in the per-iter shuffle order.
+        '''
+        call_idx = getattr(self, '_train_step_calls', 0)
+        self._train_step_calls = call_idx + 1
+        iter_in_epoch = call_idx % self.train_steps_per_epoch
+
+        # Snapshot in original (pre-shuffle) order on the first call of each epoch.
+        if iter_in_epoch == 0 or self.cached_prox_logprobs is None:
+            self.policy_engine.eval()
+            self.cached_prox_logprobs, self.cached_prox_nan_masks = self.snapshot_prox_logprobs(micro_batches=micro_batches,
+                                                                                                engine_id=engine_id,
+                                                                                                device=device)
+            self.policy_engine.train()
+
+        # Pair-shuffle so prox stays paired with its micro_batch through any
+        # per-iter shuffle. Seeded by call_idx so the order is reproducible
+        # but differs across iterations within an epoch.
+        local_rng = random.Random(f"{self.seed}_{engine_id}_{call_idx}")
+        paired    = list(zip(micro_batches, self.cached_prox_logprobs, self.cached_prox_nan_masks))
+        local_rng.shuffle(paired)
+        return ([p[0] for p in paired], [p[1] for p in paired], [p[2] for p in paired])
+
+    def release_prox_cache_if_epoch_end(self):
+        '''
+            Release the prox cache if it was the last iteration of an epoch.
+            Otherwise keep it alive for the next iteration within this epoch.
+        '''
+        # Skip if we never cached or if this isn't an epoch boundary.
+        if self.cached_prox_logprobs is None:
+            return
+
+        if (self._train_step_calls % self.train_steps_per_epoch) != 0:
+            return
+
+        # Drop refs first so the tensors are garbage before empty_cache.
+        self.cached_prox_logprobs  = None
+        self.cached_prox_nan_masks = None
+        torch.cuda.empty_cache()
 
     def check_logit_health(self, logits):
         '''

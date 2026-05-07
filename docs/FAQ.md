@@ -10,11 +10,31 @@ Most frameworks share similar building blocks. The difference is the design prio
 
 We built FeynRL around a trade-off we experienced directly: training at scale and ease of modification don't always go together. Our goal is to make it possible to do both.
 
+## Who should use FeynRL?
+
+FeynRL is designed to be usable by anyone, students, researchers, and engineers alike, because it's built around a clear **separation of concerns** between algorithmic logic and distributed-systems logic, so different kinds of work stay decoupled:
+
+- **Algorithm researchers** can add new objectives, losses, or update rules without threading changes through rollout workers, orchestration, data pipelines, and weight sync. Most new algorithms are a single file.
+- **Systems researchers** can work on rollout engines, async scheduling, or weight synchronization without touching algorithm implementations.
+- **Practitioners** can run existing recipes (PPO, GRPO, CISPO, P3O, DPO, SFT) with a consistent config schema across sync and async execution modes.
+
+The design goal is simple: work on one layer should not require rewriting the others.
+
+## Where should I start?
+
+The README's [How to Use FeynRL](../README.md#-how-to-use-feynrl) section is the fastest entry point. In order:
+
+1. **[Installation & Setup](./INSTALL.md)** — configure your environment and dependencies.
+2. **[Usage & Examples](./HOWTO.md)** — launch your first training job and walk through the example recipes.
+3. **[Configuration Reference](../configs/README.md)** — full parameter guide once you're ready to customize your own runs.
+
+If you want to understand *how* the framework is put together before running anything, skim the [Architecture Overview](./ARCHITECTURE.md) and the per-algorithm READMEs under [`algs/`](../algs/). If you hit issues, check the [Troubleshooting Guide](./TROUBLESHOOTING.md) first.
+
 ## Does "algorithm-first" mean toy-scale?
 
 No. "Algorithm-first" describes the design priority, not a limitation to small experiments.
 
-FeynRL supports large-scale training through DeepSpeed, Ray, and vLLM, including multi-GPU and multi-node training, sync and overlap execution, adaptive ESS-based weight synchronization, and multiple weight-sync backends.
+FeynRL supports large-scale training through DeepSpeed, Ray, and vLLM, including multi-GPU and multi-node training, sync and overlap execution, and multiple weight-sync backends.
 
 The goal is to keep the stack understandable without giving up the ability to run realistic experiments.
 
@@ -30,7 +50,17 @@ That said, FeynRL includes an **overlap engine** that provides a practical middl
 
 ## How does the overlap engine work, and when should I use it?
 
-The overlap engine runs rollout generation and training concurrently within a single epoch. It uses a queue-pull architecture: the driver fills a shared Ray prompt queue at the start of each epoch and rollout engines self-schedule by pulling from it, while the driver drains results between training steps. Mid-epoch weight sync is triggered by ESS (for P3O) or a fixed step interval (for PPO/GRPO/CISPO). For a full description of the mechanisms (queue-pull, pipelined generation, mid-epoch NCCL sync, staleness control, pre-launched next epoch) and guidance on when to use each mode, see the [Architecture Overview](./ARCHITECTURE.md#-trainingrollout-scheduling).
+In sync mode, training follows a strict *generate → train → sync → repeat* cycle, so the training GPUs sit idle while rollouts run and the rollout GPUs sit idle while training runs. The overlap (async) engine runs generation and training **concurrently** on separate GPU pools: rollout engines keep producing new trajectories in the background while the training engines consume from a shared replay buffer. Weight sync happens once at the end of each non-final epoch, and a configurable staleness budget (`overlap.max_lag`) caps how off-policy the oldest replay samples are allowed to become before they're evicted.
+
+**Use overlap mode when generation is the bottleneck** — typically with large models, long sequences, or when `train_steps_per_epoch > 1` makes training finish well before the next rollout batch is ready. The concurrent execution fills training-GPU idle time with useful work.
+
+**Stick with sync mode when:**
+- You need strictly on-policy data (debugging, method development, algorithms sensitive to data freshness).
+- You want the `direct` → `disk` weight-sync fallback chain (sync-only). Overlap mode is NCCL-only at runtime, with no fallback to keep the logic simple.
+
+One thing worth noting: not every algorithm tolerates off-policy data equally. PPO, GRPO, and CISPO use a fixed clip range that does not self-adjust to staleness, so aggressive `max_lag` can dampen gradients via over-clipping. [P3O](../algs/P3O/README.md) derives its clip and trust-region KL from each batch's effective sample size, so it self-regulates as data ages, which makes it a natural fit for overlap mode with a larger staleness budget.
+
+For the full mechanics (producer/queue architecture, NCCL watchdog, staleness eviction, pipeline diagnostics), see the [Architecture Overview](./ARCHITECTURE.md#-trainingrollout-scheduling).
 
 ## Other frameworks include many system improvements. Why don't you include them?
 

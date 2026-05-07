@@ -54,7 +54,7 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 | `rollout_gpus` | GPUs for vLLM rollout engines (also used in eval) | Integer ≥ 1 | `2`, `4`, `7` |
 | `ray_address` | Ray cluster address |`"auto"` if multi-node, `null` if single-node | `"auto"`  |
 | `ray_master_port` | Port for torch distributed rendezvous | Integer \| `null` | `29500` |
-| `weight_sync_method` | Weight sync method. `"nccl"` is required when overlap is enabled. | `"direct"` \| `"disk"` \| `"nccl"` | `"direct"` |
+| `weight_sync_method` | Weight sync method. `"nccl"` is **both required and exclusive** to overlap mode: `overlap.enabled=True` requires `"nccl"`, and `"nccl"` requires `overlap.enabled=True`. Sync mode must use `"direct"` or `"disk"`. | `"direct"` \| `"disk"` \| `"nccl"` | `"direct"` |
 | `nccl_sync_port` | Port for NCCL weight sync rendezvous (default: `ray_master_port + 100`) | Integer \| `null` | `29600` |
 | `nccl_sync_backend` | Backend for weight sync broadcast. `"nccl"` uses GPU-to-GPU transfer via vLLM's PyNcclCommunicator (fast, recommended for full-model sync). `"gloo"` uses CPU-based transfer via torch.distributed (robust fallback). | `"nccl"` \| `"gloo"` | `"nccl"` |
 
@@ -72,15 +72,13 @@ If you encounter NCCL InfiniBand connection errors (`ibv_modify_qp failed with 1
 
 ## `overlap` — Overlap Engine (RL only)
 
-Controls interleaved rollout generation and training within a single epoch. When enabled, `weight_sync_method` must be `"nccl"`. The overlap engine uses mid-training chunk cycling: when an in-flight generation chunk finishes during training, it is finalized immediately and the next chunk is dispatched, keeping rollout GPUs busy throughout training. See the [Architecture Overview](../docs/ARCHITECTURE.md#-trainingrollout-scheduling) for how these parameters interact.
+Controls concurrent rollout generation and training. When `enabled: true`, rollout and training run on separate GPU pools to reduce idle time, and `weight_sync_method` must be `"nccl"` (validator-enforced). A configurable staleness budget (`max_lag`) bounds how off-policy the replay data can drift. See the [Architecture Overview](../docs/ARCHITECTURE.md#-trainingrollout-scheduling) for the full mechanics.
 
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
-| `enabled` | Enable overlap of rollout and training | Boolean | `False` |
-| `max_lag` | Max policy versions rollout data can lag behind. The replay buffer evicts samples older than this. | Integer ≥ 1 | `1`, `2`, `3` |
-| `chunk_size` | Dataloader batches per generation chunk. One chunk in-flight at a time; smaller = more frequent NCCL sync windows. `1` = max overlap, fastest ESS response. `>1` = fewer round-trips, coarser sync. | Integer ≥ 1 | `1`, `2`, `4` |
-| `ess_sync_threshold` | ESS below this triggers weight sync. Lower = more tolerance for off-policy data. | Float in (0.0, 1.0] | `0.5`, `0.8` |
-| `fixed_sync_interval` | Static sync interval in training steps, used when ESS is not available. `null` = disabled (ESS-driven only). | Integer ≥ 1 \| `null` | `1`, `3`, `null` |
+| `enabled` | Enable the async overlap engine. When `True`, `run.weight_sync_method` must be `"nccl"`. | Boolean | `False`, `True` |
+| `max_lag` | Tolerated staleness, in policy versions. Bounds (1) the replay-buffer capacity (sized as `~max_lag` rounds of rollout output) and (2) the age-based eviction threshold applied after each round (items older than `current_version − max_lag` are dropped). The *effective* in-buffer lag can be smaller than `max_lag` when rollout is faster than training (FIFO eviction trims older items first); the `rollout/speed_ratio` metric reports the actual ratio of items produced per cycle vs. one theoretical round. | Integer ≥ 1 | `1`, `2`, `3` |
+| `behave_imp_weight_cap` | Cap on the behavioral importance weight in the decoupled-PPO loss path used by GRPO / PPO / CISPO. Clamps the IS correction to a finite range to prevent runaway weights on stale data. **No-op for P3O** (which uses an ESS-driven trust-region KL instead). The validator requires `> 1.0` for non-P3O algorithms. | Float > 1.0 \| `null` | `null`, `5.0` |
 
 ---
 

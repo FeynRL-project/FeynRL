@@ -247,6 +247,10 @@ class Overlap(BaseModel):
     # Cap on behavioral importance weight (pi_prox / pi_behav). null means no cap.
     behave_imp_weight_cap: float | None = None
 
+class Modality(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    adapter: str = "text"
+
 class Rollout(BaseModel):
     '''
         Everything related to rollout generation (RL-specific).
@@ -290,6 +294,8 @@ class Config(BaseModel):
     deepspeed_ref: DeepSpeedRef | None = None
     # Value model DeepSpeed config
     deepspeed_value: DeepSpeed | None = None
+
+    modality: Modality = Field(default_factory=lambda: Modality())
 
     # peft specific config
     peft: Peft = Field(default_factory=lambda: Peft(use_peft=False))

@@ -136,6 +136,11 @@ rollout:
   # Sync engine only and only "fp8".
   quantization: null
 
+modality:
+  # Which ModalityAdapter to use for data loading, rollout, and training-signal
+  # construction.  Options: "text" (default).
+  adapter: "text"
+
 model:
   name: "google/gemma-3-1b-it"
   dtype: "bfloat16"

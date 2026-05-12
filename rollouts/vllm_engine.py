@@ -39,6 +39,7 @@ class VLLMRolloutEngine(Base):
                  engine_id: int = 0,
                  batch_invariant: bool = False,
                  quantization: Optional[str] = None,
+                 adapter=None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -55,6 +56,15 @@ class VLLMRolloutEngine(Base):
         # worker_extension_cls resolves to local source.
         if os.getcwd() not in sys.path:
             sys.path.append(os.getcwd())
+
+        # modality adapter — routes request building and training-signal
+        # construction; defaults to TextOnlyAdapter when None is passed.
+        if adapter is None:
+            from modality.text import TextOnlyAdapter
+            adapter = TextOnlyAdapter(tokenizer=None)
+        self.engine_id = int(engine_id)
+        self.adapter = adapter
+        self.log(f"Modality adapter: {type(self.adapter).__name__}")
 
         # reward function
         self.reward_func = reward_func
@@ -74,7 +84,6 @@ class VLLMRolloutEngine(Base):
         self.prompt_logprobs = prompt_logprobs
         self.force_strict_on_policy = bool(force_strict_on_policy)
         self.gpu_memory_utilization = float(gpu_memory_utilization)
-        self.engine_id = int(engine_id)
         self.batch_invariant = bool(batch_invariant)
         # prompt + response max length also known as context window size
         self.max_seq_len = int(max_seq_len)
@@ -370,25 +379,11 @@ class VLLMRolloutEngine(Base):
                         finish_reason = getattr(response, "finish_reason", None)
                         stop_reason   = getattr(response, "stop_reason", None)
 
-                        # all have length [T] and token_aligned as described above
                         seq_len = prompt_len + response_len
                         input_ids = torch.tensor(prompt_ids + response_ids, dtype=torch.int64, device='cpu')
 
-                        token_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        token_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        token_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
-
-                        # prediction-level
-                        pred_masks      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        pred_dones      = torch.zeros((seq_len,), dtype=torch.int32, device='cpu')
-                        pred_old_logprobs = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
-
-                        rewards       = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
-                        pred_rewards  = torch.zeros((seq_len,), dtype=torch.float32, device='cpu')
-
                         rewards_resp, is_per_token, correct_threshold = all_rewards[reward_idx]
                         reward_idx += 1
-                        rewards[prompt_len:] = rewards_resp
                         # correct_threshold must be collected from all responses, including empty
                         # correct_threshold is required in pass@k calculation
                         group_stats['correct_threshold'].append(correct_threshold)
@@ -402,73 +397,33 @@ class VLLMRolloutEngine(Base):
                             if response.logprobs is None:
                                 raise ValueError("response.logprobs is None. Check if SamplingParams(logprobs=1) is set.")
 
-                            #####
-                            # token-aligned
-                            #####
-                            token_masks[prompt_len:] = 1 # 1 if valid token which we want to update.
                             response_logprobs, nan_mask = self.extract_logprobs(response_ids, response.logprobs)
-                            token_old_logprobs[prompt_len:] = response_logprobs
-                            token_masks[prompt_len:] = token_masks[prompt_len:] * (~nan_mask).to(token_masks.dtype)
-                            #####
-                            # pred-aligned
-                            #####
-                            # To recall how autoregressive models work:
-                            # - response token j is at token index prompt_len + j in input_ids
-                            # - and this is predicted by logits index prompt_len + j - 1
-                            # pred_aligned which would be one we will use in policy update
-                            # and to avoid any weired indexing later in the training loop.
-                            pred_start = prompt_len - 1
-                            pred_end   = seq_len - 1
-                            pred_masks[pred_start:pred_end] = 1
-                            pred_masks[pred_start:pred_end] = pred_masks[pred_start:pred_end] * (~nan_mask).to(pred_masks.dtype)
-                            pred_old_logprobs[pred_start:pred_end] = response_logprobs
-                            pred_rewards[pred_start:pred_end] = rewards[prompt_len:]
 
-                            # Terminal handling:
-                            #  1. stop: ended due to EOS or a stop condition so done should be 1.
-                            #  2. length: truncated which should not be done=1 and we need to bootstrap
-                            if finish_reason == "stop":
-                                token_dones[seq_len - 1] = 1
-
-                                # pred-aligned terminal is at the logit index that predicts last token
-                                # seq_len >= 2 is guaranteed since prompt_len >= 1 and response_len >= 1
-                                pred_dones[seq_len - 2] = 1
-
-                            # if stop_reason is None, it means it ended on eos
-                            # see here https://docs.vllm.ai/en/stable/api/vllm/outputs/#vllm.outputs.CompletionOutput
-                            eos_in_tokens = (response_ids[-1] == self.eos_id)
-                            ended_on_eos  = (finish_reason == "stop" and stop_reason is None and eos_in_tokens)
-
-                            group_samples.append({ "iter": int(current_iter),
-                                                "policy_version": int(policy_version),
-                                                "loaded_version": int(self.loaded_version),
-
-                                                # token-aligned
-                                                "input_ids": input_ids, #[T]
-                                                "token_rewards": rewards, #[T]
-                                                "token_zscores": rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
-                                                "token_masks": token_masks, #[T] 1 on response/valid tokens
-                                                "token_dones": token_dones, #[T] 1 on last token if terminal
-                                                "token_old_logprobs": token_old_logprobs, #[T] 0 on prompt since we don't backprop on it.
-
-                                                # pred-aligned
-                                                "pred_rewards": pred_rewards, #[T]
-                                                "pred_masks": pred_masks, #[T]
-                                                "pred_dones": pred_dones, #[T]
-                                                "pred_old_logprobs": pred_old_logprobs, #[T]
-                                                "pred_zscores": pred_rewards.clone(), #[T] if len(group_samples) > 1 it will be replaced in normalize_rewards
-
-                                                "finish_reason": finish_reason,
-                                                "stop_reason": stop_reason,
-                                                "ended_on_eos": ended_on_eos,
-
-                                                "response_ids": response_ids, # list[int]
-                                                "prompt_ids": prompt_ids, # list[int]
-                                                "response_text": getattr(response, "text", ""),
-                                                "response_len": response_len,
-                                                "truncated": 1 if finish_reason == "length" else 0,
-                                                "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
-                                                    })
+                            action = self.adapter.parse_rollout_output(
+                                {"input_ids": input_ids}, prompt_data
+                            )
+                            response_text = self.adapter.render_output(
+                                prompt_ids, action,
+                                {"response_text": getattr(response, "text", "")},
+                            )
+                            sample = self.adapter.build_training_signal(
+                                inp=prompt_ids,
+                                action=action,
+                                logprobs=response_logprobs,
+                                rewards=rewards_resp,
+                                metadata={
+                                    "nan_mask":       nan_mask,
+                                    "finish_reason":  finish_reason,
+                                    "stop_reason":    stop_reason,
+                                    "response_text":  response_text,
+                                    "eos_id":         self.eos_id,
+                                    "max_seq_len":    self.max_seq_len,
+                                    "iter":           current_iter,
+                                    "loaded_version": self.loaded_version,
+                                },
+                                policy_version=int(policy_version),
+                            )
+                            group_samples.append(sample)
                     self.normalize_rewards(samples=group_samples,
                                            stats=group_stats,
                                            prompt_len=prompt_len,

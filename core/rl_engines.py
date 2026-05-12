@@ -12,6 +12,7 @@ from misc.utils import safe_string_to_torch_dtype, ray_get_with_timeout, set_ran
 from misc.nccl_env import nccl_watchdog_env_vars
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.vllm_engine_async import VLLMRolloutEngineAsync
+from modality.text import TextOnlyAdapter
 import misc.rollout_stats as rollout_stats
 
 Algorithm_Registry = {# supported algorithms
@@ -103,13 +104,24 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
     return ray_runners
 
-def create_rollout_engines(params, reward_fnc, eos_id):
+def _build_adapter(params, adapter):
+    """Return *adapter* as-is, or construct one from ``params.modality.adapter``."""
+    if adapter is not None:
+        return adapter
+    adapter_name = params.modality.adapter if params.modality else "text"
+    if adapter_name == "text":
+        return TextOnlyAdapter(tokenizer=None)
+    raise ValueError(f"Unknown modality.adapter '{adapter_name}'. Supported: 'text'.")
+
+def create_rollout_engines(params, reward_fnc, eos_id, adapter=None):
     '''
         This function is responsible for setting up distributed
         inference/rollout/generation engine.
     '''
     tp = int(params.rollout.tensor_parallel_size)
     rollout_gpus = int(params.run.rollout_gpus)
+
+    adapter = _build_adapter(params, adapter)
 
     kwargs = { # model related arguments
               "model_path":params.model.name,
@@ -140,10 +152,14 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "batch_invariant":params.rollout.batch_invariant,
+
+              "adapter":adapter,
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
     num_engines = max(1, rollout_gpus // tp)
+    print(f"[RolloutEngines] modality adapter: {type(adapter).__name__} "
+          f"({num_engines} engine{'s' if num_engines != 1 else ''})")
     engines = []
     cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
     for i in range(num_engines):
@@ -180,7 +196,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
 
     return engines
 
-def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch):
+def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch, adapter=None):
     '''
        This dataloader is used for rollout generation which
        would be used to train the policy.
@@ -193,6 +209,9 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
     bsz = num_rollout_engines * params.rollout.rollout_batch_size_per_gpu
     # Calculate number of batches from total samples
     num_batches = (samples_per_epoch + bsz - 1) // bsz
+
+    adapter = _build_adapter(params, adapter)
+    print(f"[RolloutDataloader] modality adapter: {type(adapter).__name__}")
 
     dataset, sampler, collate_fn = create_prompt_dataset_and_sampler(
                                                 data_paths=params.data.train_files_path,
@@ -207,6 +226,7 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                                                 steps_per_epoch=num_batches,
                                                 shuffle_within_batch=True,
                                                 dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                adapter=adapter,
                                                 )
     # Seed each DataLoader worker deterministically so any randomness
     # inside __getitem__ / collate_fn is reproducible across runs.

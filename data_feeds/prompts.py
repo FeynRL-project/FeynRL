@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from torch.utils.data import Dataset
 from datasets import load_dataset
 
@@ -6,12 +7,13 @@ class PromptsFeed(Dataset):
     '''
         Returns tokenized prompt ids as a list[int] which can be a variable length.
     '''
-    def __init__(self, 
+    def __init__(self,
                 prompt_key: str,
                 tokenizer,
                 max_seq_len: int,
                 data_path: str,
                 solution_key: str = None,
+                adapter=None,
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
         assert max_seq_len > 0, "max_seq_len must be > 0"
@@ -22,6 +24,7 @@ class PromptsFeed(Dataset):
         assert tokenizer.eos_token_id is not None, "tokenizer must have an eos token"
 
         self.prompt_key  = prompt_key
+        self.adapter     = adapter
 
         # this is required for reward function of datatset where solution is provided.
         if solution_key:
@@ -94,10 +97,14 @@ class PromptsFeed(Dataset):
                                         )
         if self.solution_key:
             solution = sample[self.solution_key]
-            return  {"prompt_token_ids": prompt_ids, "text": prompt_text, "solution": solution}
-
+            raw = {"prompt_token_ids": prompt_ids, "text": prompt_text, "solution": solution}
         else:
-            return  {"prompt_token_ids": prompt_ids, "text": prompt_text}
+            raw = {"prompt_token_ids": prompt_ids, "text": prompt_text}
+
+        if self.adapter is not None:
+            inp, meta = self.adapter.load_sample(raw)
+            return self.adapter.build_rollout_request(inp, meta)
+        return raw
 
 
     def __len__(self):

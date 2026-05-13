@@ -5,6 +5,7 @@ import importlib
 import ray
 import time
 import shutil
+import json
 
 # imports local methods, classes, etc.
 from misc.utils import load_algorithm, ray_get_with_timeout, set_random_seeds
@@ -22,6 +23,20 @@ from core.rl_engines import (Algorithm_Registry,
                             sync_weights_direct,
                             refresh_rollout_engine,
                             reinit_nccl_weight_sync_group)
+
+def _dump_epoch_debug_samples(checkpoint_dir: str, experiment_id: str, epoch_1based: int, samples: list, logger):
+    if not checkpoint_dir or not experiment_id or not samples:
+        return
+    out_dir = os.path.join(checkpoint_dir, experiment_id, "epoch_debug")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"epoch{epoch_1based:06d}_judge_samples.jsonl")
+    try:
+        with open(out_path, "w") as f:
+            for s in samples:
+                f.write(json.dumps(s, ensure_ascii=False) + "\n")
+        logger.info(f"[Epoch {epoch_1based}] Wrote judge samples: {out_path}")
+    except Exception as e:
+        logger.warning(f"[Epoch {epoch_1based}] Failed to write judge samples: {e}")
 
 def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
                    replay_buffer, policy_version, rollout_policy_version, global_step,
@@ -43,7 +58,8 @@ def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
                                        replay_buffer=replay_buffer,
                                        n_samples=n_samples,
                                        logger=logger,
-                                       rollout_timeout=rollout_timeout)
+                                       rollout_timeout=rollout_timeout,
+                                       debug_sample_count=8)
 
     # 3. Prepare training batches
     logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")
@@ -183,7 +199,9 @@ def main(args, config):
     reward_func_name = config.reward.reward_func if config.reward.reward_func else None
     if reward_func_name:
         reward_module = importlib.import_module("rewards." + reward_func_name)
-        reward_fnc = getattr(reward_module, "compute_score")
+        if hasattr(reward_module, "configure"):
+            reward_module.configure(config.reward)
+        reward_fnc = reward_module.compute_score
         logger.info(f"Using reward function: {reward_func_name}")
 
     else:
@@ -349,6 +367,15 @@ def main(args, config):
         policy_version         = result['policy_version']
         rollout_metrics        = result['rollout_metrics']
         rollout_policy_version = result['rollout_policy_version']
+        debug_samples = rollout_metrics.pop("_debug_samples", None)
+        if debug_samples:
+            _dump_epoch_debug_samples(
+                checkpoint_dir=config.run.checkpoint_dir,
+                experiment_id=config.run.experiment_id,
+                epoch_1based=epoch + 1,
+                samples=debug_samples,
+                logger=logger,
+            )
 
         # Log rollout metrics
         time_str = f"time={rollout_metrics['rollout_time']:.2f}s"
@@ -371,7 +398,12 @@ def main(args, config):
                     f"{time_str}, tps={rollout_metrics['tokens_per_sec']:.2f}")
 
         if tracker:
-            rollout_log = {"rollout/" + k: v for k, v in rollout_metrics.items()}
+            # Only log scalar metrics to the tracker.
+            rollout_log = {
+                "rollout/" + k: v
+                for k, v in rollout_metrics.items()
+                if isinstance(v, (int, float, np.floating, np.integer))
+            }
             tracker.log_metrics(rollout_log, step=global_step)
 
         # Log training summary

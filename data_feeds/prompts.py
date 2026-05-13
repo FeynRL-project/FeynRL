@@ -6,12 +6,13 @@ class PromptsFeed(Dataset):
     '''
         Returns tokenized prompt ids as a list[int] which can be a variable length.
     '''
-    def __init__(self, 
+    def __init__(self,
                 prompt_key: str,
                 tokenizer,
                 max_seq_len: int,
                 data_path: str,
                 solution_key: str = None,
+                extra_keys: list = None,
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
         assert max_seq_len > 0, "max_seq_len must be > 0"
@@ -29,6 +30,9 @@ class PromptsFeed(Dataset):
 
         else:
             self.solution_key = None
+
+        # extra dataset fields to pass through to the reward function via prompt_data
+        self.extra_keys = list(extra_keys) if extra_keys else []
 
         self.max_seq_len = int(max_seq_len)
         self.tokenizer   = tokenizer
@@ -92,12 +96,17 @@ class PromptsFeed(Dataset):
                                         return_tensors=None,
                                         skip_special_tokens=False,
                                         )
-        if self.solution_key:
-            solution = sample[self.solution_key]
-            return  {"prompt_token_ids": prompt_ids, "text": prompt_text, "solution": solution}
+        out = {"prompt_token_ids": prompt_ids, "text": prompt_text}
 
-        else:
-            return  {"prompt_token_ids": prompt_ids, "text": prompt_text}
+        if self.solution_key:
+            out["solution"] = sample[self.solution_key]
+
+        for key in self.extra_keys:
+            if key not in sample:
+                raise KeyError(f"extra_key '{key}' missing from sample {idx}: keys={list(sample.keys())}")
+            out[key] = sample[key]
+
+        return out
 
 
     def __len__(self):

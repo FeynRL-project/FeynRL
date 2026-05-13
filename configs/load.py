@@ -140,6 +140,8 @@ class Data(BaseModel):
     prompt_key: str
     answer_key: str
     solution_key: str | None = None
+    # Additional dataset fields passed through to the reward function via prompt_data.
+    extra_keys: list[str] | None = None
 
 class Model(BaseModel):
     '''
@@ -235,6 +237,14 @@ class Reward(BaseModel):
     model_config = ConfigDict(extra='forbid')
     broadcast: bool | None = None
     reward_func: str | None = None
+    # LLM-as-judge configuration (used by llm_judge_reward_func)
+    judge_system_prompt_path: str | None = None
+    judge_base_url: str | None = None
+    judge_model: str | None = None
+    judge_timeout: float | None = 60.0    # seconds per attempt
+    judge_max_retries: int | None = 2     # retries on timeout/connection error
+    judge_max_tokens: int | None = 4096  # max tokens for judge completion (thinking models need more)
+    judge_enable_thinking: bool | None = None  # if set, forwarded to vLLM chat_template_kwargs.enable_thinking
 
 class Overlap(BaseModel):
     '''

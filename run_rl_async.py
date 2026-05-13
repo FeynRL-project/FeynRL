@@ -1030,7 +1030,9 @@ def main(args, config):
     reward_func_name = config.reward.reward_func if config.reward.reward_func else None
     if reward_func_name:
         reward_module = importlib.import_module("rewards." + reward_func_name)
-        reward_fnc    = getattr(reward_module, "compute_score")
+        if hasattr(reward_module, "configure"):
+            reward_module.configure(config.reward)
+        reward_fnc = reward_module.compute_score
         logger.info(f"Using reward function: {reward_func_name}")
 
     else:

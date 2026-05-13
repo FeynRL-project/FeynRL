@@ -156,6 +156,11 @@ def create_rollout_engines(params, reward_fnc, eos_id):
                             # timeout so the job fails fast instead of hanging.
                             **nccl_watchdog_env_vars(),
                            }
+        # Forward VLLM_BASE_URL so reward functions that call an external
+        # LLM endpoint (e.g. llm_judge_reward_func) can resolve it inside
+        # the Ray actor the same way the main process does.
+        if os.environ.get("VLLM_BASE_URL"):
+            rollout_env_vars["VLLM_BASE_URL"] = os.environ["VLLM_BASE_URL"]
         # The goal of batch_invariant is topology-invariance. it means that
         # same prompt → same output regardless of engine count
         if params.rollout.batch_invariant:
@@ -207,6 +212,7 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                                                 steps_per_epoch=num_batches,
                                                 shuffle_within_batch=True,
                                                 dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                extra_keys=getattr(params.data, 'extra_keys', None),
                                                 )
     # Seed each DataLoader worker deterministically so any randomness
     # inside __getitem__ / collate_fn is reproducible across runs.
@@ -333,7 +339,8 @@ def collect_rollouts(dataloader,
                      replay_buffer,
                      n_samples,
                      logger,
-                     rollout_timeout):
+                     rollout_timeout,
+                     debug_sample_count: int = 0):
 
     '''
         This function is used to run rollout engine and generate rollouts/samples.
@@ -357,6 +364,8 @@ def collect_rollouts(dataloader,
                 f"{num_rollout_engines} engines ({prompts_per_engine} prompts/engine/batch), "
                 f"{n_samples} samples/prompt, "
                 f"~{total_prompts * n_samples} expected samples in replay buffer")
+
+    debug_samples = []
 
     for rollout_batch in dataloader:
         # 1. split data across rollout engines
@@ -382,6 +391,26 @@ def collect_rollouts(dataloader,
         rollout_merged, stats = merge_rollout_with_stats(rollout_lists)
         rollout_stats.accumulate(acc, stats)
 
+        # Capture a few representative samples for debugging (driver-side only).
+        if debug_sample_count and len(debug_samples) < debug_sample_count:
+            for s in rollout_merged:
+                if len(debug_samples) >= debug_sample_count:
+                    break
+                debug_samples.append(
+                    {
+                        "iter": int(s.get("iter", epoch)),
+                        "policy_version": int(s.get("policy_version", policy_version)),
+                        "finish_reason": s.get("finish_reason"),
+                        "response_len": int(s.get("response_len", 0)),
+                        "truncated": int(s.get("truncated", 0)),
+                        "seq_truncated": int(s.get("seq_truncated", 0)),
+                        "reward": float(s["pred_rewards"].sum().item()) if "pred_rewards" in s else None,
+                        "prompt_text": s.get("prompt_text", ""),
+                        "response_text": s.get("response_text", ""),
+                        "judge": s.get("judge", None),
+                    }
+                )
+
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
 
@@ -391,7 +420,10 @@ def collect_rollouts(dataloader,
     if acc['total_samples_generated'] == 0:
         logger.warning("No samples generated during rollout phase!")
 
-    return rollout_stats.summarize(acc, rollout_time=time.time() - rollout_start_time)
+    out = rollout_stats.summarize(acc, rollout_time=time.time() - rollout_start_time)
+    if debug_sample_count:
+        out["_debug_samples"] = debug_samples
+    return out
 
 def weighted_sampler_by_recency(replay_buffer,
                                 recency_decay: float,

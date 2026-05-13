@@ -442,6 +442,9 @@ class VLLMRolloutEngine(Base):
                             group_samples.append({ "iter": int(current_iter),
                                                 "policy_version": int(policy_version),
                                                 "loaded_version": int(self.loaded_version),
+                                                # prompt metadata (for debugging / sampling)
+                                                "prompt_text": prompt_data.get("text", ""),
+                                                "rubric": prompt_data.get("rubric", ""),
 
                                                 # token-aligned
                                                 "input_ids": input_ids, #[T]
@@ -465,6 +468,7 @@ class VLLMRolloutEngine(Base):
                                                 "response_ids": response_ids, # list[int]
                                                 "prompt_ids": prompt_ids, # list[int]
                                                 "response_text": getattr(response, "text", ""),
+                                                "judge": getattr(response, "_judge_debug", None),
                                                 "response_len": response_len,
                                                 "truncated": 1 if finish_reason == "length" else 0,
                                                 "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,

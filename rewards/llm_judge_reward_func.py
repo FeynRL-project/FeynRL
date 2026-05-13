@@ -4,7 +4,16 @@ import re
 from typing import Any, Dict, Optional
 
 import torch
-from openai import APIConnectionError, APITimeoutError, OpenAI
+try:
+    from openai import APIConnectionError, APITimeoutError, OpenAI
+except ModuleNotFoundError:  # optional dependency for unit tests / minimal installs
+    OpenAI = None
+
+    class APITimeoutError(Exception):
+        pass
+
+    class APIConnectionError(Exception):
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +58,10 @@ class _LLMJudgeScorer:
         self._client = None
 
     def configure(self, reward_config) -> None:
+        if OpenAI is None:
+            raise RuntimeError(
+                "[LLMJudge] Optional dependency missing: `openai`. Install it to use llm_judge_reward_func."
+            )
         system_prompt_path = getattr(reward_config, "judge_system_prompt_path", None)
         if not system_prompt_path:
             raise RuntimeError("[LLMJudge] reward.judge_system_prompt_path is required.")

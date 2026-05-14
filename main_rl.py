@@ -4,7 +4,7 @@ import configs.load as cfg
 if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_file", type=str, default="./config/rl_args.yaml", help="config file")
+    parser.add_argument("--config_file", "--config", type=str, required=True, help="config file")
     parser.add_argument("--experiment_id", type=str, default="run_1", help="experiment id")
     parser.add_argument("--log_level", type=str, default="INFO", help="logging level")
     parser.add_argument("--resume_from", type=str, default=None,

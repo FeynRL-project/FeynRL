@@ -223,7 +223,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
 if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_file", type=str, default="./config/dummy.yaml", help="config file")
+    parser.add_argument("--config_file", "--config", type=str, required=True, help="config file")
     parser.add_argument("--experiment_id", type=str, default="run_1", help="experiment id")
     parser.add_argument("--log_level", type=str, default="INFO", help="logging level")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to a checkpoint to resume training. It must contain a CHECKPOINT_COMPLETE marker.")

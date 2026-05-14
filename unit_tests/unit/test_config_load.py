@@ -152,6 +152,7 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         "data": {
             "train_files_path": ["data.parquet"], "num_workers": 0,
             "max_seq_len": 256, "prompt_key": "prompt", "answer_key": "answer",
+            "train_ratios": {"data": 1.0},
         },
         "deepspeed": {"zero_optimization": {"stage": 2}},
     }
@@ -178,3 +179,69 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         yaml.dump(config_dict, f)
     config = load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)
     assert config.run.checkpoint_save_interval == 5
+
+
+# ---------------------------------------------------------------------------
+# RL optional-field guards (C2)
+# ---------------------------------------------------------------------------
+
+def _base_rl_config(tmp_path):
+    """Minimal valid RL config for testing required-field guards."""
+    return {
+        "run": {
+            "experiment_id": "test", "seed": 42, "project_name": "p",
+            "tracking_uri": "", "checkpoint_dir": str(tmp_path),
+            "training_gpus": 1, "rollout_gpus": 1,
+            "ray_master_port": 29500,
+            "weight_sync_method": "direct",
+            "init_timeout": 60, "rollout_timeout": 60,
+            "train_step_timeout": 60, "save_timeout": 60, "sync_timeout": 60,
+        },
+        "train": {
+            "optimizer_name": "adamw", "alg_name": "grpo", "lr": 1e-4,
+            "adam_epsilon": 1e-8, "betas": [0.9, 0.99], "weight_decay": 0.01,
+            "warmup_steps_ratio": 0.1, "clip_grad_norm": 1.0,
+            "lr_scheduler": "WarmupCosineLR", "total_number_of_epochs": 10,
+            "train_steps_per_epoch": 10, "train_batch_size_per_gpu": 4,
+            "gradient_accumulation_steps": 1, "val_batch_size_per_gpu": 4,
+            "dynamic_ratio_every_step": False, "normalize_loss": True,
+            "update_after_full_replay": True,
+            "kl_coeff": 0.0, "clip_low": 0.2, "clip_high": 0.2,
+            "entropy_coeff": 0.0,
+        },
+        "reward": {"broadcast": False, "reward_func": "dummy"},
+        "rollout": {
+            "temperature": 1.0, "max_tokens": 128, "n_samples": 4,
+            "top_p": 1.0, "top_k": -1, "ignore_eos": False,
+            "gpu_memory_utilization": 0.5, "force_strict_on_policy": False,
+            "tensor_parallel_size": 1, "rollout_batch_size_per_gpu": 4,
+            "rollout_samples_per_epoch": 100,
+        },
+        "model": {"name": "m", "dtype": "bf16", "trust_remote_code": True},
+        "data": {
+            "train_files_path": ["data.parquet"], "num_workers": 0,
+            "max_seq_len": 256, "prompt_key": "prompt", "answer_key": "answer",
+            "train_ratios": {"data": 1.0},
+        },
+        "deepspeed": {"zero_optimization": {"stage": 2}},
+    }
+
+
+@pytest.mark.parametrize("field,match", [
+    ("train.clip_low",               "clip_low"),
+    ("train.clip_high",              "clip_high"),
+    ("train.kl_coeff",               "kl_coeff"),
+    ("train.entropy_coeff",          "entropy_coeff"),
+    ("train.update_after_full_replay", "update_after_full_replay"),
+    ("data.train_ratios",            "train_ratios"),
+])
+def test_rl_required_field_none_raises(tmp_path, field, match):
+    """Omitting an RL-required Optional field must produce a clear ValueError, not a TypeError."""
+    cfg = _base_rl_config(tmp_path)
+    section, key = field.split(".", 1)
+    del cfg[section][key]   # remove the field so it defaults to None
+    config_file = tmp_path / "config.yaml"
+    with open(config_file, "w") as f:
+        yaml.dump(cfg, f)
+    with pytest.raises(ValueError, match=match):
+        load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)

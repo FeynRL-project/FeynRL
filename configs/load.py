@@ -648,6 +648,21 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
             world_size = config.run.training_gpus
 
+            # Required RL-only training fields — Optional in the schema because they
+            # don't apply to SL/CL, but every RL run must provide them explicitly.
+            if config.train.clip_low is None:
+                raise ValueError("train.clip_low must be specified for rl training")
+            if config.train.clip_high is None:
+                raise ValueError("train.clip_high must be specified for rl training")
+            if config.train.kl_coeff is None:
+                raise ValueError("train.kl_coeff must be specified for rl training")
+            if config.train.entropy_coeff is None:
+                raise ValueError("train.entropy_coeff must be specified for rl training")
+            if config.train.update_after_full_replay is None:
+                raise ValueError("train.update_after_full_replay must be specified for rl training")
+            if config.data.train_ratios is None:
+                raise ValueError("data.train_ratios must be specified for rl training")
+
             # [1-clip_low, 1+clip_high] requires non-negative values
             if config.train.clip_low < 0 or config.train.clip_high < 0:
                 raise ValueError(f"clip_low and clip_high must be >= 0, got {config.train.clip_low} and {config.train.clip_high}.")

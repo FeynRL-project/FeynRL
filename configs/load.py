@@ -802,6 +802,42 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
                     raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")
 
+        elif method == "eval":
+            if config.run.rollout_gpus is None or config.run.rollout_gpus < 1:
+                raise ValueError(f"run.rollout_gpus must be >= 1 for eval, got {config.run.rollout_gpus}")
+
+            tp = config.rollout.tensor_parallel_size if config.rollout else None
+            rg = config.run.rollout_gpus
+            if tp is None or tp < 1:
+                raise ValueError(f"rollout.tensor_parallel_size must be >= 1 for eval, got {tp}")
+
+            if tp > rg:
+                raise ValueError(f"rollout.tensor_parallel_size ({tp}) cannot exceed run.rollout_gpus ({rg})")
+
+            if rg % tp != 0:
+                raise ValueError(f"run.rollout_gpus ({rg}) must be divisible by rollout.tensor_parallel_size ({tp})")
+
+            if config.rollout is None or config.rollout.rollout_batch_size_per_gpu is None or config.rollout.rollout_batch_size_per_gpu < 1:
+                raise ValueError(f"rollout.rollout_batch_size_per_gpu must be >= 1 for eval, got {config.rollout and config.rollout.rollout_batch_size_per_gpu}")
+
+            if config.rollout.n_samples is None or config.rollout.n_samples < 1:
+                raise ValueError(f"rollout.n_samples must be >= 1 for eval, got {config.rollout.n_samples}")
+
+            if config.rollout.max_tokens is None or config.rollout.max_tokens < 1:
+                raise ValueError(f"rollout.max_tokens must be >= 1 for eval, got {config.rollout.max_tokens}")
+
+            if not config.data or not config.data.test_files_path:
+                raise ValueError("data.test_files_path must be specified for eval")
+
+            if config.data.max_seq_len is None or config.data.max_seq_len < 1:
+                raise ValueError(f"data.max_seq_len must be >= 1 for eval, got {config.data.max_seq_len}")
+
+            if not config.reward or not config.reward.reward_func:
+                raise ValueError("reward.reward_func must be specified for eval")
+
+            if config.run.rollout_timeout is None:
+                raise ValueError("run.rollout_timeout must be specified for eval")
+
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:
             try:

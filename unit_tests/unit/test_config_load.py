@@ -178,3 +178,88 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         yaml.dump(config_dict, f)
     config = load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)
     assert config.run.checkpoint_save_interval == 5
+
+
+# ---------------------------------------------------------------------------
+# Eval validator (C1)
+# ---------------------------------------------------------------------------
+
+def _base_eval_config(tmp_path):
+    """Minimal valid eval config."""
+    return {
+        "run": {
+            "experiment_id": "eval-test", "seed": 42, "project_name": "p",
+            "tracking_uri": "", "checkpoint_dir": str(tmp_path),
+            "rollout_gpus": 2,
+            "rollout_timeout": 3600,
+        },
+        "reward": {"broadcast": False, "reward_func": "dummy"},
+        "rollout": {
+            "temperature": 1.0, "max_tokens": 512, "n_samples": 4,
+            "top_p": 1.0, "top_k": -1, "ignore_eos": False,
+            "gpu_memory_utilization": 0.5, "force_strict_on_policy": False,
+            "tensor_parallel_size": 1, "rollout_batch_size_per_gpu": 2,
+        },
+        "model": {"name": "m", "dtype": "bf16", "trust_remote_code": True},
+        "data": {
+            "test_files_path": "test.parquet", "num_workers": 0,
+            "max_seq_len": 512, "prompt_key": "prompt", "answer_key": "answer",
+        },
+    }
+
+
+def test_eval_validator_valid_config(tmp_path):
+    """A fully specified eval config must pass load_and_verify."""
+    cfg = _base_eval_config(tmp_path)
+    config_file = tmp_path / "config.yaml"
+    with open(config_file, "w") as f:
+        yaml.dump(cfg, f)
+    config = load_and_verify(method="eval", input_yaml=str(config_file), experiment_id="e", rank=0)
+    assert config.run.rollout_gpus == 2
+    assert config.rollout.tensor_parallel_size == 1
+
+
+@pytest.mark.parametrize("field,override,match", [
+    # rollout_gpus missing → TypeError replaced by clear ValueError
+    ("run.rollout_gpus", None, "rollout_gpus"),
+    # tensor_parallel_size missing → TypeError replaced by clear ValueError
+    ("rollout.tensor_parallel_size", None, "tensor_parallel_size"),
+    # tp > rollout_gpus (rg=2, tp=4)
+    ("rollout.tensor_parallel_size", 4, "cannot exceed"),
+    # n_samples missing
+    ("rollout.n_samples", None, "n_samples"),
+    # max_tokens missing
+    ("rollout.max_tokens", None, "max_tokens"),
+    # rollout_batch_size_per_gpu missing
+    ("rollout.rollout_batch_size_per_gpu", None, "rollout_batch_size_per_gpu"),
+    # test_files_path empty string (None is rejected by Pydantic; empty string is the realistic bad value)
+    ("data.test_files_path", "", "test_files_path"),
+    # max_seq_len=0 (None is rejected by Pydantic; 0 tests the < 1 validator)
+    ("data.max_seq_len", 0, "max_seq_len"),
+    # reward_func missing
+    ("reward.reward_func", None, "reward_func"),
+    # rollout_timeout missing
+    ("run.rollout_timeout", None, "rollout_timeout"),
+])
+def test_eval_validator_rejects_bad_config(tmp_path, field, override, match):
+    """Each required eval field must produce a clear ValueError when missing or invalid."""
+    cfg = _base_eval_config(tmp_path)
+    section, key = field.split(".", 1)
+    cfg[section][key] = override
+    config_file = tmp_path / "config.yaml"
+    with open(config_file, "w") as f:
+        yaml.dump(cfg, f)
+    with pytest.raises(ValueError, match=match):
+        load_and_verify(method="eval", input_yaml=str(config_file), experiment_id="e", rank=0)
+
+
+def test_eval_validator_rollout_gpus_not_divisible_by_tp(tmp_path):
+    """rollout_gpus not divisible by tensor_parallel_size must be rejected."""
+    cfg = _base_eval_config(tmp_path)
+    cfg["run"]["rollout_gpus"] = 4
+    cfg["rollout"]["tensor_parallel_size"] = 3  # 4 % 3 = 1, not divisible
+    config_file = tmp_path / "config.yaml"
+    with open(config_file, "w") as f:
+        yaml.dump(cfg, f)
+    with pytest.raises(ValueError, match="divisible"):
+        load_and_verify(method="eval", input_yaml=str(config_file), experiment_id="e", rank=0)

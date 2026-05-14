@@ -15,7 +15,7 @@ def test_config_load_sl_success(tmp_path):
         },
         "train": {
             "optimizer_name": "adamw",
-            "alg_name": "sl",
+            "alg_name": "sft",
             "lr": 1e-5,
             "adam_epsilon": 1e-8,
             "betas": [0.9, 0.999],
@@ -178,3 +178,105 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         yaml.dump(config_dict, f)
     config = load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)
     assert config.run.checkpoint_save_interval == 5
+
+
+def _base_rl_config(tmp_path, alg_name="grpo"):
+    return {
+        "run": {
+            "experiment_id": "test", "seed": 42, "project_name": "p",
+            "tracking_uri": "", "checkpoint_dir": str(tmp_path),
+            "training_gpus": 1, "rollout_gpus": 1,
+            "ray_master_port": 29500,
+            "weight_sync_method": "direct",
+            "checkpoint_save_interval": 1,
+            "init_timeout": 60, "rollout_timeout": 60,
+            "train_step_timeout": 60, "save_timeout": 60, "sync_timeout": 60,
+        },
+        "train": {
+            "optimizer_name": "adamw", "alg_name": alg_name, "lr": 1e-4,
+            "adam_epsilon": 1e-8, "betas": [0.9, 0.99], "weight_decay": 0.01,
+            "warmup_steps_ratio": 0.1, "clip_grad_norm": 1.0,
+            "lr_scheduler": "WarmupCosineLR", "total_number_of_epochs": 1,
+            "train_steps_per_epoch": 10, "train_batch_size_per_gpu": 4,
+            "gradient_accumulation_steps": 1, "val_batch_size_per_gpu": 4,
+            "dynamic_ratio_every_step": False, "normalize_loss": True,
+            "update_after_full_replay": True,
+            "kl_coeff": 0.0, "clip_low": 0.2, "clip_high": 0.2,
+            "entropy_coeff": 0.0, "tau": 0.95, "gamma": 0.99,
+        },
+        "reward": {"broadcast": False, "reward_func": "dummy"},
+        "rollout": {
+            "temperature": 1.0, "max_tokens": 128, "n_samples": 4,
+            "top_p": 1.0, "top_k": -1, "ignore_eos": False,
+            "gpu_memory_utilization": 0.5, "force_strict_on_policy": False,
+            "tensor_parallel_size": 1, "rollout_batch_size_per_gpu": 4,
+            "rollout_samples_per_epoch": 100,
+        },
+        "model": {"name": "m", "dtype": "bf16", "trust_remote_code": True, "value_model": "v"},
+        "data": {
+            "train_files_path": ["data.parquet"], "num_workers": 0,
+            "max_seq_len": 256, "prompt_key": "prompt", "answer_key": "answer",
+            "train_ratios": {"data": 1.0},
+        },
+        "deepspeed": {"zero_optimization": {"stage": 2}},
+    }
+
+
+def _sl_config(tmp_path, alg_name="sft"):
+    return {
+        "run": {
+            "experiment_id": "test", "seed": 42, "project_name": "p",
+            "tracking_uri": "", "checkpoint_dir": str(tmp_path),
+        },
+        "train": {
+            "optimizer_name": "adamw", "alg_name": alg_name, "lr": 1e-5,
+            "adam_epsilon": 1e-8, "betas": [0.9, 0.999], "weight_decay": 0.01,
+            "warmup_steps_ratio": 0.1, "clip_grad_norm": 1.0,
+            "lr_scheduler": "WarmupCosineLR", "total_number_of_epochs": 1,
+            "micro_batches_per_epoch": 10, "train_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1, "val_batch_size_per_gpu": 2,
+            "dynamic_ratio_every_step": False, "normalize_loss": True,
+        },
+        "model": {"name": "m", "dtype": "bf16", "trust_remote_code": True},
+        "data": {
+            "train_files_path": ["data.jsonl"], "val_files_path": ["val.jsonl"],
+            "num_workers": 0, "max_seq_len": 512,
+            "prompt_key": "prompt", "answer_key": "answer",
+        },
+        "deepspeed": {"zero_optimization": {"stage": 2}},
+    }
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("GRPO", "grpo"),
+    ("Grpo", "grpo"),
+    ("PPO", "ppo"),
+    ("P3O", "p3o"),
+])
+def test_alg_name_uppercased_is_normalized(tmp_path, raw, expected):
+    cfg = _base_rl_config(tmp_path)
+    cfg["train"]["alg_name"] = raw
+    config_file = tmp_path / "config.yaml"
+    with open(config_file, "w") as f:
+        yaml.dump(cfg, f)
+    config = load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)
+    assert config.train.alg_name == expected
+
+
+@pytest.mark.parametrize("method,alg_name", [
+    ("rl", "unknown_alg"),
+    ("rl", "sft"),
+    ("sl", "grpo"),
+    ("sl", "unknown_alg"),
+])
+def test_alg_name_invalid_for_method_raises(tmp_path, method, alg_name):
+    if method == "rl":
+        cfg = _base_rl_config(tmp_path)
+    else:
+        cfg = _sl_config(tmp_path)
+    cfg["train"]["alg_name"] = alg_name
+    config_file = tmp_path / "config.yaml"
+    with open(config_file, "w") as f:
+        yaml.dump(cfg, f)
+    with pytest.raises(ValueError, match="is not supported for"):
+        load_and_verify(method=method, input_yaml=str(config_file), experiment_id="e", rank=0)

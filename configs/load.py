@@ -550,6 +550,10 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         if config.model and config.model.value_model is not None and config.model.value_model.strip() == "":
             config.model.value_model = None
 
+        # Normalize alg_name to lowercase once so all downstream comparisons are case-insensitive.
+        if config.train and config.train.alg_name:
+            config.train.alg_name = config.train.alg_name.lower()
+
         config.run.method = method
 
         # Common pre-training checks
@@ -601,6 +605,26 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                     raise ValueError(f"lora_rank must be >= 1 when use_peft=True, got {config.peft.lora_rank}")
                 if config.peft.lora_alpha is None or config.peft.lora_alpha < 1:
                     raise ValueError(f"lora_alpha must be >= 1 when use_peft=True, got {config.peft.lora_alpha}")
+
+        # Per-method alg_name allowlists — validated after normalization to catch "PPO", "Grpo", etc.
+        _RL_ALGS = {"grpo", "cispo", "ppo", "p3o", "p4o"}
+        _SL_ALGS = {"sft"}
+        _CL_ALGS = {"dpo"}
+        if method == "rl" and config.train and config.train.alg_name not in _RL_ALGS:
+            raise ValueError(
+                f"train.alg_name '{config.train.alg_name}' is not supported for rl training. "
+                f"Supported: {sorted(_RL_ALGS)}"
+            )
+        if method == "sl" and config.train and config.train.alg_name not in _SL_ALGS:
+            raise ValueError(
+                f"train.alg_name '{config.train.alg_name}' is not supported for sl training. "
+                f"Supported: {sorted(_SL_ALGS)}"
+            )
+        if method == "cl" and config.train and config.train.alg_name not in _CL_ALGS:
+            raise ValueError(
+                f"train.alg_name '{config.train.alg_name}' is not supported for cl training. "
+                f"Supported: {sorted(_CL_ALGS)}"
+            )
 
         # Method-specific checks
         if method == "sl":

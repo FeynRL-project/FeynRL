@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
 import yaml
 import sys
@@ -249,7 +249,7 @@ class Overlap(BaseModel):
 
 class Modality(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    adapter: str = "text"
+    adapter: Literal["text"] = "text"
 
 class Rollout(BaseModel):
     '''
@@ -295,7 +295,7 @@ class Config(BaseModel):
     # Value model DeepSpeed config
     deepspeed_value: DeepSpeed | None = None
 
-    modality: Modality = Field(default_factory=lambda: Modality())
+    modality: Modality = Field(default_factory=Modality)
 
     # peft specific config
     peft: Peft = Field(default_factory=lambda: Peft(use_peft=False))

@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 from torch.utils.data import Dataset
 from datasets import load_dataset
 

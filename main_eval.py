@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 import ray
 import time
 from tqdm import tqdm
+from typing import Optional
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -18,6 +19,7 @@ from rollouts.vllm_engine import VLLMRolloutEngine
 from misc.utils import set_random_seeds, ray_get_with_timeout, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 from rollouts.replay_buffer import ReplayBuffer
+from modality import ModalityAdapter, TextOnlyAdapter
 
 
 def setup_ray(ray_address):
@@ -59,17 +61,36 @@ def load_tokenizer(model_name, trust_remote_code=False, rank=0):
 
     return tokenizer
 
-def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
+def _build_adapter(params, adapter: Optional[ModalityAdapter] = None) -> ModalityAdapter:
+    """
+    Mirror the modality-adapter wiring used by the training entrypoints.
+
+    main_eval.py historically instantiated rollout engines directly; after PR #67
+    rollout engines require an explicit adapter instance.
+    """
+    if adapter is not None:
+        return adapter
+    adapter_name = "text"
+    if getattr(params, "modality", None) is not None:
+        adapter_name = getattr(params.modality, "adapter", "text")
+    if adapter_name == "text":
+        return TextOnlyAdapter(tokenizer=None)
+    raise ValueError(f"Unknown modality.adapter '{adapter_name}'. Supported: ['text'].")
+
+
+def create_rollout_dataloader(params, tokenizer, num_rollout_engines, adapter: Optional[ModalityAdapter] = None):
     '''
        This dataloader is used for rollout generation which 
        would be used to train the policy.
     '''
+    adapter = _build_adapter(params, adapter)
     # 1. Initialize our custom datasets
     prompt_ds = PromptsFeed(prompt_key=params.data.prompt_key,
                             max_seq_len=params.data.max_seq_len,
                             tokenizer=tokenizer,
                             data_path=params.data.test_files_path,
                             solution_key=params.data.solution_key,
+                            adapter=adapter,
                             )
 
     # since we split the data across the rollout engines
@@ -84,13 +105,14 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
                             )
     return dataloader
 
-def create_rollout_engines(params, reward_fnc, eos_id):
+def create_rollout_engines(params, reward_fnc, eos_id, adapter: Optional[ModalityAdapter] = None):
     '''
         This function is responsible for setting up distributed
         inference/rollout/generation engine.
     '''
     tp = int(params.rollout.tensor_parallel_size)
     rollout_gpus = int(params.run.rollout_gpus)
+    adapter = _build_adapter(params, adapter)
 
     kwargs = { # model related arguments
               "model_path":params.model.name,
@@ -121,6 +143,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "batch_invariant":params.rollout.batch_invariant,
+              "adapter":adapter,
             }
 
     # if model doesn't fit in one gpu, tp can be > 1

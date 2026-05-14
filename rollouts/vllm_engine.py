@@ -57,11 +57,7 @@ class VLLMRolloutEngine(Base):
         if os.getcwd() not in sys.path:
             sys.path.append(os.getcwd())
 
-        # modality adapter — routes request building and training-signal
-        # construction; defaults to TextOnlyAdapter when None is passed.
-        if adapter is None:
-            from modality.text import TextOnlyAdapter
-            adapter = TextOnlyAdapter(tokenizer=None)
+        assert adapter is not None, "adapter must be provided; use _build_adapter in rl_engines.py"
         self.engine_id = int(engine_id)
         self.adapter = adapter
         self.log(f"Modality adapter: {type(self.adapter).__name__}")
@@ -379,7 +375,6 @@ class VLLMRolloutEngine(Base):
                         finish_reason = getattr(response, "finish_reason", None)
                         stop_reason   = getattr(response, "stop_reason", None)
 
-                        seq_len = prompt_len + response_len
                         input_ids = torch.tensor(prompt_ids + response_ids, dtype=torch.int64, device='cpu')
 
                         rewards_resp, is_per_token, correct_threshold = all_rewards[reward_idx]

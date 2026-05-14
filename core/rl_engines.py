@@ -12,7 +12,7 @@ from misc.utils import safe_string_to_torch_dtype, ray_get_with_timeout, set_ran
 from misc.nccl_env import nccl_watchdog_env_vars
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.vllm_engine_async import VLLMRolloutEngineAsync
-from modality.text import TextOnlyAdapter
+from modality import ModalityAdapter, TextOnlyAdapter
 import misc.rollout_stats as rollout_stats
 
 Algorithm_Registry = {# supported algorithms
@@ -104,14 +104,22 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
     return ray_runners
 
-def _build_adapter(params, adapter):
+_ADAPTER_REGISTRY: dict[str, type[ModalityAdapter]] = {
+    "text": TextOnlyAdapter,
+}
+
+def _build_adapter(params, adapter: ModalityAdapter | None) -> ModalityAdapter:
     """Return *adapter* as-is, or construct one from ``params.modality.adapter``."""
     if adapter is not None:
         return adapter
     adapter_name = params.modality.adapter if params.modality else "text"
-    if adapter_name == "text":
-        return TextOnlyAdapter(tokenizer=None)
-    raise ValueError(f"Unknown modality.adapter '{adapter_name}'. Supported: 'text'.")
+    cls = _ADAPTER_REGISTRY.get(adapter_name)
+    if cls is None:
+        raise ValueError(
+            f"Unknown modality.adapter '{adapter_name}'. "
+            f"Supported: {list(_ADAPTER_REGISTRY)!r}."
+        )
+    return cls(tokenizer=None)
 
 def create_rollout_engines(params, reward_fnc, eos_id, adapter=None):
     '''

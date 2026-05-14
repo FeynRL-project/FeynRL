@@ -11,7 +11,9 @@ class TextOnlyAdapter(ModalityAdapter):
 
     Wraps the prompt/response format already used by ``PromptsFeed`` and
     ``VLLMRolloutEngine`` with no behaviour changes.  Metrics and loss values
-    are bit-for-bit identical to the pre-adapter code path.
+    are identical to the pre-adapter code path.  The training-signal dict
+    additionally carries ``encoder_inputs: None`` to establish a uniform schema
+    across all adapters.
 
     Parameters
     ----------
@@ -98,8 +100,7 @@ class TextOnlyAdapter(ModalityAdapter):
         ``ReplayBuffer.add_batch_seqs``.
 
         Reproduces the token-aligned and prediction-aligned tensor construction
-        that ``VLLMRolloutEngine.generate`` currently performs inline.  The
-        output is bit-for-bit identical to the pre-adapter code path.
+        that ``VLLMRolloutEngine.generate`` previously performed inline.
 
         Parameters
         ----------

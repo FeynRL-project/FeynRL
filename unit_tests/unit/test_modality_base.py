@@ -1,12 +1,11 @@
 """Unit tests for modality/base.py and modality/text.py.
 
 These tests cover:
-  - Trajectory dataclass construction and field defaults
   - ModalityAdapter cannot be instantiated directly (it is abstract)
   - TextOnlyAdapter implements every abstract method correctly
   - Round-trip: load_sample → build_rollout_request preserves all fields
   - parse_rollout_output extracts exactly the response slice
-  - render_output delegates to tokenizer.decode
+  - render_output uses vLLM-decoded text when available, falls back to tokenizer.decode
   - build_training_signal produces a ReplayBuffer-compatible dict
 """
 
@@ -14,51 +13,8 @@ import pytest
 import torch
 from unittest.mock import MagicMock
 
-from modality.base import ModalityAdapter, Trajectory
+from modality.base import ModalityAdapter
 from modality.text import TextOnlyAdapter
-
-
-# ---------------------------------------------------------------------------
-# Trajectory
-# ---------------------------------------------------------------------------
-
-def test_trajectory_all_fields():
-    inp = [1, 2, 3]
-    action = torch.tensor([4, 5])
-    rendered = "hello"
-    reward = torch.tensor([0.0, 1.0])
-    sig = {"input_ids": torch.tensor([1, 2, 3, 4, 5])}
-
-    t = Trajectory(
-        input=inp,
-        action=action,
-        rendered_output=rendered,
-        reward=reward,
-        training_signal=sig,
-    )
-
-    assert t.input is inp
-    assert torch.equal(t.action, action)
-    assert t.rendered_output == rendered
-    assert torch.equal(t.reward, reward)
-    assert t.training_signal is sig
-    assert t.metadata == {}
-
-
-def test_trajectory_metadata_default_is_independent():
-    t1 = Trajectory(input=[], action=torch.tensor([]), rendered_output=None,
-                    reward=torch.tensor([]), training_signal={})
-    t2 = Trajectory(input=[], action=torch.tensor([]), rendered_output=None,
-                    reward=torch.tensor([]), training_signal={})
-    t1.metadata["key"] = "val"
-    assert "key" not in t2.metadata, "default_factory must produce separate dicts"
-
-
-def test_trajectory_explicit_metadata():
-    meta = {"solution": "42"}
-    t = Trajectory(input=[], action=torch.tensor([]), rendered_output=None,
-                   reward=torch.tensor([]), training_signal={}, metadata=meta)
-    assert t.metadata["solution"] == "42"
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +136,13 @@ def test_parse_rollout_output_empty_response(adapter):
 # ---------------------------------------------------------------------------
 # render_output
 # ---------------------------------------------------------------------------
+
+def test_render_output_uses_response_text_from_metadata(adapter, tokenizer):
+    action = torch.tensor([10, 20, 30])
+    result = adapter.render_output(inp=[1, 2], action=action, metadata={"response_text": "vllm decoded"})
+    tokenizer.decode.assert_not_called()
+    assert result == "vllm decoded"
+
 
 def test_render_output_calls_tokenizer_decode(adapter, tokenizer):
     action = torch.tensor([10, 20, 30])

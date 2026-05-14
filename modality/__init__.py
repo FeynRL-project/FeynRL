@@ -1,4 +1,4 @@
-from modality.base import ModalityAdapter, Trajectory
+from modality.base import ModalityAdapter
 from modality.text import TextOnlyAdapter
 
-__all__ = ["Trajectory", "ModalityAdapter", "TextOnlyAdapter"]
+__all__ = ["ModalityAdapter", "TextOnlyAdapter"]

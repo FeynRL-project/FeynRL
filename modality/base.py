@@ -2,43 +2,7 @@ from __future__ import annotations
 
 import torch
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import Any
-
-
-@dataclass
-class Trajectory:
-    """One environment step: modality input → model action → reward signal.
-
-    Attributes
-    ----------
-    input:
-        Raw modality-specific input.  For text this is a ``list[int]`` of
-        prompt token ids; for audio it is a ``np.ndarray`` waveform; for
-        vision it is an image tensor.
-    action:
-        Generated response as token ids, shape ``[R]``.
-    rendered_output:
-        Reward-function-visible form of the action.  For text output this is
-        a decoded string; for audio output it could be a waveform array.
-    reward:
-        Per-action-token reward tensor, shape ``[R]``.
-    training_signal:
-        Dict consumed by ``ReplayBuffer.add_batch_seqs`` and the trainer.
-        Must contain at minimum: ``input_ids``, ``pred_rewards``,
-        ``pred_zscores``, ``pred_masks``, ``pred_dones``,
-        ``pred_old_logprobs``, ``policy_version``, ``response_len``.
-        Encoder-decoder models additionally include an ``encoder_inputs`` key.
-    metadata:
-        Arbitrary pass-through data (solution strings, sample ids, …).
-    """
-
-    input: Any
-    action: torch.Tensor
-    rendered_output: Any
-    reward: torch.Tensor
-    training_signal: dict
-    metadata: dict = field(default_factory=dict)
 
 
 class ModalityAdapter(ABC):
@@ -49,8 +13,8 @@ class ModalityAdapter(ABC):
 
     The adapter is the *only* place that knows about modality-specific
     encoding.  Everything above it (replay buffer, algorithms) operates on
-    ``Trajectory`` or its ``training_signal`` dict and never inspects the
-    raw ``input``.
+    the adapter-produced ``training_signal`` dict and never inspects the raw
+    modality input.
     """
 
     # ------------------------------------------------------------------

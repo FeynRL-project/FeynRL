@@ -479,11 +479,13 @@ def shard_and_put(batches, num_engines):
         shard_refs.append(ray.put(shard))
 
     if len(set(shard_sizes)) > 1:
-        print(f"[shard_and_put] SHARD SIZE MISMATCH: {shard_sizes}. "
-              f"This WILL cause a ZeRO-3 collective deadlock!", flush=True)
-    else:
-        print(f"[shard_and_put] {num_engines} shards, {shard_sizes[0]} micro-batches each "
-              f"(total={len(batches)})", flush=True)
+        raise RuntimeError(
+            f"[shard_and_put] SHARD SIZE MISMATCH: {shard_sizes}. "
+            f"This will cause a ZeRO-3 collective deadlock. "
+            f"prepare_training_batches must produce a batch count divisible by num_engines ({num_engines})."
+        )
+    print(f"[shard_and_put] {num_engines} shards, {shard_sizes[0]} micro-batches each "
+          f"(total={len(batches)})", flush=True)
 
     return shard_refs
 

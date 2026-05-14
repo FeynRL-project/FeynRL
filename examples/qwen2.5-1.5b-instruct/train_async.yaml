@@ -10,7 +10,7 @@ run:
   ray_master_port: 29500
   seed: 42
 
-  weight_sync_method: "direct"
+  weight_sync_method: "nccl"
   checkpoint_save_interval: 15
 
   nccl_socket_ifname: null

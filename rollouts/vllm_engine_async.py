@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import tempfile
 import torch
 import torch.distributed
 import gc
@@ -602,7 +603,7 @@ class VLLMRolloutEngineAsync(Base):
 
     def update_weights_direct(self, state_dict: dict, version: int) -> bool:
         '''
-            Fallback weight update via /dev/shm pickle path.
+            Fallback weight update via pickle file (path from FEYNRL_SHM_DIR or /dev/shm).
             state_dict: {param_name: cpu_tensor} from training engine rank 0.
         '''
         if self.async_engine is None:
@@ -613,14 +614,16 @@ class VLLMRolloutEngineAsync(Base):
             self.log(f"Model already at version {version}, skipping weight update")
             return True
 
-        shm_path = f"/dev/shm/feynrl_weights_{os.getpid()}_v{version}.pkl"
+        _default_shm = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+        shm_dir = os.environ.get("FEYNRL_SHM_DIR", _default_shm)
+        shm_path = os.path.join(shm_dir, f"feynrl_weights_{os.getpid()}_v{version}.pkl")
         with open(shm_path, 'wb') as f:
             pickle.dump(state_dict, f)
 
-        # Free the CPU state_dict now that it's persisted to /dev/shm.
+        # Free the CPU state_dict now that it's persisted to disk.
         # The TP workers will read from the file, so we don't need this copy.
         del state_dict
-        self.log(f"Updating weights directly to version {version}")
+        self.log(f"Updating weights directly to version {version} via {shm_dir}")
         try:
             results = self.run_async(self.async_engine.collective_rpc("update_weights_from_state", args=(shm_path,)))
 

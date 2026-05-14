@@ -1,6 +1,7 @@
 import os
 import sys
 import glob
+import tempfile
 import torch
 import gc
 import ray
@@ -219,25 +220,27 @@ class VLLMRolloutEngine(Base):
         # vllm collective_rpc serializes args with msgspec, which cannot encode
         # strings or bytes larger than 4GB. For large models the pickled
         # state_dict easily exceeds that. Instead of sending weight data through
-        # msgspec, we pickle to /dev/shm, a ram-backed tmpfs which has no real disk I/O,
-        # just a memcpy into kernel page cache, and pass only the ~50-byte file
-        # path through collective_rpc. Each TP worker then reads the file
+        # msgspec, we pickle to a fast local directory and pass only the ~50-byte
+        # file path through collective_rpc. Each TP worker then reads the file
         # independently. This works across multi-node setups because:
         #   1. Ray delivers state_dict to this actor on its node via object store
-        #   2. This actor writes to /dev/shm on its node
+        #   2. This actor writes the file on its node
         #   3. collective_rpc fans out to TP workers on the same node
-        #   4. Workers read from the same local /dev/shm
+        #   4. Workers read from the same local path
         # Each rollout engine on a different node writes its own file (PID in name).
         # collective_rpc is synchronous, so the file is guaranteed to exist until
         # all workers finish, and the finally block cleans it up afterward.
-        shm_path = f"/dev/shm/feynrl_weights_{os.getpid()}_v{version}.pkl"
+        # Override the directory with FEYNRL_SHM_DIR for non-Linux or small-tmpfs.
+        _default_shm = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+        shm_dir = os.environ.get("FEYNRL_SHM_DIR", _default_shm)
+        shm_path = os.path.join(shm_dir, f"feynrl_weights_{os.getpid()}_v{version}.pkl")
         with open(shm_path, 'wb') as f:
             pickle.dump(state_dict, f)
 
-        # Free the CPU state_dict now that it's persisted to /dev/shm.
+        # Free the CPU state_dict now that it's persisted to disk.
         # The TP workers will read from the file, so we don't need this copy.
         del state_dict
-        self.log(f"Updating weights directly to version {version}")
+        self.log(f"Updating weights directly to version {version} via {shm_dir}")
         try:
             results = self.vllm_engine.collective_rpc("update_weights_from_state", args=(shm_path,))
 

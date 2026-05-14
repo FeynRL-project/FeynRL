@@ -120,6 +120,24 @@ vLLM is memory-intensive. If you encounter OOM:
 2. **Use Shared Storage**: For multi-node, use a **shared filesystem** for `checkpoint_dir`.
 3. **Sync Check**: With `weight_sync_method: nccl` or `direct`, disk checkpoints are only written at the periodic save schedule (or final epoch); verify the sync logs show success between saves.
 
+### `OSError: No space left on device` during `direct` weight sync
+
+The `direct` sync path pickles the training weights to a temporary file and passes only the file path to the vLLM TP workers. By default the file is written to `/dev/shm` on Linux (a RAM-backed tmpfs), or `tempfile.gettempdir()` on other platforms.
+
+Docker containers start with a 64 MB `/dev/shm` by default. A 7B model state dict can easily exceed that:
+
+```
+OSError: [Errno 28] No space left on device: '/dev/shm/feynrl_weights_12345_v3.pkl'
+```
+
+**Fix:** either increase the container's shared-memory size (`--shm-size 32g` in `docker run`), or redirect the temp file to a larger filesystem:
+
+```bash
+export FEYNRL_SHM_DIR=/tmp   # any directory with enough free space
+```
+
+On Linux clusters where `/dev/shm` is large, leave `FEYNRL_SHM_DIR` unset to use RAM-backed I/O (faster than `/tmp`).
+
 ### Weight Synchronization Methods
 The `weight_sync_method` config knob selects how training rank 0 transfers updated weights to the rollout workers. The config validator at [`configs/load.py:680-686`](../configs/load.py#L680-L686) couples this knob tightly to `overlap.enabled`: **overlap (async) mode requires `nccl`, and sync mode forbids `nccl`** (because the non-async vLLM engine has no NCCL weight-sync path).
 

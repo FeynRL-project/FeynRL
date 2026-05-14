@@ -802,6 +802,14 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
                     raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")
 
+                if config.rollout and config.rollout.force_strict_on_policy and config.overlap.max_lag > 1:
+                    raise ValueError(
+                        f"force_strict_on_policy=True is incompatible with overlap.enabled=True "
+                        f"when overlap.max_lag > 1 (got max_lag={config.overlap.max_lag}). "
+                        f"Overlap mode produces off-policy data by design. "
+                        f"Set force_strict_on_policy=False or overlap.max_lag=1."
+                    )
+
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:
             try:

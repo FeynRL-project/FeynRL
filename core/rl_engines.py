@@ -133,7 +133,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "eos_id":eos_id,
               "tensor_parallel_size":tp,
               "model_dtype":params.model.dtype,
-              "max_seq_len":params.data.max_seq_len,
+              "max_prompt_len":params.data.max_prompt_len,
               "max_model_len":params.rollout.max_model_len,
 
               # reward related arguments
@@ -198,7 +198,7 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                                                 data_paths=params.data.train_files_path,
                                                 prompt_key=params.data.prompt_key,
                                                 solution_key=params.data.solution_key,
-                                                max_seq_len=params.data.max_seq_len,
+                                                max_prompt_len=params.data.max_prompt_len,
                                                 tokenizer=tokenizer,
                                                 train_ratios=params.data.train_ratios,
                                                 seed=params.run.seed,
@@ -891,7 +891,7 @@ def format_rollout_lens_ratios(rollout_acc, samples):
                      (finish_reason==length). The actionable signal:
                      high values mean max_tokens is binding and it should be lowered.
         eos%       = sequences that ended cleanly on EOS.
-        seq_drop%  = sequences whose prompt+response > max_seq_len, which
+        seq_drop%  = sequences whose total length > max_prompt_len + max_tokens, which
                      would be silently dropped by replay_buffer.
         Empty completions (response_len==0) are NOT in samples, they're filtered at the rollout engine
         before the accumulator sees them as shown in [postprocess].

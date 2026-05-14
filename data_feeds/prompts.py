@@ -9,12 +9,12 @@ class PromptsFeed(Dataset):
     def __init__(self, 
                 prompt_key: str,
                 tokenizer,
-                max_seq_len: int,
+                max_prompt_len: int,
                 data_path: str,
                 solution_key: str = None,
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
-        assert max_seq_len > 0, "max_seq_len must be > 0"
+        assert max_prompt_len > 0, "max_prompt_len must be > 0"
         assert tokenizer is not None, "tokenizer cannot be None"
         assert isinstance(data_path, str), "data_path must be a string"
         assert os.path.exists(os.path.expanduser(data_path)), f"{data_path} does not exist"
@@ -30,7 +30,7 @@ class PromptsFeed(Dataset):
         else:
             self.solution_key = None
 
-        self.max_seq_len = int(max_seq_len)
+        self.max_prompt_len = int(max_prompt_len)
         self.tokenizer   = tokenizer
         self.data_path   = data_path
         self._load_data()
@@ -80,9 +80,9 @@ class PromptsFeed(Dataset):
             raise ValueError(f"Sample {idx}:{sample}: tokenization produced empty prompt_ids")
 
         # Validate prompt length
-        if len(prompt_ids) >= self.max_seq_len:
+        if len(prompt_ids) >= self.max_prompt_len:
             raise ValueError(f"Prompt in sample {idx}:{sample}: too long: "
-                             f"prompt must be at most {self.max_seq_len} tokens (got {len(prompt_ids)})")
+                             f"prompt must be at most {self.max_prompt_len} tokens (got {len(prompt_ids)})")
 
         # Get the prompt text for debugging.
         prompt_text = self.tokenizer.apply_chat_template(
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     dataset = PromptsFeed(
                         prompt_key="prompt",
                         tokenizer=tokenizer,
-                        max_seq_len=1024,
+                        max_prompt_len=1024,
                         data_path="./promptonly.parquet",
                         solution_key="",
                         )
@@ -153,7 +153,7 @@ if __name__ == "__main__":
     concat_ds, sampler, collate_fn = create_prompt_dataset_and_sampler(data_paths=["./promptonly.parquet"],
                                       prompt_key="prompt",
                                       solution_key="solution",
-                                      max_seq_len=1024,
+                                      max_prompt_len=1024,
                                       tokenizer=tokenizer,
                                       train_ratios={"promptonly":1},
                                       seed=42,

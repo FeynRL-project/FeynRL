@@ -223,9 +223,9 @@ def main(args, config):
 
     # replay buffer size = rollout_samples_per_epoch (prompts) * n_samples (completions per prompt)
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
-                                 max_seq_len=config.data.max_seq_len,
+                                 max_total_len=config.data.max_prompt_len + config.rollout.max_tokens,
                                  )
-    logger.info(f"Replay buffer initialized (max_seq_len={config.data.max_seq_len})")
+    logger.info(f"Replay buffer initialized (max_total_len={config.data.max_prompt_len + config.rollout.max_tokens})")
 
     ########
     # 8. Some variables initialization

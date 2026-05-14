@@ -230,7 +230,7 @@ def compute_pipeline_capacities(rollout_samples_per_epoch, rollout_batch_size_pe
     '''
     # Actual number of prompts per dataloader pass, rounded up to batch boundary.
     # Matches core/rl_engines.create_rollout_dataloader. This is an UPPER bound, actual
-    # fill may be lower due to sequences dropped at max_seq_len or failed generations
+    # fill may be lower due to sequences dropped at max_prompt_len or failed generations
     # At policy version T with max_lag=N, the buffer holds data from versions {T-N+1, ..., T}
     bsz_rollout        = num_rollout_engines * rollout_batch_size_per_gpu
     prompt_per_pass    = math.ceil(rollout_samples_per_epoch / bsz_rollout) * bsz_rollout
@@ -425,7 +425,7 @@ def wait_for_pull_loops(pull_refs, prompt_queue, results_queue, replay_buffer,
 def wait_for_round_completion(results_queue, replay_buffer, rollout_acc, target_shards, timeout, pull_refs, logger):
     '''
         Blocking drain into replay_buffer until target_shards arrive. Shard count is used
-        because sequences dropped at max_seq_len make item counts lossy, while shard count
+        because sequences dropped at max_prompt_len make item counts lossy, while shard count
         reliably tracks rollout work done.
         Since partial rounds would desync the dataloader from training rounds and mask a real
         rollout bottleneck, it raises TimeoutError. Raise run.rollout_timeout if slow.
@@ -725,8 +725,8 @@ def run_round(epoch, training_engines, rollout_engines,
                            f"{len(replay_buffer)} < {min_buffer_items} (train_batch_size × num_engines). "
                            f"Drained {shards_received}/{wait_target} shards (round_target={round_target_shards}, "
                            f"carryover={carryover_shards}). "
-                           f"Likely rollout stall, or too many sequences exceeded max_seq_len. "
-                           f"Check rollout engine health and data.max_seq_len vs rollout.max_tokens.")
+                           f"Likely rollout stall, or too many prompts exceeded data.max_prompt_len. "
+                           f"Check rollout engine health and data.max_prompt_len / rollout.max_tokens.")
 
     # Step 2: Build training shards once from the full buffer snapshot
     build_start   = time.time()
@@ -1089,7 +1089,7 @@ def main(args, config):
     overlap_max_lag = config.overlap.max_lag
 
     # Buffer sizing: items_per_round × max_lag. Upper bound — actual fill may
-    # be lower due to sequences dropped at max_seq_len or failed generations.
+    # be lower due to sequences dropped at max_prompt_len or failed generations.
     (replay_buffer_size, results_queue_maxsize, prompt_queue_maxsize,
                          items_per_round_theoretical) = compute_pipeline_capacities(rollout_samples_per_epoch=config.rollout.rollout_samples_per_epoch,
                                                                                     rollout_batch_size_per_gpu=config.rollout.rollout_batch_size_per_gpu,
@@ -1103,12 +1103,12 @@ def main(args, config):
     # target for wait_for_round_completion's blocking drain.
     target_shards_per_round = len(rollout_dataloader) * num_rollout_engines
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
-                                 max_seq_len=config.data.max_seq_len,
+                                 max_total_len=config.data.max_prompt_len + config.rollout.max_tokens,
                                  max_size=replay_buffer_size,
                                  )
     logger.info(f"Pipeline capacities: replay_buffer={replay_buffer_size}, "
                 f"results_queue={results_queue_maxsize}, prompt_queue={prompt_queue_maxsize}, "
-                f"max_seq_len={config.data.max_seq_len}")
+                f"max_total_len={config.data.max_prompt_len + config.rollout.max_tokens}")
 
     ########
     # 9. Resume from checkpoint if requested and clean up incomplete checkpoint directories

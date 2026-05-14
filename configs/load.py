@@ -136,7 +136,8 @@ class Data(BaseModel):
     val_files_path: list[str] = None
     test_files_path: str = None
     num_workers: int
-    max_seq_len: int
+    max_seq_len: int | None = None    # SL/CL: total sequence truncation length
+    max_prompt_len: int | None = None  # RL/eval: maximum prompt token length
     prompt_key: str
     answer_key: str
     solution_key: str | None = None
@@ -585,9 +586,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if not config.data.train_files_path:
                 raise ValueError("data.train_files_path must be a non-empty list")
 
-            if config.data.max_seq_len < 1:
-                raise ValueError(f"data.max_seq_len must be >= 1, got {config.data.max_seq_len}")
-
             if config.data.num_workers < 0:
                 raise ValueError(f"data.num_workers must be >= 0, got {config.data.num_workers}")
 
@@ -607,6 +605,9 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if world_size is None:
                 raise ValueError("world_size must be specified for SL training")
 
+            if config.data.max_seq_len is None or config.data.max_seq_len < 1:
+                raise ValueError(f"data.max_seq_len must be >= 1 for SL training, got {config.data.max_seq_len}")
+
             if config.train.micro_batches_per_epoch is None or config.train.micro_batches_per_epoch < 1:
                 raise ValueError(f"micro_batches_per_epoch must be >= 1 for SL, got {config.train.micro_batches_per_epoch}")
 
@@ -619,6 +620,9 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
         elif method == "cl":
             if world_size is None:
                 raise ValueError("world_size must be specified for CL training")
+
+            if config.data.max_seq_len is None or config.data.max_seq_len < 1:
+                raise ValueError(f"data.max_seq_len must be >= 1 for CL training, got {config.data.max_seq_len}")
 
             if not config.model.ref_model:
                 raise ValueError("model.ref_model must be specified for CL/DPO training")
@@ -705,18 +709,21 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                     raise ValueError(f"nccl_sync_backend must be 'nccl' or 'gloo', got {nccl_backend!r}")
 
             max_tokens = config.rollout.max_tokens
-            max_seq_len = config.data.max_seq_len
-            if max_tokens is None or max_seq_len is None:
-                raise ValueError("max_tokens and max_seq_len must be specified for rl training")
+            max_prompt_len = config.data.max_prompt_len
+            if max_tokens is None or max_prompt_len is None:
+                raise ValueError("rollout.max_tokens and data.max_prompt_len must both be specified for rl training")
 
-            if max_tokens > max_seq_len:
-                raise ValueError("max_tokens must be < max_seq_len as max_seq_len equals to len(prompt + generation) and max_tokens equals to len(generation)")
+            if max_prompt_len < 1:
+                raise ValueError(f"data.max_prompt_len must be >= 1, got {max_prompt_len}")
 
-            # When rollout.max_model_len is set explicitly, it must be >= data.max_seq_len.
+            # When rollout.max_model_len is set, the sum must fit within the context window.
             max_model_len = config.rollout.max_model_len
-            if max_model_len is not None and max_model_len < max_seq_len:
-                raise ValueError(f"rollout.max_model_len ({max_model_len}) must be >= "
-                                 f"data.max_seq_len ({max_seq_len}).")
+            if max_model_len is not None and max_tokens + max_prompt_len > max_model_len:
+                raise ValueError(
+                    f"rollout.max_tokens ({max_tokens}) + data.max_prompt_len ({max_prompt_len}) = "
+                    f"{max_tokens + max_prompt_len} exceeds rollout.max_model_len ({max_model_len}). "
+                    f"Reduce max_tokens or max_prompt_len so their sum fits within the model context window."
+                )
 
             # Training step count
             if config.train.train_steps_per_epoch is None or config.train.train_steps_per_epoch < 1:

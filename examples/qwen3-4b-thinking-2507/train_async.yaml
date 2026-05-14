@@ -108,7 +108,7 @@ data:
   train_files_path: ["./data/deepscaler/deepscaler_preview_processed_123245_wsp_train.parquet"]
   val_files_path: ["./data/deepscaler/deepscaler_preview_processed_123245_wsp_val.parquet"]
   num_workers: 4
-  max_seq_len: 4096
+  max_prompt_len: 4096
   prompt_key: "prompt"
   answer_key: "answer"
   solution_key: "solution"

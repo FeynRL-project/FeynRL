@@ -17,7 +17,7 @@ class ReplayBuffer(Dataset):
     '''
     def __init__(self,
                 pad_token_id: int,
-                max_seq_len: int,
+                max_total_len: int,
                 max_size: Optional[int] = None,
                 ):
 
@@ -29,7 +29,7 @@ class ReplayBuffer(Dataset):
 
         self.max_size = max_size
         self.pad_token_id = int(pad_token_id)
-        self.max_seq_len  = int(max_seq_len)
+        self.max_total_len  = int(max_total_len)
         # this shows the total number of action tokens which are not masked which
         # can be used for token-weighted scaling later.
         self.total_action_tokens = 0
@@ -70,9 +70,9 @@ class ReplayBuffer(Dataset):
                 continue
 
             seq_len = sample["input_ids"].numel()
-            # samples which are longer than max_seq_len are truncated,
+            # samples which are longer than max_total_len are truncated,
             # otherwise there would be issuues with done, reward, mask, etc.
-            if seq_len > self.max_seq_len:
+            if seq_len > self.max_total_len:
                 truncated_count += 1
                 continue
 
@@ -86,9 +86,9 @@ class ReplayBuffer(Dataset):
                      )
 
         if truncated_count > 0:
-            print(f"[ReplayBuffer] {truncated_count}/{len(samples)} sequences truncated "
-                  f"from prompt+response to max_seq_len={self.max_seq_len}. "
-                  f"Consider reducing rollout max_tokens in rollouts or increasing max_seq_len in data configs.")
+            print(f"[ReplayBuffer] {truncated_count}/{len(samples)} sequences dropped: "
+                  f"prompt+response exceeded max_total_len={self.max_total_len}. "
+                  f"Consider reducing rollout.max_tokens or data.max_prompt_len.")
 
     def add(self,
             input_ids: torch.Tensor,
@@ -120,8 +120,8 @@ class ReplayBuffer(Dataset):
         if len(all_len) != 1:
             raise ValueError(f"All tensors must have the same length; got lengths={sorted(all_len)}")
 
-        # truncate to max_seq_len and save memory
-        keep       = min(input_ids.numel(), self.max_seq_len)
+        # truncate to max_total_len and save memory
+        keep       = min(input_ids.numel(), self.max_total_len)
         input_ids  = input_ids[:keep]
         attn_masks = attn_masks[:keep]
         old_logps  = old_logps[:keep]
@@ -148,13 +148,13 @@ class ReplayBuffer(Dataset):
     def collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         '''
             Overwrite the default collate_fn to handle padding.
-            Pads to target_len = min(max_len_in_batch, max_seq_len).
+            Pads to target_len = min(max_len_in_batch, max_total_len).
         '''
         if len(batch) == 0:
             raise ValueError("collate_fn received an empty batch")
 
-        # calculate effective max_seq_len in the current batch
-        # note data already truncated to max_seq_len in add()
+        # calculate effective max_total_len in the current batch
+        # note data already truncated to max_total_len in add()
         target_len = max(x["input_ids"].numel() for x in batch)
 
         # pad to batch_max_seq

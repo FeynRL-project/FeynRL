@@ -222,7 +222,7 @@ def create_dataset_and_sampler(data_paths,
 def create_prompt_dataset_and_sampler(data_paths,
                                       prompt_key,
                                       solution_key,
-                                      max_seq_len,
+                                      max_prompt_len,
                                       tokenizer,
                                       train_ratios,
                                       seed,
@@ -246,7 +246,7 @@ def create_prompt_dataset_and_sampler(data_paths,
         # load each dataset
         dataset = dataset_cls(prompt_key=prompt_key,
                               solution_key=solution_key,
-                              max_seq_len=max_seq_len,
+                              max_prompt_len=max_prompt_len,
                               tokenizer=tokenizer,
                               data_path=d_path)
 

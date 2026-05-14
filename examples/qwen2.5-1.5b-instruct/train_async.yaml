@@ -108,7 +108,7 @@ data:
   train_files_path: ["./data/gsm8k_train.parquet"]
   val_files_path: ["./data/gsm8k_val.parquet"]
   num_workers: 4
-  max_seq_len: 1024
+  max_prompt_len: 1024
   prompt_key: "prompt"
   answer_key: "answer"
   solution_key: "solution"

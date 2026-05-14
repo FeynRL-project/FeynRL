@@ -37,7 +37,7 @@ model:
 data:
   test_files_path: "./data/{benchmark}_test.parquet"
   num_workers: 8
-  max_seq_len: 8192
+  max_prompt_len: 8192
   prompt_key: "prompt"
   answer_key: "answer"
   solution_key: "solution"

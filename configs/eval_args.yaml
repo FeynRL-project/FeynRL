@@ -43,7 +43,7 @@ model:
 data:
   test_files_path: "./dummy_test.parquet"
   num_workers: 4
-  max_seq_len: 512
+  max_prompt_len: 512
   prompt_key: "prompt"
   answer_key: "answer"
   solution_key: "solution"

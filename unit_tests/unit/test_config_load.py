@@ -151,7 +151,7 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         "model": {"name": "m", "dtype": "bf16", "trust_remote_code": True, "value_model": "v"},
         "data": {
             "train_files_path": ["data.parquet"], "num_workers": 0,
-            "max_seq_len": 256, "prompt_key": "prompt", "answer_key": "answer",
+            "max_prompt_len": 256, "prompt_key": "prompt", "answer_key": "answer",
         },
         "deepspeed": {"zero_optimization": {"stage": 2}},
     }

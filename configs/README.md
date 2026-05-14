@@ -163,7 +163,8 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | `test_files_path` | Test Parquet file path (eval only) | String \| `null` | `"./test.parquet"` |
 | `train_ratios` | Per-dataset sampling ratios | Dict (basename → float) | `{"data1": 8.0, "d2": 0.2}` |
 | `num_workers` | DataLoader worker count | Integer ≥ 0 | `4` |
-| `max_seq_len` | Max total sequence length (prompt + response) | Integer > 0 | `512`, `2048` |
+| `max_seq_len` | Max total sequence length for truncation (SL/CL only) | Integer > 0 | `512`, `2048` |
+| `max_prompt_len` | Max prompt token length (RL/eval only); must satisfy `max_prompt_len + max_tokens ≤ max_model_len` when `max_model_len` is set | Integer > 0 | `512`, `2048` |
 | `prompt_key` | Prompt column name in Parquet | String | `"prompt"` |
 | `answer_key` | Answer column name (SFT target) | String | `"answer"` |
 | `solution_key` | Ground truth column for RL reward calculation | String \| `null` | `"solution"` |
@@ -175,7 +176,7 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
 | `n_samples` | Completions per prompt | Integer ≥ 1 | `1`, `5`, `16` |
-| `max_tokens` | Max generation tokens (must be < `max_seq_len`) | Integer ≥ 1 | `512`, `1024` |
+| `max_tokens` | Max generation tokens | Integer ≥ 1 | `512`, `1024` |
 | `rollout_samples_per_epoch` | Prompts to process per epoch (RL only) | Integer ≥ 1 | `100`, `500` |
 | `rollout_batch_size_per_gpu` | Batch size for prompt dataloader | Integer ≥ 1 | `2`, `4` |
 | `temperature` | Sampling temperature | Float ≥ 0 | `1.0`, `0.7` |

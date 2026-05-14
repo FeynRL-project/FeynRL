@@ -66,7 +66,7 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
     '''
     # 1. Initialize our custom datasets
     prompt_ds = PromptsFeed(prompt_key=params.data.prompt_key,
-                            max_seq_len=params.data.max_seq_len,
+                            max_prompt_len=params.data.max_prompt_len,
                             tokenizer=tokenizer,
                             data_path=params.data.test_files_path,
                             solution_key=params.data.solution_key,
@@ -114,7 +114,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "eos_id":eos_id,
               "tensor_parallel_size":tp,
               "model_dtype":params.model.dtype,
-              "max_seq_len":params.data.max_seq_len,
+              "max_prompt_len":params.data.max_prompt_len,
               "max_model_len":params.rollout.max_model_len,
 
               # reward related arguments
@@ -404,7 +404,7 @@ if __name__ == "__main__":
                                                   num_rollout_engines=num_rollout_engines)
     logger.info(f"Rollout dataloader ready. Total batches per epoch: {len(rollout_dataloader)}")
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
-                                 max_seq_len=config.data.max_seq_len,
+                                 max_total_len=config.data.max_prompt_len + config.rollout.max_tokens,
                                  )
     logger.info("Replay buffer initialized")
 

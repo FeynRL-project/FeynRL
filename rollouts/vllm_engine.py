@@ -34,7 +34,7 @@ class VLLMRolloutEngine(Base):
                  reward_broadcast: bool,
                  gpu_memory_utilization: float,
                  model_dtype: str,
-                 max_seq_len: int,
+                 max_prompt_len: int,
                  max_model_len: int | None = None,
                  engine_id: int = 0,
                  batch_invariant: bool = False,
@@ -77,7 +77,7 @@ class VLLMRolloutEngine(Base):
         self.engine_id = int(engine_id)
         self.batch_invariant = bool(batch_invariant)
         # prompt + response max length also known as context window size
-        self.max_seq_len = int(max_seq_len)
+        self.max_prompt_len = int(max_prompt_len)
         self.max_model_len = int(max_model_len) if max_model_len is not None else None
 
         # vllm engine config
@@ -467,7 +467,7 @@ class VLLMRolloutEngine(Base):
                                                 "response_text": getattr(response, "text", ""),
                                                 "response_len": response_len,
                                                 "truncated": 1 if finish_reason == "length" else 0,
-                                                "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                                "seq_truncated": 1 if prompt_len > self.max_prompt_len else 0,
                                                     })
                     self.normalize_rewards(samples=group_samples,
                                            stats=group_stats,
@@ -563,7 +563,7 @@ if __name__ == "__main__":
                                     reward_broadcast=True,
                                     gpu_memory_utilization=0.5,
                                     engine_id=0,
-                                    max_seq_len=2048,
+                                    max_prompt_len=2048,
                                     max_model_len=32768,
                                     model_dtype='bfloat16',
                                     batch_invariant=True,

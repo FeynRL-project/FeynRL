@@ -32,7 +32,7 @@ def test_nan_reward_error():
 
 def test_empty_batch_error():
     # ReplayBuffer is a normal class
-    rb = ReplayBuffer(pad_token_id=0, max_seq_len=10)
+    rb = ReplayBuffer(pad_token_id=0, max_total_len=10)
     with pytest.raises(ValueError, match="collate_fn received an empty batch"):
         rb.collate_fn([])
 

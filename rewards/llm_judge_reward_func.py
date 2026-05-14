@@ -1,7 +1,8 @@
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 try:
@@ -137,12 +138,25 @@ class _LLMJudgeScorer:
         if not rubric_items:
             return r, False, 0.0
 
-        max_pos = sum(max(0, it["points"]) for it in rubric_items)
-        min_neg = sum(min(0, it["points"]) for it in rubric_items)
-        if max_pos == min_neg:
+        total_possible_points = sum(it["points"] for it in rubric_items if it["points"] > 0)
+        if total_possible_points == 0:
             r[-1] = 0.5
             return r, False, 0.0
 
+        self._ensure_client()
+
+        convo = f"{prompt_data.get('text', '')}{response_data.text}"
+        total_points = sum(
+            it["points"]
+            for it in rubric_items
+            if self._judge_criterion(convo, it["criterion"])
+        )
+
+        normalized = total_points / float(total_possible_points)
+        r[-1] = float(max(0.0, min(1.0, normalized)))
+        return r, False, 0.0
+
+    def _ensure_client(self) -> None:
         if self._client is None:
             self._client = OpenAI(
                 base_url=self._cfg["base_url"],
@@ -150,50 +164,131 @@ class _LLMJudgeScorer:
                 timeout=self._cfg["timeout_s"],
             )
 
-        convo = f"{prompt_data.get('text', '')}{response_data.text}"
-        total_points = 0
-        for it in rubric_items:
-            user_msg = (
-                f"# Conversation\n{convo}\n\n"
-                f"# Rubric item\n{json.dumps({'criterion': it['criterion']}, ensure_ascii=False)}"
-            )
-            met = None
-            for attempt in range(1, self._cfg["max_retries"] + 1):
+    def _judge_criterion(self, convo: str, criterion: str) -> Optional[bool]:
+        """Send a single rubric criterion to the judge; return True/False/None."""
+        user_msg = (
+            f"# Conversation\n{convo}\n\n"
+            f"# Rubric item\n{json.dumps({'criterion': criterion}, ensure_ascii=False)}"
+        )
+        for attempt in range(1, self._cfg["max_retries"] + 1):
+            try:
+                kwargs = {"extra_body": self._cfg["extra_body"]} if self._cfg["extra_body"] else {}
+                resp = self._client.chat.completions.create(
+                    model=self._cfg["model_id"],
+                    messages=[
+                        {"role": "system", "content": self._cfg["system_prompt"]},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=self._cfg["max_tokens"],
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    **kwargs,
+                )
+                msg = resp.choices[0].message
+                text = (
+                    getattr(msg, "content", None)
+                    or getattr(msg, "reasoning_content", None)
+                    or getattr(msg, "reasoning", None)
+                    or ""
+                )
+                return _parse_criteria_met(text)
+            except _RETRYABLE as exc:
+                if attempt >= self._cfg["max_retries"]:
+                    logger.warning(f"[LLMJudge] retryable error after {self._cfg['max_retries']} attempts: {exc}")
+            except Exception as exc:
+                logger.warning(f"[LLMJudge] judge call error: {type(exc).__name__}: {exc}")
+                break
+        return None
+
+    def batch(self, pairs: List[Tuple[Dict[str, Any], Any]]) -> List[Tuple[torch.Tensor, bool, float]]:
+        """Score all (prompt, response) pairs with all judge calls issued concurrently.
+
+        Fires every (response × rubric_criterion) request in parallel so the
+        vLLM judge server sees the full batch at once, maximising GPU utilisation
+        instead of draining one request at a time.
+        """
+        if not self._cfg:
+            raise RuntimeError("[LLMJudge] configure() must be called before batch().")
+        self._ensure_client()
+
+        # Parse rubric metadata and build a flat task list.
+        # task: (pair_idx, criterion_idx, convo, criterion, points)
+        pair_meta: List[Tuple[List, Optional[int], List]] = []  # (token_ids, total_possible, rubric_items)
+        tasks: List[Tuple[int, int, str, str, int]] = []
+
+        for i, (prompt_data, response_data) in enumerate(pairs):
+            token_ids = list(response_data.token_ids)
+
+            rubric_val = prompt_data.get("rubric", "")
+            if not rubric_val or not token_ids:
+                pair_meta.append((token_ids, None, []))
+                continue
+
+            if isinstance(rubric_val, str):
                 try:
-                    kwargs = {"extra_body": self._cfg["extra_body"]} if self._cfg["extra_body"] else {}
-                    resp = self._client.chat.completions.create(
-                        model=self._cfg["model_id"],
-                        messages=[
-                            {"role": "system", "content": self._cfg["system_prompt"]},
-                            {"role": "user", "content": user_msg},
-                        ],
-                        max_tokens=self._cfg["max_tokens"],
-                        temperature=0.0,
-                        response_format={"type": "json_object"},
-                        **kwargs,
-                    )
-                    msg = resp.choices[0].message
-                    text = (
-                        getattr(msg, "content", None)
-                        or getattr(msg, "reasoning_content", None)
-                        or getattr(msg, "reasoning", None)
-                        or ""
-                    )
-                    met = _parse_criteria_met(text)
-                    break
-                except _RETRYABLE as exc:
-                    if attempt >= self._cfg["max_retries"]:
-                        logger.warning(f"[LLMJudge] retryable error after {self._cfg['max_retries']} attempts: {exc}")
-                except Exception as exc:
-                    logger.warning(f"[LLMJudge] judge call error: {type(exc).__name__}: {exc}")
-                    break
+                    rubric_val = json.loads(rubric_val)
+                except Exception:
+                    logger.warning("[LLMJudge] Failed to parse rubric JSON; assigning score=0.0")
+                    pair_meta.append((token_ids, None, []))
+                    continue
 
-            if met:
-                total_points += it["points"]
+            if not isinstance(rubric_val, list) or not rubric_val:
+                pair_meta.append((token_ids, None, []))
+                continue
 
-        normalized = (total_points - min_neg) / float(max_pos - min_neg)
-        r[-1] = float(max(0.0, min(1.0, normalized)))
-        return r, False, 0.0
+            rubric_items = [
+                {"criterion": str(it["criterion"]), "points": int(it["points"])}
+                for it in rubric_val
+                if isinstance(it, dict) and "criterion" in it and "points" in it
+            ]
+            total_possible = sum(it["points"] for it in rubric_items if it["points"] > 0)
+            pair_meta.append((token_ids, total_possible, rubric_items))
+
+            convo = f"{prompt_data.get('text', '')}{response_data.text}"
+            for j, it in enumerate(rubric_items):
+                tasks.append((i, j, convo, it["criterion"], it["points"]))
+
+        # Submit all judge calls concurrently.
+        criterion_met: Dict[Tuple[int, int], bool] = {}
+        if tasks:
+            with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+                future_to_key = {
+                    pool.submit(self._judge_criterion, convo, criterion): (i, j)
+                    for i, j, convo, criterion, _ in tasks
+                }
+                for future in as_completed(future_to_key):
+                    key = future_to_key[future]
+                    try:
+                        criterion_met[key] = bool(future.result())
+                    except Exception as exc:
+                        logger.warning(f"[LLMJudge] batch future error: {exc}")
+                        criterion_met[key] = False
+
+        # Reassemble per-response results.
+        results = []
+        for i, (token_ids, total_possible, rubric_items) in enumerate(pair_meta):
+            r = torch.zeros(len(token_ids), dtype=torch.float32)
+            if not token_ids:
+                results.append((r, False, 0.0))
+                continue
+            if total_possible is None:
+                results.append((r, False, 0.0))
+                continue
+            if total_possible == 0:
+                if token_ids:
+                    r[-1] = 0.5
+                results.append((r, False, 0.0))
+                continue
+
+            earned = sum(
+                rubric_items[j]["points"]
+                for j in range(len(rubric_items))
+                if criterion_met.get((i, j), False)
+            )
+            r[-1] = float(max(0.0, min(1.0, earned / float(total_possible))))
+            results.append((r, False, 0.0))
+
+        return results
 
 
 compute_score = _LLMJudgeScorer()

@@ -1,4 +1,4 @@
-"""Unit tests for modality/base.py and modality/text.py.
+"""Unit tests for modality/base.py, modality/text.py, and modality/__init__.py.
 
 These tests cover:
   - ModalityAdapter cannot be instantiated directly (it is abstract)
@@ -7,6 +7,7 @@ These tests cover:
   - parse_rollout_output extracts exactly the response slice
   - render_output uses vLLM-decoded text when available, falls back to tokenizer.decode
   - build_training_signal produces a ReplayBuffer-compatible dict
+  - build_adapter registry: valid names, unknown names, pass-through
 """
 
 import pytest
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock
 
 from modality.base import ModalityAdapter
 from modality.text import TextOnlyAdapter
+from modality import build_adapter, _ADAPTER_REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -276,3 +278,60 @@ def test_build_training_signal_empty_response(adapter):
     sig = _make_signal(adapter, prompt_ids=[1, 2], response_len=0)
     assert sig["response_len"] == 0
     assert sig["pred_dones"].sum().item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# build_adapter / _ADAPTER_REGISTRY
+# ---------------------------------------------------------------------------
+
+def test_registry_contains_text():
+    assert "text" in _ADAPTER_REGISTRY
+    assert _ADAPTER_REGISTRY["text"] is TextOnlyAdapter
+
+
+def test_registry_values_are_modality_adapter_subclasses():
+    for name, cls in _ADAPTER_REGISTRY.items():
+        assert issubclass(cls, ModalityAdapter), (
+            f"Registry entry '{name}' ({cls}) is not a ModalityAdapter subclass"
+        )
+
+
+def test_build_adapter_valid_name_returns_correct_type():
+    adapter = build_adapter("text")
+    assert isinstance(adapter, TextOnlyAdapter)
+
+
+def test_build_adapter_returns_fresh_instance_each_call():
+    a1 = build_adapter("text")
+    a2 = build_adapter("text")
+    assert a1 is not a2
+
+
+def test_build_adapter_instance_is_usable():
+    adapter = build_adapter("text")
+    raw = {"prompt_token_ids": [1, 2, 3], "text": "hi", "solution": "42"}
+    inp, meta = adapter.load_sample(raw)
+    assert inp == [1, 2, 3]
+    assert meta["solution"] == "42"
+
+
+def test_build_adapter_unknown_name_raises_value_error():
+    with pytest.raises(ValueError, match="Unknown modality adapter"):
+        build_adapter("nonexistent_modality")
+
+
+def test_build_adapter_unknown_name_error_lists_supported():
+    with pytest.raises(ValueError, match="text"):
+        build_adapter("audio")
+
+
+def test_build_adapter_all_registry_names_constructible():
+    """Every name in the registry must produce a usable adapter instance."""
+    for name in _ADAPTER_REGISTRY:
+        adapter = build_adapter(name)
+        assert isinstance(adapter, ModalityAdapter)
+
+
+def test_build_adapter_text_tokenizer_is_none():
+    adapter = build_adapter("text")
+    assert adapter.tokenizer is None

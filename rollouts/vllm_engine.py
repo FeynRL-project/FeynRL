@@ -11,6 +11,7 @@ import pickle
 from misc.utils import set_random_seeds
 from misc.metrics import compute_pass_metrics
 from rollouts.base import Base
+from modality.base import ModalityAdapter
 
 @ray.remote
 class VLLMRolloutEngine(Base):
@@ -39,7 +40,7 @@ class VLLMRolloutEngine(Base):
                  engine_id: int = 0,
                  batch_invariant: bool = False,
                  quantization: Optional[str] = None,
-                 adapter=None,
+                 adapter: ModalityAdapter | None = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -395,7 +396,7 @@ class VLLMRolloutEngine(Base):
                             response_logprobs, nan_mask = self.extract_logprobs(response_ids, response.logprobs)
 
                             action = self.adapter.parse_rollout_output(
-                                {"input_ids": input_ids}, prompt_data
+                                {"input_ids": input_ids}, {"prompt_token_ids": prompt_ids}
                             )
                             response_text = self.adapter.render_output(
                                 prompt_ids, action,

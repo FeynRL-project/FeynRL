@@ -12,7 +12,7 @@ from misc.utils import safe_string_to_torch_dtype, ray_get_with_timeout, set_ran
 from misc.nccl_env import nccl_watchdog_env_vars
 from rollouts.vllm_engine import VLLMRolloutEngine
 from rollouts.vllm_engine_async import VLLMRolloutEngineAsync
-from modality import ModalityAdapter, TextOnlyAdapter
+from modality import ModalityAdapter, TextOnlyAdapter, build_adapter as _modality_build_adapter
 import misc.rollout_stats as rollout_stats
 
 Algorithm_Registry = {# supported algorithms
@@ -104,24 +104,13 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
     return ray_runners
 
-_ADAPTER_REGISTRY: dict[str, type[ModalityAdapter]] = {
-    "text": TextOnlyAdapter,
-}
-
 def _build_adapter(params, adapter: ModalityAdapter | None) -> ModalityAdapter:
     """Return *adapter* as-is, or construct one from ``params.modality.adapter``."""
     if adapter is not None:
         return adapter
-    adapter_name = params.modality.adapter if params.modality else "text"
-    cls = _ADAPTER_REGISTRY.get(adapter_name)
-    if cls is None:
-        raise ValueError(
-            f"Unknown modality.adapter '{adapter_name}'. "
-            f"Supported: {list(_ADAPTER_REGISTRY)!r}."
-        )
-    return cls(tokenizer=None)
+    return _modality_build_adapter(params.modality.adapter)
 
-def create_rollout_engines(params, reward_fnc, eos_id, adapter=None):
+def create_rollout_engines(params, reward_fnc, eos_id, adapter: ModalityAdapter | None = None):
     '''
         This function is responsible for setting up distributed
         inference/rollout/generation engine.
@@ -204,7 +193,7 @@ def create_rollout_engines(params, reward_fnc, eos_id, adapter=None):
 
     return engines
 
-def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch, adapter=None):
+def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch, adapter: ModalityAdapter | None = None):
     '''
        This dataloader is used for rollout generation which
        would be used to train the policy.

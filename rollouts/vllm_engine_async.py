@@ -14,6 +14,7 @@ import threading
 from misc.utils import set_random_seeds
 from misc.metrics import compute_pass_metrics
 from misc.nccl_utils import create_nccl_process_group
+from modality.base import ModalityAdapter
 from rollouts.base import Base
 
 @ray.remote(concurrency_groups={"health": 1, "pull": 1, "mailbox": 1})
@@ -42,7 +43,7 @@ class VLLMRolloutEngineAsync(Base):
                  max_model_len: int | None = None,
                  engine_id: int = 0,
                  batch_invariant: bool = False,
-                 adapter=None,
+                 adapter: ModalityAdapter | None = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -378,7 +379,7 @@ class VLLMRolloutEngineAsync(Base):
                     response_logprobs, nan_mask = self.extract_logprobs(response_ids, response.logprobs)
 
                     action = self.adapter.parse_rollout_output(
-                        {"input_ids": input_ids}, prompt_data
+                        {"input_ids": input_ids}, {"prompt_token_ids": prompt_ids}
                     )
                     response_text = self.adapter.render_output(
                         prompt_ids, action,

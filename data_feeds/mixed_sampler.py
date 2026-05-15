@@ -1,5 +1,6 @@
 import numpy as np
 from torch.utils.data import Sampler, DistributedSampler, ConcatDataset
+from modality.base import ModalityAdapter
 
 class MixedDatasetSampler(Sampler):
     def __init__(self, seed: int,
@@ -231,7 +232,7 @@ def create_prompt_dataset_and_sampler(data_paths,
                                       dynamic_ratio_every_step,
                                       steps_per_epoch,
                                       shuffle_within_batch=True,
-                                      adapter=None,
+                                      adapter: ModalityAdapter | None = None,
                                       ):
     '''
         Creates a concat dataset and MixedDatasetSampler for rollout generation.

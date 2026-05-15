@@ -1,6 +1,7 @@
 import os
 from torch.utils.data import Dataset
 from datasets import load_dataset
+from modality.base import ModalityAdapter
 
 class PromptsFeed(Dataset):
     '''
@@ -12,7 +13,7 @@ class PromptsFeed(Dataset):
                 max_seq_len: int,
                 data_path: str,
                 solution_key: str = None,
-                adapter=None,
+                adapter: ModalityAdapter | None = None,
                 ):
         assert prompt_key != "", "prompt_key cannot be empty"
         assert max_seq_len > 0, "max_seq_len must be > 0"
@@ -22,8 +23,8 @@ class PromptsFeed(Dataset):
         assert tokenizer.pad_token_id is not None, "tokenizer must have a pad token"
         assert tokenizer.eos_token_id is not None, "tokenizer must have an eos token"
 
-        self.prompt_key  = prompt_key
-        self.adapter     = adapter
+        self.prompt_key = prompt_key
+        self.adapter: ModalityAdapter | None = adapter
 
         # this is required for reward function of datatset where solution is provided.
         if solution_key:

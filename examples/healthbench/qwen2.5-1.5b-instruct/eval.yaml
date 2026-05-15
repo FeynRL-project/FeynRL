@@ -1,0 +1,50 @@
+run:
+  experiment_id: "feynrl_healthbench_qwen25_eval"
+  project_name: "feynrl"
+  logger_type: "mlflow"
+  tracking_uri: ""
+  checkpoint_dir: "./ckps/healthbench/qwen25/eval"
+  rollout_gpus: 8
+  seed: 42
+
+reward:
+  broadcast: False
+  reward_func: llm_judge_reward_func
+  judge_system_prompt_path: "prompts/rubric_criterion_judge_system_prompt_test.txt"
+  judge_base_url: "http://<judge-server>:8080"
+  judge_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  judge_max_tokens: 2048
+  judge_enable_thinking: false
+
+rollout:
+  temperature: 0.0        # greedy — matches standard benchmark evaluation protocol
+  max_tokens: 4096
+  n_samples: 1
+  top_p: 1.0
+  top_k: -1
+  ignore_eos: False
+  stop: ""
+  gpu_memory_utilization: 0.85
+  stop_token_ids: []
+  prompt_logprobs: False
+  force_strict_on_policy: False
+  tensor_parallel_size: 1
+  rollout_batch_size_per_gpu: 8
+  batch_invariant: False
+  max_model_len: 8096
+
+model:
+  # Point this at your trained checkpoint, e.g.:
+  #   ./ckps/healthbench/qwen25/grpo/iter000030_v000030
+  name: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  trust_remote_code: False
+
+data:
+  test_files_path: "./data/healthbench_v1_val.parquet"
+  num_workers: 4
+  max_seq_len: 8096
+  prompt_key: "prompt"
+  answer_key: "prompt"
+  solution_key: null
+  extra_keys: ["rubric"]

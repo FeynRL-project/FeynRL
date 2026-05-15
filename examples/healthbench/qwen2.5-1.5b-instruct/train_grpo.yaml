@@ -1,0 +1,154 @@
+run:
+  experiment_id: "feynrl_healthbench_qwen25_grpo"
+  project_name: "feynrl"
+  logger_type: "mlflow"
+  tracking_uri: ""
+  checkpoint_dir: "./ckps/healthbench/qwen25/grpo"
+  training_gpus: 4
+  rollout_gpus: 4
+  ray_address: null
+  ray_master_port: 29500
+  seed: 42
+
+  weight_sync_method: "direct"
+  checkpoint_save_interval: 10
+
+  nccl_socket_ifname: null
+  nccl_ib_hca: null
+  nccl_sync_port: null
+  nccl_sync_backend: "gloo"
+
+  init_timeout: 3600
+  rollout_timeout: 3600
+  train_step_timeout: 1800
+  save_timeout: 1800
+  sync_timeout: 900
+
+overlap:
+  enabled: False
+  max_lag: null
+  behave_imp_weight_cap: null
+
+train:
+  alg_name: "grpo"
+  optimizer_name: "adamw"
+  lr: 1e-6
+  adam_epsilon: 1e-8
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.1
+  clip_grad_norm: 1.0
+  lr_scheduler: "WarmupCosineLR"
+
+  kl_coeff: 0.0
+  clip_low: 0.2
+  clip_high: 0.2
+  entropy_coeff: 0.0
+  update_after_full_replay: True
+
+  tau: null
+  gamma: null
+  value_lr: null
+  value_weight_decay: null
+  value_clip_grad_norm: null
+
+  total_number_of_epochs: 50
+  train_steps_per_epoch: 1
+  dynamic_ratio_every_step: False
+
+  train_batch_size_per_gpu: 4
+  gradient_accumulation_steps: 1
+  val_batch_size_per_gpu: 16
+  normalize_loss: True
+
+reward:
+  broadcast: True
+  reward_func: llm_judge_reward_func
+  judge_system_prompt_path: "prompts/rubric_criterion_judge_system_prompt_train.txt"
+  judge_base_url: "http://<judge-server>:8080"
+  judge_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  judge_max_tokens: 2048
+  judge_enable_thinking: false
+
+rollout:
+  temperature: 0.7
+  max_tokens: 4096
+  n_samples: 8
+  top_p: 0.8
+  top_k: 20
+  ignore_eos: False
+  stop: ""
+  gpu_memory_utilization: 0.85
+  stop_token_ids: []
+  prompt_logprobs: False
+  force_strict_on_policy: False
+  tensor_parallel_size: 1
+  rollout_batch_size_per_gpu: 8
+  rollout_samples_per_epoch: 128
+  batch_invariant: False
+  max_model_len: 8096
+
+model:
+  name: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  ref_model: ""
+  ref_model_offload_to_cpu: True
+  trust_remote_code: False
+  model_class: "llm"
+  gradient_checkpointing: True
+  attn_implementation: "flash_attention_2"
+  value_model: ""
+
+peft:
+  use_peft: False
+  peft_type: "lora"
+  task_type: "CAUSAL_LM"
+  lora_rank: 64
+  lora_alpha: 128
+  lora_dropout: 0
+  lora_target_modules: null
+
+data:
+  train_ratios: {"healthbench_v1_train": 1.0}
+  train_files_path: ["./data/healthbench_v1_train.parquet"]
+  val_files_path: ["./data/healthbench_v1_val.parquet"]
+  num_workers: 4
+  max_seq_len: 8096
+  prompt_key: "prompt"
+  answer_key: "prompt"
+  solution_key: null
+  extra_keys: ["rubric"]
+
+deepspeed:
+  zero_optimization:
+    stage: 3
+    stage3_param_persistence_threshold: "auto"
+    stage3_prefetch_bucket_size: "auto"
+    stage3_max_live_parameters: "auto"
+    stage3_max_reuse_distance: "auto"
+    sub_group_size: "auto"
+    offload_optimizer:
+      device: "none"
+      pin_memory: true
+    offload_param:
+      device: "none"
+      pin_memory: true
+    contiguous_gradients: true
+    overlap_comm: true
+    reduce_scatter: true
+    reduce_bucket_size: "auto"
+    allgather_bucket_size: "auto"
+    stage3_gather_16bit_weights_on_model_save: true
+
+  prescale_gradients: false
+  data_types:
+    grad_accum_dtype: "fp32"
+  steps_per_print: 100
+  wall_clock_breakdown: false
+  flops_profiler:
+    enabled: false
+    profile_step: 10
+    module_depth: -1
+    top_modules: 1
+    detailed: true
+    output_file: null

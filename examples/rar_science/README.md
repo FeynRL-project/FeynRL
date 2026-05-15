@@ -6,6 +6,15 @@ FeynRL on RAR-b Science — rubric-graded science-question benchmark, LLM-as-jud
 
 ## Results
 
+Full test shard (2292 prompts), greedy decoding. Avg Reward = mean LLM-judge rubric score.
+
+| Model | Checkpoint | Avg Reward |
+| --- | --- | ---: |
+| Base | — | 0.4655 |
+| FeynRL (GRPO) | iter 50 | 0.5042 |
+| FeynRL (P3O) | iter 50 | 0.5030 |
+
+GRPO: +8.3% vs base. P3O: +8.1%.
 
 ## Configs
 

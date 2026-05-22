@@ -28,7 +28,7 @@ def test_registry_unknown_class_raises():
 
 def test_registry_list_loaders_contains_qwen():
     from models.registry import list_loaders
-    assert "transformers_qwen2_5_sft_text" in list_loaders()
+    assert "llm" in list_loaders()
 
 
 # ---------------------------------------------------------------------------
@@ -167,16 +167,22 @@ def test_normalize_pad_token_skips_when_already_set():
 # Qwen2.5 loader is registered
 # ---------------------------------------------------------------------------
 
-def test_qwen2_5_loader_is_registered_and_callable():
+def test_llm_loader_is_registered_and_callable():
     from models.registry import get_loader
-    loader = get_loader("transformers_qwen2_5_sft_text")
+    loader = get_loader("llm")
     assert callable(loader)
 
+def test_get_sft_adapter_dispatches_by_model_class():
+    from models.adapters import get_sft_adapter
+    from models.adapters.hf_causal_lm import HFCausalLMAdapter
 
-def test_gemma3_loader_is_registered_and_callable():
-    from models.registry import get_loader
-    loader = get_loader("transformers_gemma3_sft_text")
-    assert callable(loader)
+    assert isinstance(get_sft_adapter("llm"), HFCausalLMAdapter)
+
+
+def test_get_sft_adapter_unknown_model_class_raises():
+    from models.adapters import get_sft_adapter
+    with pytest.raises(ValueError, match="Unsupported model_class"):
+        get_sft_adapter("__does_not_exist__")
 
 
 # ---------------------------------------------------------------------------

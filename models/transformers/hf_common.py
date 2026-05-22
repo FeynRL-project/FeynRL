@@ -43,13 +43,3 @@ def load_hf_text_model(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
 @register("llm")
 def _load_llm(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
     return load_hf_text_model(cfg, rank=rank)
-
-
-@register("transformers_qwen2_5_sft_text")
-def _load_qwen2_5_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
-    return load_hf_text_model(cfg, rank=rank)
-
-
-@register("transformers_gemma3_sft_text")
-def _load_gemma3_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
-    return load_hf_text_model(cfg, rank=rank)

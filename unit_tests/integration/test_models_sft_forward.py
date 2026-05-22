@@ -140,9 +140,9 @@ def test_sft_train_step_with_synthetic_data():
                 self._opt.step()
                 self._opt.zero_grad()
 
-        from models.adapters.qwen_2 import Qwen2Adapter
+        from models.adapters.hf_causal_lm import HFCausalLMAdapter
         engine = _EngineShim(model, optimizer)
-        alg = SFT(model_engine=engine, optimizer=optimizer, model_adapter=Qwen2Adapter(), normalize_loss=True)
+        alg = SFT(model_engine=engine, optimizer=optimizer, model_adapter=HFCausalLMAdapter(), normalize_loss=True)
 
         micro_batch = {k: v.clamp(0, VOCAB_SIZE - 1) if k == "input_ids" else v for k, v in batch.items()}
         ga_denom = float(micro_batch["loss_mask"].sum().item())

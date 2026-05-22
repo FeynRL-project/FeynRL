@@ -4,13 +4,13 @@ from typing import Any, Dict
 
 import torch
 
-from models.adapters.base import ForwardOutput, ModelAdapter
 from misc.batch_utils import move_to_device
+from models.adapters.base import ForwardOutput, ModelAdapter
 
 
-class Qwen2Adapter(ModelAdapter):
+class HFCausalLMAdapter(ModelAdapter):
     """
-    Text-only adapter for Qwen2-family causal LMs (and any HF AutoModelForCausalLM).
+    Text-only adapter for HuggingFace causal LMs (AutoModelForCausalLM-style).
 
     Assumes the batch contains:
       - input_ids:  [B, T]
@@ -42,3 +42,4 @@ class Qwen2Adapter(ModelAdapter):
 
     def to_device(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
         return move_to_device(batch, device)
+

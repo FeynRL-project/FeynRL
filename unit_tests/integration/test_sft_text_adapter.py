@@ -1,5 +1,5 @@
 """
-Integration smoke test: PairedFeed -> Qwen2Adapter -> SFT train step.
+Integration smoke test: PairedFeed -> HFCausalLMAdapter -> SFT train step.
 
 Runs fully offline using TinyModel and a minimal mock tokenizer.
 """
@@ -13,7 +13,7 @@ import torch
 import torch.optim as optim
 
 from algs.SFT.sft import SFT
-from models.adapters.qwen_2 import Qwen2Adapter
+from models.adapters.hf_causal_lm import HFCausalLMAdapter
 from unit_tests.models import TinyModel
 
 
@@ -90,7 +90,7 @@ def test_sft_train_step_uses_adapter_forward():
                 self._opt.zero_grad()
 
         engine = _EngineShim(model, optimizer)
-        adapter = Qwen2Adapter()
+        adapter = HFCausalLMAdapter()
         alg = SFT(model_engine=engine, optimizer=optimizer, normalize_loss=True, model_adapter=adapter)
 
         # Clamp ids into vocab.

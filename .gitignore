@@ -126,3 +126,5 @@ wandb/
 configs/murdock_configs/
 scripts/
 .clean_git.sh
+# Private / machine-specific configs
+configs/murdock_configs/

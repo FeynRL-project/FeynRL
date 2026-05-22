@@ -1,12 +1,13 @@
 import torch
 
 class SFT:
-    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1):
+    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1, model_adapter=None):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
         self.normalize_loss = normalize_loss
         self.world_size = world_size
+        self.model_adapter = model_adapter
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
@@ -74,6 +75,10 @@ class SFT:
                 y is [B, T-1]
                 loss_mask is [B, T-1]
         '''
+        if self.model_adapter is not None:
+            out = self.model_adapter.forward(self.model_engine, batch)
+            return out.logits, out.target_ids, out.loss_mask
+
         # input_ids and att_mask are [B, T]
         input_ids = batch['input_ids']
         att_mask  = batch['attn_mask']

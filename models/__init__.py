@@ -10,10 +10,10 @@ This package intentionally separates:
 import models.transformers  # noqa: F401 — trigger @register decorators in all family modules
 from models.registry import get_loader, list_loaders
 
-__all__ = ["load_sft_model_and_tokenizer"]
+__all__ = ["load_model_and_tokenizer"]
 
 
-def load_sft_model_and_tokenizer(model_cfg, rank: int = 0):
+def load_model_and_tokenizer(model_cfg, rank: int = 0):
     """
     Dispatch model + tokenizer loading via model_cfg.model_class.
 

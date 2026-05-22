@@ -208,7 +208,7 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, tokenizer = models.load_sft_model_and_tokenizer(config.model, rank=rank)
+    model, tokenizer = models.load_model_and_tokenizer(config.model, rank=rank)
     model_class = getattr(config.model, "model_class", "")
     model_adapter = get_sft_adapter(model_class)
     # apply PEFT module if enabled

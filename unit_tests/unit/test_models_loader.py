@@ -32,7 +32,7 @@ def test_registry_list_loaders_contains_qwen():
 
 
 # ---------------------------------------------------------------------------
-# load_sft_model_and_tokenizer dispatch
+# load_model_and_tokenizer dispatch
 # ---------------------------------------------------------------------------
 
 def test_load_sft_dispatches_to_registered_loader():
@@ -47,7 +47,7 @@ def test_load_sft_dispatches_to_registered_loader():
 
     model_cfg = MagicMock()
     model_cfg.model_class = "_unit_test_dispatch"
-    assert models.load_sft_model_and_tokenizer(model_cfg, rank=0) is sentinel
+    assert models.load_model_and_tokenizer(model_cfg, rank=0) is sentinel
 
 
 def test_load_sft_none_model_class_raises():
@@ -55,7 +55,7 @@ def test_load_sft_none_model_class_raises():
     model_cfg = MagicMock()
     model_cfg.model_class = None
     with pytest.raises(ValueError, match="model.model_class must be set"):
-        models.load_sft_model_and_tokenizer(model_cfg)
+        models.load_model_and_tokenizer(model_cfg)
 
 
 def test_load_sft_empty_model_class_raises():
@@ -63,7 +63,7 @@ def test_load_sft_empty_model_class_raises():
     model_cfg = MagicMock()
     model_cfg.model_class = ""
     with pytest.raises(ValueError, match="model.model_class must be set"):
-        models.load_sft_model_and_tokenizer(model_cfg)
+        models.load_model_and_tokenizer(model_cfg)
 
 
 # ---------------------------------------------------------------------------

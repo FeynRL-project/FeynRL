@@ -75,33 +75,28 @@ class SFT:
                 y is [B, T-1]
                 loss_mask is [B, T-1]
         '''
-        # input_ids and att_mask are [B, T]
+        if self.model_adapter is not None:
+            out = self.model_adapter.forward(self.model_engine, batch)
+            return out.logits, out.target_ids, out.loss_mask
+
+        # Fallback legacy text-only path.
         input_ids = batch['input_ids']
-        att_mask  = batch['attn_mask']
-        # loss_mask is [B, T - 1]
+        att_mask = batch['attn_mask']
         loss_mask = batch['loss_mask']
 
-        # if pos_ids is not provided, hf will add it automatically.
         pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
             pos_ids = pos_ids.to(att_mask.device)
 
-        # feed data to model
-        output = self.model_engine(input_ids=input_ids,
-                                   attention_mask=att_mask,
-                                   position_ids=pos_ids,
-                                   use_cache=False)
+        output = self.model_engine(
+            input_ids=input_ids,
+            attention_mask=att_mask,
+            position_ids=pos_ids,
+            use_cache=False,
+        )
 
-        # [B, T, vocab_size]
-        every_token_logits = output.logits
-        # remember we use token t to predict token t+1, hence no need to predict last
-        # token's output (e.g., <eos>) and we remove it from logits.
-        logits = every_token_logits[:, :-1, :].contiguous()
-
-        # target_ids would be input_ids shifted by one
-        # so the size is [B, T-1]
+        logits = output.logits[:, :-1, :].contiguous()
         target_ids = input_ids[:, 1:].contiguous()
-
         return logits, target_ids, loss_mask
 
     def eval_step(self, micro_batch):

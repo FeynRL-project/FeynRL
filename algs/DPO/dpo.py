@@ -116,6 +116,8 @@ class DPO:
             }
             if pos_ids is not None:
                 adapter_batch["position_ids"] = pos_ids
+            # Pass through any extra, model-specific inputs (e.g. vision/audio tensors)
+            # without the algorithm knowing their structure.
             if "multi_modal_inputs" in batch:
                 adapter_batch["multi_modal_inputs"] = batch["multi_modal_inputs"]
 

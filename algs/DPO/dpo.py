@@ -7,8 +7,7 @@ class DPO:
                  optimizer,
                  beta,
                  normalize_loss=False,
-                 model_adapter=None,
-                 **_unused):
+                 model_adapter=None):
 
         self.model_engine = model_engine
         self.ref_model_engine = ref_model_engine

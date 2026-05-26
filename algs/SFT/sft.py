@@ -1,7 +1,7 @@
 import torch
 
 class SFT:
-    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1, model_adapter=None, **_unused):
+    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1, model_adapter=None):
 
         self.model_engine = model_engine
         self.optimizer = optimizer

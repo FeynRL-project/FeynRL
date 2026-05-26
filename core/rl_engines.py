@@ -58,6 +58,7 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                'behave_imp_weight_cap': params.overlap.behave_imp_weight_cap if params.overlap else None,
 
                'train_steps_per_epoch': params.train.train_steps_per_epoch,
+               'model_class': getattr(params.model, "model_class", None) or "llm",
     }
 
     # ppo arguments
@@ -194,6 +195,30 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
     # Calculate number of batches from total samples
     num_batches = (samples_per_epoch + bsz - 1) // bsz
 
+    from data_feeds.image_prompts import ImagePromptsFeed
+    from data_feeds.audio_prompts import AudioPromptsFeed
+    from models.adapters import get_adapter
+
+    model_class = getattr(params.model, "model_class", None) or "llm"
+    if model_class == "qwen2_5_vl":
+        dataset_cls = ImagePromptsFeed
+        dataset_kwargs = {
+            "adapter": get_adapter(model_class),
+            "image_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
+            "max_image_pixels": getattr(params.data, "max_image_pixels", None),
+        }
+    elif model_class == "qwen2_audio":
+        dataset_cls = AudioPromptsFeed
+        dataset_kwargs = {
+            "adapter": get_adapter(model_class),
+            "audio_key": getattr(params.data, "audio_key", None) or "audio_bytes",
+            "sampling_rate_key": getattr(params.data, "sampling_rate_key", None) or "sampling_rate",
+            "default_sampling_rate": getattr(params.data, "default_sampling_rate", None) or 16000,
+        }
+    else:
+        dataset_cls = PromptsFeed
+        dataset_kwargs = None
+
     dataset, sampler, collate_fn = create_prompt_dataset_and_sampler(
                                                 data_paths=params.data.train_files_path,
                                                 prompt_key=params.data.prompt_key,
@@ -203,10 +228,11 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
                                                 train_ratios=params.data.train_ratios,
                                                 seed=params.run.seed,
                                                 local_batch_size=bsz,
-                                                dataset_cls=PromptsFeed,
+                                                dataset_cls=dataset_cls,
                                                 steps_per_epoch=num_batches,
                                                 shuffle_within_batch=True,
                                                 dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                dataset_kwargs=dataset_kwargs,
                                                 )
     # Seed each DataLoader worker deterministically so any randomness
     # inside __getitem__ / collate_fn is reproducible across runs.

@@ -3,6 +3,45 @@ import pytest
 from types import SimpleNamespace
 from rewards.math_verify_reward_func import compute_score
 
+
+@pytest.fixture(autouse=True)
+def _math_verify_inline_pool(monkeypatch):
+    """
+    rewards/math_verify_reward_func.py uses ProcessPoolExecutor("spawn").
+    Some CI/sandbox environments disallow multiprocessing semaphores, which
+    makes pool creation raise PermissionError. For unit tests we run the
+    verification inline via a small stub pool.
+    """
+    import rewards.math_verify_reward_func as m
+
+    class _InlineFuture:
+        def __init__(self, fn, args):
+            self._fn = fn
+            self._args = args
+            self._ran = False
+            self._value = None
+            self._exc = None
+
+        def result(self, timeout=None):
+            if not self._ran:
+                self._ran = True
+                try:
+                    self._value = self._fn(*self._args)
+                except Exception as e:  # pragma: no cover
+                    self._exc = e
+            if self._exc is not None:
+                raise self._exc
+            return self._value
+
+        def cancel(self):
+            return False
+
+    class _InlinePool:
+        def submit(self, fn, *args, **kwargs):
+            return _InlineFuture(fn, args)
+
+    monkeypatch.setattr(m, "_get_reward_pool", lambda: _InlinePool())
+
 def test_compute_score_correct_simple():
     prompt_data = {"solution": "42"}
     response_data = SimpleNamespace(

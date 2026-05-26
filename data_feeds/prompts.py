@@ -44,6 +44,15 @@ class PromptsFeed(Dataset):
             #  without it we get a DatasetDict; with it we get a Dataset.
             self.data = load_dataset("parquet", data_files=self.data_path, split="train")
 
+        except PermissionError:
+            # Some environments (e.g. sandboxed CI) cannot write to the default
+            # HF datasets cache under ~/.cache. Retry using a tmp cache dir.
+            cache_dir = os.environ.get("HF_DATASETS_CACHE", "/tmp/hf_datasets_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            self.data = load_dataset(
+                "parquet", data_files=self.data_path, split="train", cache_dir=cache_dir
+            )
+
         except Exception as e:
             raise Exception(f"Failed to load data from {self.data_path}: {str(e)}")
 

@@ -233,6 +233,7 @@ def create_prompt_dataset_and_sampler(data_paths,
                                       dataset_cls,
                                       dynamic_ratio_every_step,
                                       steps_per_epoch,
+                                      dataset_kwargs=None,
                                       shuffle_within_batch=True,
                                       ):
     '''
@@ -247,11 +248,15 @@ def create_prompt_dataset_and_sampler(data_paths,
         dname = d_path.split("/")[-1].split(".")[0]
         dname_list.append(dname)
         # load each dataset
-        dataset = dataset_cls(prompt_key=prompt_key,
-                              solution_key=solution_key,
-                              max_seq_len=max_seq_len,
-                              tokenizer=tokenizer,
-                              data_path=d_path)
+        extra_kwargs = dataset_kwargs or {}
+        dataset = dataset_cls(
+            prompt_key=prompt_key,
+            solution_key=solution_key,
+            max_seq_len=max_seq_len,
+            tokenizer=tokenizer,
+            data_path=d_path,
+            **extra_kwargs,
+        )
 
         all_datasets.append(dataset)
         len_datasets[dname] = len(dataset)

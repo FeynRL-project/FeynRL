@@ -4,7 +4,6 @@ import random
 import torch
 import torch.distributed
 import numpy as np
-from transformers import AutoModelForCausalLM, AutoConfig
 import deepspeed
 from peft import get_peft_model, LoraConfig
 from safetensors.torch import save_file
@@ -12,6 +11,7 @@ from huggingface_hub import split_torch_state_dict_into_shards
 from misc.utils import set_random_seeds
 import copy
 import time
+import types
 # internal and local import
 from misc.nccl_utils import create_nccl_process_group
 
@@ -389,19 +389,30 @@ class COMMON:
         '''
             Helper to load a single model from HuggingFace.
         '''
-        assert dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-        assert self.attn_impl is None or self.attn_impl == '' or self.attn_impl in ['eager', 'flash_attention_2'], \
-            "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
+        def _dtype_to_str(dt: torch.dtype) -> str:
+            if dt == torch.bfloat16:
+                return "bfloat16"
+            if dt == torch.float16:
+                return "float16"
+            if dt == torch.float32:
+                return "float32"
+            return str(dt).replace("torch.", "")
 
-        config = AutoConfig.from_pretrained(model_path)
-        model  = AutoModelForCausalLM.from_pretrained(
-                                model_path,
-                                dtype=dtype,
-                                trust_remote_code=self.trust_remote_code,
-                                config=config,
-                                attn_implementation=None if self.attn_impl == '' else self.attn_impl
-                            )
+        import models.transformers  # noqa: F401
+        from models.registry import get_loader
+
+        model_class = getattr(self, "model_class", None) or "llm"
+        loader = get_loader(model_class)
+        cfg = types.SimpleNamespace(
+            name=model_path,
+            dtype=_dtype_to_str(dtype),
+            trust_remote_code=self.trust_remote_code,
+            attn_implementation=self.attn_impl,
+            processor_name_or_path=getattr(self, "processor_name_or_path", None),
+        )
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        result = loader(cfg, rank=rank)
+        model = result[0]
 
         # apply PEFT module to both policy and value
         if model_name != "ref" and self.peft_config.use_peft:

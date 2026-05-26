@@ -33,12 +33,14 @@ class GRPO(COMMON):
                  peft_config: Any = None,
                  use_decoupled_loss: bool = False,
                  behave_imp_weight_cap: float = None,
+                 model_class: str = "llm",
                  ):
 
         self.alg_name = self.__class__.__name__
         # model related parameters
         self.model_path = model_path
         self.ref_model_path = ref_model_path
+        self.model_class = model_class
         self.attn_impl = attn_impl
         self.model_dtype = model_dtype
         self.trust_remote_code = trust_remote_code

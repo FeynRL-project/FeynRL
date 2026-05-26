@@ -586,11 +586,18 @@ class VLLMRolloutEngineAsync(Base):
         self._request_counter += len(prompts)
 
         async def generate_one(request_id, prompt_data):
-            prompt_token_ids = prompt_data['prompt_token_ids']
             final_output = None
-            # vllm v1 (AsyncLLM) takes token IDs via the prompt parameter as a dict.
-            # The old prompt_token_ids keyword was removed in the v1 API.
-            async for output in self.async_engine.generate(prompt={"prompt_token_ids": prompt_token_ids},
+            # vllm v1 (AsyncLLM) takes either:
+            #  - {"prompt_token_ids": [...]} for token-based prompts, or
+            #  - {"prompt": "...", "multi_modal_data": {...}} for multimodal prompts.
+            if "prompt" in prompt_data:
+                req = {"prompt": prompt_data["prompt"]}
+                if "multi_modal_data" in prompt_data:
+                    req["multi_modal_data"] = prompt_data["multi_modal_data"]
+            else:
+                req = {"prompt_token_ids": prompt_data["prompt_token_ids"]}
+
+            async for output in self.async_engine.generate(prompt=req,
                                                            sampling_params=sampling_params,
                                                            request_id=str(request_id)):
                 final_output = output

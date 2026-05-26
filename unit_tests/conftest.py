@@ -14,7 +14,6 @@ mock_modules = [
     "peft",
     "safetensors",
     "safetensors.torch",
-    "huggingface_hub",
 ]
 
 for mod in mock_modules:
@@ -37,6 +36,9 @@ import transformers
 transformers.generation.GenerationMixin = MagicMock()
 transformers.AutoConfig = MagicMock()
 transformers.AutoModelForCausalLM = MagicMock()
+class PreTrainedTokenizerBase:  # noqa: N801
+    pass
+transformers.PreTrainedTokenizerBase = PreTrainedTokenizerBase
 
 # Ensure PeftModel is a class for isinstance checks
 import peft

@@ -41,6 +41,7 @@ class PPO(COMMON):
                  deepspeed_value_config: Any = None,
                  use_decoupled_loss: bool = False,
                  behave_imp_weight_cap: float = None,
+                 model_class: str = "llm",
                  ):
         assert tau is not None and gamma is not None, 'tau and gamma must be provided for PPO'
         assert value_model_path is not None, 'value_model_path must be provided for PPO'
@@ -48,6 +49,7 @@ class PPO(COMMON):
         self.model_path = model_path
         self.model_dtype = model_dtype
         self.ref_model_path = ref_model_path
+        self.model_class = model_class
         self.attn_impl = attn_impl
         self.trust_remote_code = trust_remote_code
         self.peft_config = peft_config

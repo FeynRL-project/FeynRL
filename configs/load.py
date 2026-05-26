@@ -140,6 +140,10 @@ class Data(BaseModel):
     prompt_key: str
     answer_key: str
     solution_key: str | None = None
+    # Optional multimodal dataset keys (used by MM SFT/DPO/RL feeds).
+    image_bytes_key: str | None = None
+    image_placeholder_token: str | None = None
+    insert_image_token_if_missing: bool | None = None
 
 class Model(BaseModel):
     '''

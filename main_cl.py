@@ -2,7 +2,6 @@ import os
 import argparse
 import deepspeed
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from torch.utils.data import DataLoader
 import torch.distributed
 from tqdm import tqdm
@@ -14,9 +13,14 @@ from peft import get_peft_model, LoraConfig
 import configs.load as cfg # all config arguments
 from data_feeds.preference import PreferenceFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
+from data_feeds.image_preference import ImagePreferenceFeed
+from data_feeds.collators import build_preference_multimodal_collate_fn
+from misc.batch_utils import move_to_device
+from misc.utils import get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
+import models
+from models.adapters import get_adapter
 
 
 Algorithm_Registry = {# supported algorithms
@@ -82,62 +86,6 @@ def apply_peft_module(model, peft_config, rank=0):
     else:
         raise ValueError(f"Unsupported PEFT type: {peft_config.peft_type}")
 
-def load_models_and_tokenizer(model_name, model_dtype, ref_model_name,trust_remote_code, attn_impl, rank):
-    '''
-        Load models and tokenizer.
-    '''
-    assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-    assert attn_impl is None or attn_impl == '' or attn_impl in ['eager', 'flash_attention_2'], \
-        "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
-
-    # convert string to torch dtype if it is not already
-    model_dtype = safe_string_to_torch_dtype(model_dtype)
-
-    # 1. model and its config initialization
-    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(model_name,
-                                                dtype=model_dtype,
-                                                trust_remote_code=trust_remote_code,
-                                                config=model_config,
-                                                attn_implementation=None if attn_impl == '' else attn_impl)
-    # 2. load reference model
-    if ref_model_name is None:
-        ref_model_name = model_name
-
-    ref_model_config = AutoConfig.from_pretrained(ref_model_name, trust_remote_code=trust_remote_code)
-    ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
-                                                     dtype=model_dtype,
-                                                     trust_remote_code=trust_remote_code,
-                                                     config=ref_model_config,
-                                                     attn_implementation=None if attn_impl == '' else attn_impl)
-
-    # 3. Tokenizer initialization
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-
-    # if pad token is not present, we use eos token as pad token
-    # log warning if pad token is not present.
-    if tokenizer.pad_token_id is None:
-        if rank == 0:
-            print("Warning: Pad token is not present, using eos token as pad token")
-
-        if getattr(tokenizer, 'eos_token', None) is not None:
-            # prefer explicit token if available
-            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-
-        else:
-            # fallback to eos token id
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # Sync pad_token_id into model config so exported checkpoints are consistent
-    # as vllm and similar read pad_token_id from config.json, not tokenizer
-    if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
-    if ref_model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
-        ref_model.config.pad_token_id = tokenizer.pad_token_id
-
-    return model, ref_model, tokenizer
-
 def create_training_engine(deepspeed_config, deepspeed_ref_config, model, ref_model):
     '''
         This function is responsible for setting up distributed training engine.
@@ -166,7 +114,7 @@ def create_training_engine(deepspeed_config, deepspeed_ref_config, model, ref_mo
 
     return model_engine, ref_model_engine, optimizer
 
-def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
+def create_data_loader(params, tokenizer, processor, model_class, rank, world_size, batch_size, split):
     '''
        Setup DataLoader for distributed training.
        As a reminder, batch_size is the per-gpu-micro-batch size.
@@ -178,21 +126,39 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     # steps_per_epoch is only needed for training (MixedDatasetSampler)
     steps_per_epoch = params.train.micro_batches_per_epoch if split == 'train' else None
 
-    dataset, sampler = create_dataset_and_sampler(data_paths=data_path,
-                                                  prompt_key=params.data.prompt_key,
-                                                  answer_key=params.data.answer_key,
-                                                  max_seq_len=params.data.max_seq_len,
-                                                  tokenizer=tokenizer,
-                                                  train_ratios=params.data.train_ratios,
-                                                  split=split,
-                                                  rank=rank,
-                                                  world_size=world_size,
-                                                  seed=params.run.seed,
-                                                  local_batch_size=batch_size,
-                                                  dataset_cls=PreferenceFeed,
-                                                  steps_per_epoch=steps_per_epoch,
-                                                  shuffle_within_batch=True,
-                                                  dynamic_ratio_every_step=params.train.dynamic_ratio_every_step)
+    use_mm = processor is not None and (model_class == "qwen2_5_vl")
+    dataset_cls = ImagePreferenceFeed if use_mm else PreferenceFeed
+    dataset_kwargs = None
+    collate_fn = None
+    if use_mm:
+        adapter = get_adapter(model_class)
+        dataset_kwargs = {
+            "processor": processor,
+            "adapter": adapter,
+            "image_bytes_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
+            "image_placeholder_token": getattr(params.data, "image_placeholder_token", None) or "<image>",
+            "insert_image_token_if_missing": bool(getattr(params.data, "insert_image_token_if_missing", False)),
+        }
+        collate_fn = build_preference_multimodal_collate_fn(enable_vision=True)
+
+    dataset, sampler = create_dataset_and_sampler(
+        data_paths=data_path,
+        prompt_key=params.data.prompt_key,
+        answer_key=params.data.answer_key,
+        max_seq_len=params.data.max_seq_len,
+        tokenizer=tokenizer,
+        train_ratios=params.data.train_ratios,
+        split=split,
+        rank=rank,
+        world_size=world_size,
+        seed=params.run.seed,
+        local_batch_size=batch_size,
+        dataset_cls=dataset_cls,
+        dataset_kwargs=dataset_kwargs,
+        steps_per_epoch=steps_per_epoch,
+        shuffle_within_batch=True,
+        dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+    )
 
     # 2. Initialize data loader
     def worker_init_fn(worker_id):
@@ -207,6 +173,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                 batch_sampler=sampler,
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
     else:
         # DistributedSampler yields individual indices.
@@ -216,6 +183,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
                                 drop_last=False,  # ensure all validation samples are used
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
 
     return dataloader, sampler
@@ -267,12 +235,26 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                            model_dtype=config.model.dtype,
-                                                            ref_model_name=config.model.ref_model,
-                                                            trust_remote_code=config.model.trust_remote_code,
-                                                            attn_impl=config.model.attn_implementation,
-                                                            rank=rank)
+    model_class = config.model.model_class or "llm"
+
+    loaded = models.load_model_and_tokenizer(config.model, rank=rank)
+    if isinstance(loaded, tuple) and len(loaded) == 3:
+        model, tokenizer, processor = loaded
+    elif isinstance(loaded, tuple) and len(loaded) == 2:
+        model, tokenizer = loaded
+        processor = None
+    else:
+        raise RuntimeError(f"Unexpected return from models.load_model_and_tokenizer: {type(loaded)}")
+
+    ref_name = config.model.ref_model or config.model.name
+    ref_cfg = config.model.model_copy(update={"name": ref_name})
+    ref_loaded = models.load_model_and_tokenizer(ref_cfg, rank=rank)
+    if isinstance(ref_loaded, tuple) and len(ref_loaded) == 3:
+        ref_model = ref_loaded[0]
+    elif isinstance(ref_loaded, tuple) and len(ref_loaded) == 2:
+        ref_model = ref_loaded[0]
+    else:
+        raise RuntimeError(f"Unexpected return from models.load_model_and_tokenizer (ref): {type(ref_loaded)}")
 
     # apply PEFT module if enabled
     if config.peft.use_peft:
@@ -316,6 +298,8 @@ if __name__ == "__main__":
     ########
     train_dataloader, train_sampler = create_data_loader(params=config,
                                                         tokenizer=tokenizer,
+                                                        processor=processor,
+                                                        model_class=model_class,
                                                         batch_size=config.train.train_batch_size_per_gpu,
                                                         split='train',
                                                         world_size=world_size,
@@ -323,6 +307,8 @@ if __name__ == "__main__":
 
     val_dataloader, _ = create_data_loader(params=config,
                                           tokenizer=tokenizer,
+                                          processor=processor,
+                                          model_class=model_class,
                                           batch_size=config.train.val_batch_size_per_gpu,
                                           split='val',
                                           world_size=world_size,
@@ -342,12 +328,14 @@ if __name__ == "__main__":
     ########
     # 7. Initiate the learning algorithm
     ########
+    model_adapter = get_adapter(model_class) if processor is not None else None
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
     alg = alg_class(model_engine=model_engine,
                     ref_model_engine=ref_model_engine,
                     optimizer=optimizer,
                     normalize_loss=config.train.normalize_loss,
-                    beta=config.train.cl_beta)
+                    beta=config.train.cl_beta,
+                    model_adapter=model_adapter)
 
     ########
     # 8. Variable initialization
@@ -457,7 +445,7 @@ if __name__ == "__main__":
 
         for step, micro_batch in enumerate(progress_bar):
             # Move batch to gpu
-            micro_batch = {k: v.to(model_engine.device) for k, v in micro_batch.items()}
+            micro_batch = move_to_device(micro_batch, model_engine.device)
 
             # Run one train step for micro-batch.
             metric = alg.train_step(micro_batch)
@@ -546,7 +534,7 @@ if __name__ == "__main__":
         val_iter = tqdm(val_dataloader, desc="Validation", disable=(rank != 0))
         with torch.no_grad():
             for data in val_iter:
-                val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
+                val_batch = move_to_device(data, model_engine.device)
                 batch_size = val_batch['input_ids'].shape[0]
                 per_sample = alg.eval_step(val_batch)  # dict of [B] tensors
                 # Real samples in this batch: clip to remaining real-sample budget.

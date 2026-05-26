@@ -105,6 +105,8 @@ class DPO:
             # [B, 2, T] -> [2B, T]
             pos_ids = pos_ids.view(-1, T).to(att_mask.device)
 
+        # label would be input_ids shifted by one
+        # [2B, T] -> [2B, T-1]
         flat_batch = {
             "input_ids": input_ids,
             "attn_mask": att_mask,
@@ -117,7 +119,8 @@ class DPO:
             # MM tensors to match the [2B, ...] layout.
             flat_batch["multi_modal_inputs"] = batch["multi_modal_inputs"]
 
-        # Compute ref logits first and reduce to [2B, T-1] immediately.
+        # Compute ref logprobs first and reduce to [2B, T-1] immediately.
+        # This avoids holding full policy + ref vocab logits at the same time.
         with torch.no_grad():
             if self.model_adapter is not None:
                 ref_out = self.model_adapter.forward(self.ref_model_engine, flat_batch)
@@ -131,15 +134,18 @@ class DPO:
                     position_ids=pos_ids,
                     use_cache=False,
                 )
+                # [2B, T, vocab_size] --> [2B, T-1, vocab_size]
                 ref_logits = ref_output.logits[:, :-1, :].contiguous()
                 del ref_output
 
             two_B, T_minus_1, v = ref_logits.shape
+            # ref_logits: [2B, T-1, vocab_size] -> [2B * (T-1), vocab_size]
+            # target_ids: [2B, T-1] -> [2B * (T-1)]
             neg_ref_logprobs = self.cross_entropy(ref_logits.to(torch.float32).view(-1, v), target_ids.view(-1))
             ref_logprobs = -neg_ref_logprobs.view(two_B, T_minus_1)
             del ref_logits, neg_ref_logprobs
 
-        # Policy logits with grad tracking, then immediately reduce to token logprobs.
+        # Policy forward with grad tracking, then immediately reduce to token logprobs.
         if self.model_adapter is not None:
             pol_out = self.model_adapter.forward(self.model_engine, flat_batch)
             logits = pol_out.logits
@@ -151,6 +157,7 @@ class DPO:
                 position_ids=pos_ids,
                 use_cache=False,
             )
+            # [2B, T, vocab_size] --> [2B, T-1, vocab_size]
             logits = output.logits[:, :-1, :].contiguous()
             target_ids = input_ids[:, 1:].contiguous()
             del output

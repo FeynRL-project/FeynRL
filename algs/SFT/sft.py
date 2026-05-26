@@ -76,14 +76,19 @@ class SFT:
                 loss_mask is [B, T-1]
         '''
         if self.model_adapter is not None:
+            # Delegate to model-family adapter (supports multimodal kwargs and
+            # model-specific forward signatures) and return the canonical triple.
             out = self.model_adapter.forward(self.model_engine, batch)
             return out.logits, out.target_ids, out.loss_mask
 
         # Fallback legacy text-only path.
+        # input_ids and att_mask are [B, T]
         input_ids = batch['input_ids']
         att_mask = batch['attn_mask']
+        # loss_mask is [B, T - 1]
         loss_mask = batch['loss_mask']
 
+        # if pos_ids is not provided, hf will add it automatically.
         pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
             pos_ids = pos_ids.to(att_mask.device)
@@ -95,7 +100,14 @@ class SFT:
             use_cache=False,
         )
 
-        logits = output.logits[:, :-1, :].contiguous()
+        # [B, T, vocab_size]
+        every_token_logits = output.logits
+        # remember we use token t to predict token t+1, hence no need to predict last
+        # token's output (e.g., <eos>) and we remove it from logits.
+        logits = every_token_logits[:, :-1, :].contiguous()
+
+        # target_ids would be input_ids shifted by one
+        # so the size is [B, T-1]
         target_ids = input_ids[:, 1:].contiguous()
         return logits, target_ids, loss_mask
 

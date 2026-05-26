@@ -79,9 +79,6 @@ peft:
   lora_alpha: 0
   lora_dropout: 0
   lora_target_modules: null
-  init_adapter_dir: null
-  save_mode: "merged"   # merged|adapter|both
-  ref_use_peft: False
 
 data:
   train_ratios: {"dummy_train": 1.0}

@@ -132,21 +132,6 @@ def merge_peft_state_dict(raw_state_dict, lora_alpha, lora_rank):
     return merged
 
 
-def extract_lora_adapter_state_dict(raw_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """
-    Extract adapter-only tensors from a PEFT LoRA-wrapped model state dict.
-
-    This artifact is intended to be re-loaded into a LoRA-wrapped model in this repo.
-    It intentionally does not follow HF PEFT's save_pretrained layout to keep ZeRO-3
-    gathering logic centralized and simple.
-    """
-    adapter_sd: dict[str, torch.Tensor] = {}
-    for name, tensor in raw_state_dict.items():
-        if ".lora_A." in name or ".lora_B." in name:
-            adapter_sd[name] = tensor
-    return adapter_sd
-
-
 def barrier_with_error_check(succeeded, device, label):
     '''
         Error-propagating replacement for torch.distributed.barrier().
@@ -309,43 +294,16 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
     try:
         if rank == 0:
             os.makedirs(model_path, exist_ok=True)
-            save_mode = getattr(peft_config, "save_mode", "merged")
-            if save_mode not in ("merged", "adapter", "both"):
-                raise ValueError(f"Invalid peft.save_mode: {save_mode}")
+            if peft_config.use_peft:
+                merged_sd = merge_peft_state_dict(raw_state_dict=raw_sd,
+                                                  lora_alpha=peft_config.lora_alpha,
+                                                  lora_rank=peft_config.lora_rank)
+                save_state_dict_sharded(state_dict=merged_sd, output_dir=model_path)
+                print(f"[Alg:{label.upper()}][Rank {rank}] Saved merged PEFT model")
 
-            should_save_merged = (not peft_config.use_peft) or (save_mode in ("merged", "both"))
-            if should_save_merged:
-                if peft_config.use_peft:
-                    merged_sd = merge_peft_state_dict(raw_state_dict=raw_sd,
-                                                      lora_alpha=peft_config.lora_alpha,
-                                                      lora_rank=peft_config.lora_rank)
-                    save_state_dict_sharded(state_dict=merged_sd, output_dir=model_path)
-                    print(f"[Alg:{label.upper()}][Rank {rank}] Saved merged PEFT model")
-                else:
-                    save_state_dict_sharded(state_dict=raw_sd, output_dir=model_path)
-                    print(f"[Alg:{label.upper()}][Rank {rank}] Saved non-PEFT model")
-
-            if peft_config.use_peft and save_mode in ("adapter", "both"):
-                adapter_dir = os.path.join(model_path, "adapter")
-                os.makedirs(adapter_dir, exist_ok=True)
-                adapter_sd = extract_lora_adapter_state_dict(raw_state_dict=raw_sd)
-                if not adapter_sd:
-                    raise RuntimeError("peft.save_mode requested adapter artifact but no LoRA tensors were found")
-                save_state_dict_sharded(state_dict=adapter_sd, output_dir=adapter_dir)
-
-                peft_cfg = {
-                    "peft_type": peft_config.peft_type,
-                    "task_type": peft_config.task_type,
-                    "lora_rank": peft_config.lora_rank,
-                    "lora_alpha": peft_config.lora_alpha,
-                    "lora_dropout": peft_config.lora_dropout,
-                    "lora_target_modules": peft_config.lora_target_modules,
-                }
-                with open(os.path.join(adapter_dir, "peft_config.json"), "w") as f:
-                    json.dump(peft_cfg, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                print(f"[Alg:{label.upper()}][Rank {rank}] Saved adapter artifact to {adapter_dir}")
+            else:
+                save_state_dict_sharded(state_dict=raw_sd, output_dir=model_path)
+                print(f"[Alg:{label.upper()}][Rank {rank}] Saved non-PEFT model")
 
     except Exception as e:
         save_ok = False

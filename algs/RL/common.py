@@ -12,7 +12,6 @@ from misc.utils import set_random_seeds, torch_dtype_to_str
 import copy
 import time
 import types
-from models.peft_utils import load_lora_adapter_weights_
 # internal and local import
 from misc.nccl_utils import create_nccl_process_group
 
@@ -417,13 +416,6 @@ class COMMON:
             # ds init will fail late or silently train nothing.
             num_trainable = sum(1 for p in model.parameters() if p.requires_grad)
             assert num_trainable > 0, "PEFT produced zero trainable parameters. Check peft.lora_target_modules"
-
-            if getattr(self.peft_config, "init_adapter_dir", None):
-                result = load_lora_adapter_weights_(model, self.peft_config.init_adapter_dir, strict=True)
-                if rank == 0:
-                    print(f"[Alg:{self.alg_name}][Rank {rank}] Loaded adapter weights for {model_name} from "
-                          f"{self.peft_config.init_adapter_dir} "
-                          f"(missing={len(result['missing_keys'])}, unexpected={len(result['unexpected_keys'])})")
 
         # Enable gradient checkpointing on the HF model before DS wrapping
         # only for policy as value model is done in ppo.load_model()

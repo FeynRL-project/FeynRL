@@ -2,7 +2,7 @@ import torch
 from unittest.mock import MagicMock
 
 from algs.DPO.dpo import DPO
-from data_feeds.collators import build_preference_multimodal_collate_fn
+from data_feeds.factory import _preference_vision_collate
 from models.adapters.base import ForwardOutput
 
 
@@ -24,8 +24,7 @@ def test_preference_multimodal_collate_duplicates_vision():
             }
         )
 
-    collate = build_preference_multimodal_collate_fn(enable_vision=True)
-    batch = collate(samples)
+    batch = _preference_vision_collate(samples)
 
     assert batch["input_ids"].shape == (2, 2, T)
     assert batch["attn_mask"].shape == (2, 2, T)

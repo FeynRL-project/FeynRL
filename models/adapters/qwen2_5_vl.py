@@ -4,6 +4,7 @@ from typing import Any, Dict
 
 import torch
 
+from misc.batch_utils import move_to_device
 from models.adapters.base import ForwardOutput, ModelAdapter
 
 
@@ -74,8 +75,5 @@ class Qwen2_5VLAdapter(ModelAdapter):
         return ForwardOutput(logits=logits, target_ids=target_ids, loss_mask=loss_mask)
 
     def to_device(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        for k, v in batch.items():
-            out[k] = v.to(device) if torch.is_tensor(v) else v
-        return out
+        return move_to_device(batch, device)
 

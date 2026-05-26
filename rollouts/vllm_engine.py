@@ -322,7 +322,8 @@ class VLLMRolloutEngine(Base):
                     self.sampling_params.seed = self.seed + self.engine_id * 1000 + epoch_offset
 
                 self.log(f"Generating completions for {len(prompts)} prompts with {self.n_samples} samples each")
-                generated_outputs = self.vllm_engine.generate(prompts,
+                generated_outputs = self.vllm_engine.generate(
+                                                             [self._to_vllm_request(p) for p in prompts],
                                                              sampling_params=self.sampling_params,
                                                              use_tqdm=False)
                 self.log(f"Generation complete for {len(prompts)} prompts with policy version {policy_version}")

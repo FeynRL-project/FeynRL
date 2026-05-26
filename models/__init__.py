@@ -21,9 +21,7 @@ def load_model_and_tokenizer(model_cfg, rank: int = 0):
     """
     model_class = getattr(model_cfg, "model_class", None)
     if not model_class:
-        raise ValueError(
-            f"model.model_class must be set in config. Available: {sorted(list_loaders())}"
-        )
+        raise ValueError("model.model_class must be set in your config.")
     loader = get_loader(model_class)
     return loader(model_cfg, rank=rank)
 

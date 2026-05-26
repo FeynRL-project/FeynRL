@@ -11,25 +11,11 @@ __all__ = [
     "TextCausalLMAdapter",
     "Qwen2_5VLAdapter",
     "Qwen2AudioAdapter",
-    "get_sft_adapter",
     "get_adapter",
 ]
 
 
-def get_sft_adapter(model_class: str):
-    if model_class in ("llm", "", None):
-        return TextCausalLMAdapter()
-    if model_class == "qwen2_5_vl":
-        return Qwen2_5VLAdapter()
-    if model_class == "qwen2_audio":
-        return Qwen2AudioAdapter()
-    raise ValueError(
-        f"Unsupported model_class '{model_class}' for SFT. "
-        f"Supported: 'llm', 'qwen2_5_vl', 'qwen2_audio'."
-    )
-
-
-def get_adapter(model_class: str | None):
+def get_adapter(model_class: str | None) -> ModelAdapter:
     model_class = model_class or "llm"
     if model_class in ("llm", ""):
         return TextCausalLMAdapter()
@@ -37,4 +23,7 @@ def get_adapter(model_class: str | None):
         return Qwen2_5VLAdapter()
     if model_class == "qwen2_audio":
         return Qwen2AudioAdapter()
-    raise ValueError(f"Unknown model_class '{model_class}' for adapter dispatch")
+    raise ValueError(
+        f"Unknown model_class '{model_class}'. "
+        f"Supported: 'llm', 'qwen2_5_vl', 'qwen2_audio'."
+    )

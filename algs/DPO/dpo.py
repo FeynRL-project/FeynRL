@@ -1,9 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from typing import Optional
-
-from models.adapters.base import ModelAdapter
+from models.adapters import ModelAdapter, get_adapter
 
 class DPO:
     def __init__(self, model_engine,
@@ -11,7 +9,7 @@ class DPO:
                  optimizer,
                  beta,
                  normalize_loss=False,
-                 model_adapter: Optional[ModelAdapter] = None):
+                 model_adapter: ModelAdapter = None):
 
         self.model_engine = model_engine
         self.ref_model_engine = ref_model_engine
@@ -23,8 +21,7 @@ class DPO:
         # over the batch is the correct reduction regardless of this flag.
         self.beta = beta
 
-        # Optional adapter enables multimodal forward without changing loss logic.
-        self.model_adapter = model_adapter
+        self.model_adapter = model_adapter if model_adapter is not None else get_adapter("llm")
 
         # use cross entropy loss
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
@@ -111,87 +108,41 @@ class DPO:
             # [B, 2, T] -> [2B, T]
             pos_ids = pos_ids.view(-1, T).to(att_mask.device)
 
-        if self.model_adapter is not None:
-            merged_batch = {
-                "input_ids": input_ids,
-                "attn_mask": att_mask,
-                "loss_mask": loss_mask,
-            }
-            if pos_ids is not None:
-                merged_batch["position_ids"] = pos_ids
-            if "multi_modal_inputs" in batch:
-                merged_batch["multi_modal_inputs"] = batch["multi_modal_inputs"]
+        merged_batch = {
+            "input_ids": input_ids,
+            "attn_mask": att_mask,
+            "loss_mask": loss_mask,
+        }
+        if pos_ids is not None:
+            merged_batch["position_ids"] = pos_ids
+        if "multi_modal_inputs" in batch:
+            merged_batch["multi_modal_inputs"] = batch["multi_modal_inputs"]
 
-            with torch.no_grad():
-                ref_out = self.model_adapter.forward(self.ref_model_engine, merged_batch)
-                ref_logits = ref_out.logits
-                ref_target_ids = ref_out.target_ids
-                ref_loss_mask = ref_out.loss_mask
-
-                two_B, T_minus_1, v = ref_logits.shape
-                neg_ref_logprobs = self.cross_entropy(
-                    ref_logits.to(torch.float32).view(-1, v),
-                    ref_target_ids.view(-1),
-                )
-                ref_logprobs = -neg_ref_logprobs.view(two_B, T_minus_1)
-                del ref_out, ref_logits, ref_target_ids, neg_ref_logprobs
-
-            pol_out = self.model_adapter.forward(self.model_engine, merged_batch)
-            logits = pol_out.logits
-            target_ids = pol_out.target_ids
-            loss_mask = pol_out.loss_mask
-
-            two_B, T_minus_1, v = logits.shape
-            neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, v), target_ids.view(-1))
-            logprobs = -neg_logprobs.view(two_B, T_minus_1)
-            del pol_out, logits, target_ids, neg_logprobs
-
-            # Sanity: ensure ref mask matches policy mask when adapter provides both.
-            if ref_loss_mask is not None and torch.is_tensor(ref_loss_mask):
-                if ref_loss_mask.shape != loss_mask.shape:
-                    raise ValueError(
-                        f"Adapter loss_mask shape mismatch: policy={list(loss_mask.shape)} ref={list(ref_loss_mask.shape)}"
-                    )
-
-            return logprobs, ref_logprobs, loss_mask
-
-        # label would be input_ids shifted by one
-        # [2B, T] -> [2B, T-1]
-        target_ids = input_ids[:, 1:].contiguous()
-
-        # Compute ref logprobs first and reduce to [2B, T-1] immediately.
-        # This avoids holding full policy + ref vocab logits at the same time.
         with torch.no_grad():
-            ref_output = self.ref_model_engine(input_ids=input_ids,
-                                               attention_mask=att_mask,
-                                               position_ids=pos_ids,
-                                               use_cache=False)
-
-            # [2B, T, vocab_size] --> [2B, T-1, vocab_size]
-            ref_logits = ref_output.logits[:, :-1, :].contiguous()
-            two_B, T_minus_1, v = ref_logits.shape
-            # ref_logits: [2B, T-1, vocab_size] -> [2B * (T-1), vocab_size]
-            # target_ids: [2B, T-1] -> [2B * (T-1)]
-            neg_ref_logprobs = self.cross_entropy(ref_logits.to(torch.float32).view(-1, v), target_ids.view(-1))
+            ref_out = self.model_adapter.forward(self.ref_model_engine, merged_batch)
+            two_B, T_minus_1, v = ref_out.logits.shape
+            neg_ref_logprobs = self.cross_entropy(
+                ref_out.logits.to(torch.float32).view(-1, v),
+                ref_out.target_ids.view(-1),
+            )
             ref_logprobs = -neg_ref_logprobs.view(two_B, T_minus_1)
-            del ref_output, ref_logits, neg_ref_logprobs
+            ref_loss_mask = ref_out.loss_mask
+            del ref_out, neg_ref_logprobs
 
-        # Policy forward with grad tracking, then immediately reduce to token logprobs.
-        output = self.model_engine(input_ids=input_ids,
-                                   attention_mask=att_mask,
-                                   position_ids=pos_ids,
-                                   use_cache=False)
+        pol_out = self.model_adapter.forward(self.model_engine, merged_batch)
+        two_B, T_minus_1, v = pol_out.logits.shape
+        neg_logprobs = self.cross_entropy(
+            pol_out.logits.to(torch.float32).view(-1, v),
+            pol_out.target_ids.view(-1),
+        )
+        logprobs = -neg_logprobs.view(two_B, T_minus_1)
+        loss_mask = pol_out.loss_mask
+        del pol_out, neg_logprobs
 
-        # [2B, T, vocab_size] --> [2B, T-1, vocab_size]
-        logits     = output.logits[:, :-1, :].contiguous()
-        vocab_size = logits.shape[-1]
-        del output
-
-        # Compute per-token log-probs in float32 to avoid bf16/fp16 quantization.
-        # cross_entropy returns -logprobs, so we negate.
-        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
-        logprobs     = -neg_logprobs.view(two_B, T_minus_1)
-        del logits, neg_logprobs
+        if ref_loss_mask.shape != loss_mask.shape:
+            raise ValueError(
+                f"Adapter loss_mask shape mismatch: policy={list(loss_mask.shape)} ref={list(ref_loss_mask.shape)}"
+            )
 
         return logprobs, ref_logprobs, loss_mask
 

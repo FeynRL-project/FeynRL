@@ -11,10 +11,8 @@ from peft import get_peft_model, LoraConfig
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
-from data_feeds.preference import PreferenceFeed
+from data_feeds.factory import make_preference_feed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
-from data_feeds.image_preference import ImagePreferenceFeed
-from data_feeds.collators import build_preference_multimodal_collate_fn
 from misc.batch_utils import move_to_device
 from misc.utils import get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
@@ -126,20 +124,7 @@ def create_data_loader(params, tokenizer, processor, model_class, rank, world_si
     # steps_per_epoch is only needed for training (MixedDatasetSampler)
     steps_per_epoch = params.train.micro_batches_per_epoch if split == 'train' else None
 
-    use_mm = processor is not None and (model_class == "qwen2_5_vl")
-    dataset_cls = ImagePreferenceFeed if use_mm else PreferenceFeed
-    dataset_kwargs = None
-    collate_fn = None
-    if use_mm:
-        adapter = get_adapter(model_class)
-        dataset_kwargs = {
-            "processor": processor,
-            "adapter": adapter,
-            "image_bytes_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
-            "image_placeholder_token": getattr(params.data, "image_placeholder_token", None) or "<image>",
-            "insert_image_token_if_missing": bool(getattr(params.data, "insert_image_token_if_missing", False)),
-        }
-        collate_fn = build_preference_multimodal_collate_fn(enable_vision=True)
+    dataset_cls, dataset_kwargs, collate_fn = make_preference_feed(model_class, params, processor)
 
     dataset, sampler = create_dataset_and_sampler(
         data_paths=data_path,
@@ -328,7 +313,7 @@ if __name__ == "__main__":
     ########
     # 7. Initiate the learning algorithm
     ########
-    model_adapter = get_adapter(model_class) if processor is not None else None
+    model_adapter = get_adapter(model_class)
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
     alg = alg_class(model_engine=model_engine,
                     ref_model_engine=ref_model_engine,

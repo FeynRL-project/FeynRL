@@ -590,14 +590,7 @@ class VLLMRolloutEngineAsync(Base):
             # vllm v1 (AsyncLLM) takes either:
             #  - {"prompt_token_ids": [...]} for token-based prompts, or
             #  - {"prompt": "...", "multi_modal_data": {...}} for multimodal prompts.
-            if "prompt" in prompt_data:
-                req = {"prompt": prompt_data["prompt"]}
-                if "multi_modal_data" in prompt_data:
-                    req["multi_modal_data"] = prompt_data["multi_modal_data"]
-            else:
-                req = {"prompt_token_ids": prompt_data["prompt_token_ids"]}
-
-            async for output in self.async_engine.generate(prompt=req,
+            async for output in self.async_engine.generate(prompt=self._to_vllm_request(prompt_data),
                                                            sampling_params=sampling_params,
                                                            request_id=str(request_id)):
                 final_output = output

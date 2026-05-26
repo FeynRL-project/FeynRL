@@ -187,17 +187,17 @@ def test_normalize_pad_token_skips_when_already_set():
 # ---------------------------------------------------------------------------
 
 
-def test_get_sft_adapter_dispatches_by_model_class():
-    from models.adapters import TextCausalLMAdapter, get_sft_adapter
+def test_get_adapter_dispatches_by_model_class():
+    from models.adapters import TextCausalLMAdapter, get_adapter
 
-    assert isinstance(get_sft_adapter("llm"), TextCausalLMAdapter)
+    assert isinstance(get_adapter("llm"), TextCausalLMAdapter)
 
 
-def test_get_sft_adapter_unknown_model_class_raises():
-    from models.adapters import get_sft_adapter
+def test_get_adapter_unknown_model_class_raises():
+    from models.adapters import get_adapter
 
-    with pytest.raises(ValueError, match="Unsupported model_class"):
-        get_sft_adapter("__does_not_exist__")
+    with pytest.raises(ValueError, match="Unknown model_class"):
+        get_adapter("__does_not_exist__")
 
 
 def test_llm_loader_is_registered_and_callable():

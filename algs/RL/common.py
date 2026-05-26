@@ -8,7 +8,7 @@ import deepspeed
 from peft import get_peft_model, LoraConfig
 from safetensors.torch import save_file
 from huggingface_hub import split_torch_state_dict_into_shards
-from misc.utils import set_random_seeds
+from misc.utils import set_random_seeds, torch_dtype_to_str
 import copy
 import time
 import types
@@ -389,15 +389,6 @@ class COMMON:
         '''
             Helper to load a single model from HuggingFace.
         '''
-        def _dtype_to_str(dt: torch.dtype) -> str:
-            if dt == torch.bfloat16:
-                return "bfloat16"
-            if dt == torch.float16:
-                return "float16"
-            if dt == torch.float32:
-                return "float32"
-            return str(dt).replace("torch.", "")
-
         import models.transformers  # noqa: F401
         from models.registry import get_loader
 
@@ -405,7 +396,7 @@ class COMMON:
         loader = get_loader(model_class)
         cfg = types.SimpleNamespace(
             name=model_path,
-            dtype=_dtype_to_str(dtype),
+            dtype=torch_dtype_to_str(dtype),
             trust_remote_code=self.trust_remote_code,
             attn_implementation=self.attn_impl,
             processor_name_or_path=getattr(self, "processor_name_or_path", None),

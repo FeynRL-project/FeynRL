@@ -7,7 +7,7 @@ import torch
 from datasets import load_dataset
 from PIL import Image
 
-from data_feeds.image_preference import _ensure_image_token, _load_pil_image
+from data_feeds.image_utils import _ensure_image_token, _load_pil_image
 
 
 class ImagePairedFeed:

@@ -182,6 +182,14 @@ class Base:
 
         return rewards, is_per_token, correct_threshold
 
+    def _to_vllm_request(self, prompt_data: dict) -> dict:
+        if "prompt" in prompt_data:
+            req = {"prompt": prompt_data["prompt"]}
+            if "multi_modal_data" in prompt_data:
+                req["multi_modal_data"] = prompt_data["multi_modal_data"]
+            return req
+        return {"prompt_token_ids": prompt_data["prompt_token_ids"]}
+
     def score_responses_batch(self, pairs: List[tuple]) -> List[tuple]:
         '''
             Score all (prompt, response) pairs in one batch call.

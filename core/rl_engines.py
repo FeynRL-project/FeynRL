@@ -195,35 +195,10 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
     # Calculate number of batches from total samples
     num_batches = (samples_per_epoch + bsz - 1) // bsz
 
-    from data_feeds.image_prompts import ImagePromptsFeed
-    from data_feeds.audio_prompts import AudioPromptsFeed
-    from models.adapters import get_adapter
+    from data_feeds.factory import make_rollout_feed
 
     model_class = getattr(params.model, "model_class", None) or "llm"
-    if model_class == "qwen2_5_vl":
-        dataset_cls = ImagePromptsFeed
-        dataset_kwargs = {
-            "adapter": get_adapter(model_class),
-            "image_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
-            "max_image_pixels": getattr(params.data, "max_image_pixels", None),
-        }
-    elif model_class == "qwen2_audio":
-        from transformers import AutoProcessor  # type: ignore
-        _proc_name = getattr(params.model, "processor_name_or_path", None) or params.model.name
-        _processor = AutoProcessor.from_pretrained(
-            _proc_name, trust_remote_code=params.model.trust_remote_code
-        )
-        dataset_cls = AudioPromptsFeed
-        dataset_kwargs = {
-            "adapter": get_adapter(model_class),
-            "audio_key": getattr(params.data, "audio_key", None) or "audio_bytes",
-            "sampling_rate_key": getattr(params.data, "sampling_rate_key", None) or "sampling_rate",
-            "default_sampling_rate": getattr(params.data, "default_sampling_rate", None) or 16000,
-            "processor": _processor,
-        }
-    else:
-        dataset_cls = PromptsFeed
-        dataset_kwargs = None
+    dataset_cls, dataset_kwargs = make_rollout_feed(model_class, params)
 
     dataset, sampler, collate_fn = create_prompt_dataset_and_sampler(
                                                 data_paths=params.data.train_files_path,

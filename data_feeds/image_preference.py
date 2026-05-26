@@ -1,48 +1,13 @@
 from __future__ import annotations
 
-from io import BytesIO
-from typing import Any, Dict, Optional, Tuple
-
 import os
+from typing import Any, Dict, Tuple
 
 import torch
 from datasets import load_dataset
 from PIL import Image
 
-
-def _load_pil_image(payload: Any) -> Image.Image:
-    if isinstance(payload, Image.Image):
-        return payload.convert("RGB")
-    if isinstance(payload, (bytes, bytearray)):
-        return Image.open(BytesIO(payload)).convert("RGB")
-    if isinstance(payload, str):
-        path = os.path.expanduser(payload)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Image path does not exist: {payload}")
-        return Image.open(path).convert("RGB")
-    raise TypeError(f"Unsupported image payload type: {type(payload)}")
-
-
-def _ensure_image_token(messages: list, placeholder: str, insert_if_missing: bool) -> list:
-    if not insert_if_missing:
-        return messages
-    out = []
-    injected = False
-    for turn in messages:
-        if (
-            not injected
-            and isinstance(turn, dict)
-            and turn.get("role") == "user"
-            and isinstance(turn.get("content"), str)
-            and placeholder not in turn.get("content", "")
-        ):
-            new_turn = dict(turn)
-            new_turn["content"] = placeholder + new_turn["content"]
-            out.append(new_turn)
-            injected = True
-        else:
-            out.append(turn)
-    return out
+from data_feeds.image_utils import _ensure_image_token, _load_pil_image
 
 
 class ImagePreferenceFeed:

@@ -1,13 +1,14 @@
 import torch
+from models.adapters import ModelAdapter, get_adapter
 
 class SFT:
-    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1, model_adapter=None):
+    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1, model_adapter: ModelAdapter = None):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
         self.normalize_loss = normalize_loss
         self.world_size = world_size
-        self.model_adapter = model_adapter
+        self.model_adapter = model_adapter if model_adapter is not None else get_adapter("llm")
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
@@ -75,38 +76,8 @@ class SFT:
                 y is [B, T-1]
                 loss_mask is [B, T-1]
         '''
-        if self.model_adapter is not None:
-            out = self.model_adapter.forward(self.model_engine, batch)
-            return out.logits, out.target_ids, out.loss_mask
-
-        # input_ids and att_mask are [B, T]
-        input_ids = batch['input_ids']
-        att_mask  = batch['attn_mask']
-        # loss_mask is [B, T - 1]
-        loss_mask = batch['loss_mask']
-
-        # if pos_ids is not provided, hf will add it automatically.
-        pos_ids = batch.get('position_ids', None)
-        if pos_ids is not None:
-            pos_ids = pos_ids.to(att_mask.device)
-
-        # feed data to model
-        output = self.model_engine(input_ids=input_ids,
-                                   attention_mask=att_mask,
-                                   position_ids=pos_ids,
-                                   use_cache=False)
-
-        # [B, T, vocab_size]
-        every_token_logits = output.logits
-        # remember we use token t to predict token t+1, hence no need to predict last
-        # token's output (e.g., <eos>) and we remove it from logits.
-        logits = every_token_logits[:, :-1, :].contiguous()
-
-        # target_ids would be input_ids shifted by one
-        # so the size is [B, T-1]
-        target_ids = input_ids[:, 1:].contiguous()
-
-        return logits, target_ids, loss_mask
+        out = self.model_adapter.forward(self.model_engine, batch)
+        return out.logits, out.target_ids, out.loss_mask
 
     def eval_step(self, micro_batch):
         '''

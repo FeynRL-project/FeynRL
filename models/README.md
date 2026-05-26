@@ -78,7 +78,6 @@ An adapter satisfies the `ModelAdapter` Protocol defined in `adapters/base.py`:
 ```python
 class ModelAdapter(Protocol):
     def forward(self, model_engine: Any, batch: Dict[str, Any]) -> ForwardOutput: ...
-    def get_mm_kwargs(self, batch: Dict[str, Any]) -> Dict[str, Any]: ...
     def to_device(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]: ...
 ```
 
@@ -112,10 +111,6 @@ All adapters receive a batch dict with at minimum:
 Adapters for non-text models read `batch["multi_modal_inputs"]` for extra tensors (e.g.
 `pixel_values`, `image_grid_thw`, `input_features`) and pass them as `**kwargs` to the model.
 The text adapter ignores `multi_modal_inputs` entirely.
-
-**`get_mm_kwargs`** extracts modality-specific tensors from `multi_modal_inputs` into a flat
-kwargs dict ready to splat into the model forward call. Some adapters also reshape those tensors
-to match the model's expected batch layout.
 
 **`to_device`** moves the whole batch to a target device. For most adapters this is a recursive
 tensor move via `misc.batch_utils.move_to_device`. Call it before `forward` whenever the batch

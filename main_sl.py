@@ -2,7 +2,6 @@ import os
 import argparse
 import deepspeed
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from torch.utils.data import DataLoader
 import torch.distributed
 from tqdm import tqdm
@@ -14,9 +13,12 @@ from peft import get_peft_model, LoraConfig
 import configs.load as cfg # all config arguments
 from data_feeds.paired import PairedFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
+from misc.batch_utils import move_to_device
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
+import models
+from models.adapters import get_sft_adapter
 
 
 Algorithm_Registry = {# supported algorithms
@@ -80,50 +82,6 @@ def apply_peft_module(model, peft_config, rank=0):
 
     else:
         raise ValueError(f"Unsupported PEFT type: {peft_config.peft_type}")
-
-def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_impl, rank):
-    '''
-        Load models and tokenizer.
-    '''
-    assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-    assert attn_impl is None or attn_impl == '' or attn_impl in ['eager', 'flash_attention_2'], \
-        "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
-
-    # convert string to torch dtype if it is not already
-    model_dtype = safe_string_to_torch_dtype(model_dtype)
-
-    # 1. model and its config initialization
-    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(model_name,
-                                                dtype=model_dtype,
-                                                trust_remote_code=trust_remote_code,
-                                                config=model_config,
-                                                attn_implementation=None if attn_impl == '' else attn_impl)
-
-    # 2. Tokenizer initialization
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=trust_remote_code)
-
-    # if pad token is not present, we use eos token as pad token
-    # log warning if pad token is not present.
-    if tokenizer.pad_token_id is None:
-        if rank == 0:
-            print("Warning: Pad token is not present, using eos token as pad token")
-
-        if getattr(tokenizer, 'eos_token', None) is not None:
-            # prefer explicit token if available
-            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-
-        else:
-            # fallback to eos token id
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # Sync pad_token_id into model config so exported checkpoints are consistent
-    # as vllm and similar read pad_token_id from config.json, not tokenizer
-    if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
-    return model, tokenizer
 
 def create_training_engine(deepspeed_config, model):
     '''
@@ -250,11 +208,9 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                 model_dtype=config.model.dtype,
-                                                 trust_remote_code=config.model.trust_remote_code,
-                                                 attn_impl=config.model.attn_implementation,
-                                                 rank=rank)
+    model, tokenizer = models.load_model_and_tokenizer(config.model, rank=rank)
+    model_class = getattr(config.model, "model_class", "")
+    model_adapter = get_sft_adapter(model_class)
     # apply PEFT module if enabled
     if config.peft.use_peft:
         model = apply_peft_module(model=model, peft_config=config.peft, rank=rank)
@@ -325,7 +281,8 @@ if __name__ == "__main__":
     alg = alg_class(model_engine=model_engine,
                     optimizer=optimizer,
                     normalize_loss=config.train.normalize_loss,
-                    world_size=world_size)
+                    world_size=world_size,
+                    model_adapter=model_adapter)
 
     ########
     # 8. Variable initialization
@@ -449,7 +406,7 @@ if __name__ == "__main__":
             ########
             window_loss_sum = torch.tensor(0.0, device=model_engine.device)
             for mb in window_cpu:
-                micro_batch = {k: v.to(model_engine.device) for k, v in mb.items()}
+                micro_batch = move_to_device(mb, model_engine.device)
                 metric      = alg.train_step(micro_batch, ga_denom=ga_denom, ga_steps=ga_steps)
                 window_loss_sum   += metric['loss_sum']
                 epoch_loss_sum    += metric['loss_sum']
@@ -507,7 +464,7 @@ if __name__ == "__main__":
         model_engine.eval()
         with torch.no_grad():
             for data in val_iter:
-                val_batch = {k: v.to(model_engine.device) for k, v in data.items()}
+                val_batch = move_to_device(data, model_engine.device)
                 val_metric = alg.eval_step(val_batch)
                 local_loss_sum += float(val_metric['loss_sum'])
                 local_token_count += float(val_metric['num_tokens'])

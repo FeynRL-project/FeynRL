@@ -29,6 +29,34 @@ class Qwen2_5VLAdapter(ModelAdapter):
             out.append(turn)
         return out
 
+    def get_mm_kwargs(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        mm = batch.get("multi_modal_inputs", None)
+        if not isinstance(mm, dict):
+            return {}
+        vision = mm.get("vision", None)
+        if not isinstance(vision, dict):
+            return {}
+
+        mm_kwargs: Dict[str, Any] = {}
+
+        pv = vision.get("pixel_values", None)
+        if pv is not None and torch.is_tensor(pv):
+            # DataLoader stacks [N_patches, D] per sample into [B, N_patches, D].
+            # The visual encoder expects [B*N_patches, D].
+            if pv.ndim == 3:
+                pv = pv.flatten(0, 1)
+            mm_kwargs["pixel_values"] = pv
+
+        thw = vision.get("image_grid_thw", None)
+        if thw is not None and torch.is_tensor(thw):
+            # DataLoader stacks [N_imgs, 3] per sample into [B, N_imgs, 3].
+            # The visual encoder expects [B*N_imgs, 3].
+            if thw.ndim == 3:
+                thw = thw.flatten(0, 1)
+            mm_kwargs["image_grid_thw"] = thw
+
+        return mm_kwargs
+
     def forward(self, model_engine: Any, batch: Dict[str, Any]) -> ForwardOutput:
         input_ids = batch["input_ids"]
         attn_mask = batch["attn_mask"]
@@ -38,26 +66,7 @@ class Qwen2_5VLAdapter(ModelAdapter):
         if pos_ids is not None:
             pos_ids = pos_ids.to(attn_mask.device)
 
-        mm = batch.get("multi_modal_inputs", None)
-        mm_kwargs: Dict[str, Any] = {}
-        if isinstance(mm, dict):
-            vision = mm.get("vision", None)
-            if isinstance(vision, dict):
-                pv = vision.get("pixel_values", None)
-                if pv is not None and torch.is_tensor(pv):
-                    # DataLoader stacks [N_patches, D] per sample into [B, N_patches, D].
-                    # The visual encoder expects [B*N_patches, D].
-                    if pv.ndim == 3:
-                        pv = pv.flatten(0, 1)
-                    mm_kwargs["pixel_values"] = pv
-
-                thw = vision.get("image_grid_thw", None)
-                if thw is not None and torch.is_tensor(thw):
-                    # DataLoader stacks [N_imgs, 3] per sample into [B, N_imgs, 3].
-                    # The visual encoder expects [B*N_imgs, 3].
-                    if thw.ndim == 3:
-                        thw = thw.flatten(0, 1)
-                    mm_kwargs["image_grid_thw"] = thw
+        mm_kwargs = self.get_mm_kwargs(batch)
 
         outputs = model_engine(
             input_ids=input_ids,

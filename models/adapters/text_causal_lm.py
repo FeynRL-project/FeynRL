@@ -16,6 +16,9 @@ class TextCausalLMAdapter(ModelAdapter):
       - position_ids (optional): [B, T]
     """
 
+    def get_mm_kwargs(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        return {}
+
     def forward(self, model_engine: Any, batch: Dict[str, Any]) -> ForwardOutput:
         input_ids = batch["input_ids"]
         attn_mask = batch["attn_mask"]

@@ -33,6 +33,20 @@ class Qwen2AudioAdapter(ModelAdapter):
             out.append(new_turn)
         return out
 
+    def get_mm_kwargs(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        mm = batch.get("multi_modal_inputs", None)
+        if not isinstance(mm, dict):
+            return {}
+        audio = mm.get("audio", None)
+        if not isinstance(audio, dict):
+            return {}
+        mm_kwargs: Dict[str, Any] = {}
+        for k in ("input_features", "feature_attention_mask"):
+            v = audio.get(k, None)
+            if v is not None and torch.is_tensor(v):
+                mm_kwargs[k] = v
+        return mm_kwargs
+
     def forward(self, model_engine: Any, batch: Dict[str, Any]) -> ForwardOutput:
         input_ids = batch["input_ids"]
         attn_mask = batch["attn_mask"]
@@ -42,15 +56,7 @@ class Qwen2AudioAdapter(ModelAdapter):
         if pos_ids is not None:
             pos_ids = pos_ids.to(attn_mask.device)
 
-        mm = batch.get("multi_modal_inputs", None)
-        mm_kwargs: Dict[str, Any] = {}
-        if isinstance(mm, dict):
-            audio = mm.get("audio", None)
-            if isinstance(audio, dict):
-                for k in ("input_features", "feature_attention_mask"):
-                    v = audio.get(k, None)
-                    if v is not None and torch.is_tensor(v):
-                        mm_kwargs[k] = v
+        mm_kwargs = self.get_mm_kwargs(batch)
 
         outputs = model_engine(
             input_ids=input_ids,

@@ -127,13 +127,37 @@ class ImagePreferenceFeed:
         else:
             messages = _ensure_image_token(messages, self.image_placeholder_token, self.insert_image_token_if_missing)
 
+        # Compute prompt length in encoded space (includes image patch tokens injected by the
+        # processor). Must match what PreferenceFeed does: zero loss on prompt positions.
+        try:
+            prompt_text = self.tokenizer.apply_chat_template(
+                conversation=messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                skip_special_tokens=False,
+            )
+        except TypeError:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        p_enc = self.processor(text=prompt_text, images=pil, return_tensors="pt", padding=False, truncation=False)
+        prompt_len = p_enc["input_ids"].shape[1]
+
         chosen_ids, chosen_mask, vision = self._encode(messages, chosen, pil)
         rejected_ids, rejected_mask, _vision2 = self._encode(messages, rejected, pil)
+
+        chosen_loss_mask = chosen_mask[1:].clone()
+        rejected_loss_mask = rejected_mask[1:].clone()
+        if prompt_len > 1:
+            chosen_loss_mask[:prompt_len - 1] = 0
+            rejected_loss_mask[:prompt_len - 1] = 0
 
         # Stack into [2, T]
         input_ids = torch.stack([chosen_ids, rejected_ids], dim=0)
         attn_mask = torch.stack([chosen_mask, rejected_mask], dim=0)
-        loss_mask = torch.stack([chosen_mask[1:].clone(), rejected_mask[1:].clone()], dim=0)
+        loss_mask = torch.stack([chosen_loss_mask, rejected_loss_mask], dim=0)
 
         return {
             "input_ids": input_ids,

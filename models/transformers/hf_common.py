@@ -30,7 +30,7 @@ def load_hf_causal_lm(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     config = AutoConfig.from_pretrained(cfg.name, trust_remote_code=cfg.trust_remote_code)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.name,
-        dtype=dtype,
+        torch_dtype=dtype,
         trust_remote_code=cfg.trust_remote_code,
         config=config,
         attn_implementation=None if attn_impl == "" else attn_impl,
@@ -49,11 +49,11 @@ def _load_llm(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     return load_hf_causal_lm(cfg, rank=rank)
 
 
-@register("transformers_qwen2_5_sft_text")
-def _load_qwen2_5_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
+@register("qwen2_5")
+def _load_qwen2_5(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     return load_hf_causal_lm(cfg, rank=rank)
 
 
-@register("transformers_gemma3_sft_text")
-def _load_gemma3_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
+@register("gemma3")
+def _load_gemma3(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     return load_hf_causal_lm(cfg, rank=rank)

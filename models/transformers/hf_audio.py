@@ -20,7 +20,7 @@ def load_qwen2_audio(cfg: Any, rank: int = 0) -> Tuple[Any, Any, Any]:
 
     model = Qwen2AudioForConditionalGeneration.from_pretrained(
         name,
-        dtype=dtype,
+        torch_dtype=dtype,
         trust_remote_code=cfg.trust_remote_code,
         attn_implementation=None if attn_impl == "" else attn_impl,
     )

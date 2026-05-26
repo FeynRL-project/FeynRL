@@ -45,9 +45,11 @@ def _preference_vision_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     for k in keys:
         vision_batched[k] = torch.cat([v[k] for v in vision_items], dim=0)
 
-    # Duplicate so vision aligns with DPO's [B,2,T] -> [2B,T] flattening.
+    # Interleave so each sample's vision aligns with DPO's [B,2,T] -> [2B,T] layout.
+    # view(-1,T) on [B,2,T] gives [chosen_0, rejected_0, chosen_1, rejected_1, ...]
+    # so vision must be [v0, v0, v1, v1, ...] — repeat_interleave(2) not cat([t,t]).
     for k, t in vision_batched.items():
-        vision_batched[k] = torch.cat([t, t], dim=0)
+        vision_batched[k] = t.repeat_interleave(2, dim=0)
 
     out["multi_modal_inputs"] = {"vision": vision_batched}
     return out
@@ -104,6 +106,7 @@ def make_preference_feed(
             "image_placeholder_token": getattr(params.data, "image_placeholder_token", None) or "<image>",
             "insert_image_token_if_missing": bool(getattr(params.data, "insert_image_token_if_missing", False)),
         }, _preference_vision_collate
+    # TODO: add AudioPreferenceFeed + audio collator to support qwen2_audio DPO.
     return PreferenceFeed, {}, None
 
 

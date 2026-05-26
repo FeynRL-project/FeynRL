@@ -12,9 +12,10 @@ from misc.utils import load_algorithm, ray_get_with_timeout, set_random_seeds
 from ray.util.queue import Queue as RayQueue, Empty as RayQueueEmpty, Full as RayQueueFull
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
-from misc.setup_rl import load_tokenizer, save_checkpoint, load_checkpoint_for_resume, setup_ray
+from misc.setup_rl import save_checkpoint, load_checkpoint_for_resume, setup_ray
 from misc.nccl_utils import is_nccl_fatal_error
 import misc.rollout_stats as rollout_stats
+import models
 
 from core.rl_engines import (Algorithm_Registry,
                             create_training_engines,
@@ -1018,9 +1019,8 @@ def main(args, config):
     # 4. load tokenizer
     ########
     logger.info(f"Loading tokenizer from {config.model.name}")
-    tokenizer = load_tokenizer(model_name=config.model.name,
-                               trust_remote_code=config.model.trust_remote_code,
-                               rank=rank)
+    bundle = models.load(config.model, rank=rank, components=("tokenizer", "processor"))
+    tokenizer, processor = bundle.tokenizer, bundle.processor
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
 
     ########
@@ -1102,9 +1102,12 @@ def main(args, config):
     # produces up to num_rollout_engines shards (one per engine). Used as the
     # target for wait_for_round_completion's blocking drain.
     target_shards_per_round = len(rollout_dataloader) * num_rollout_engines
+    model_class = getattr(config.model, "model_class", None) or "llm"
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
                                  max_size=replay_buffer_size,
+                                 model_class=model_class,
+                                 processor=processor,
                                  )
     logger.info(f"Pipeline capacities: replay_buffer={replay_buffer_size}, "
                 f"results_queue={results_queue_maxsize}, prompt_queue={prompt_queue_maxsize}, "

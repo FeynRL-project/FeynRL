@@ -211,7 +211,8 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, tokenizer, processor = models.load_model_and_tokenizer(config.model, rank=rank)
+    bundle = models.load(config.model, rank=rank)
+    model, tokenizer, processor = bundle.model, bundle.tokenizer, bundle.processor
     model_class = getattr(config.model, "model_class", "")
     model_adapter = get_adapter(model_class)
     # apply PEFT module if enabled

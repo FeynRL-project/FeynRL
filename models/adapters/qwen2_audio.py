@@ -66,3 +66,31 @@ class Qwen2AudioAdapter(ModelAdapter):
 
     def to_device(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
         return move_to_device(batch, device)
+
+    def build_multi_modal_inputs(self, processor: Any, mm_items: list[Any]) -> Dict[str, Any]:
+        if processor is None:
+            raise ValueError("processor is required to build audio inputs for qwen2_audio")
+        if not mm_items:
+            return {}
+        audio_dicts = []
+        for m in mm_items:
+            if not isinstance(m, dict) or "audio" not in m:
+                raise KeyError("Expected each mm_item to be a dict with key 'audio' for qwen2_audio.")
+            waveform, sr = m["audio"]
+            enc = processor(text=" ", audios=waveform, sampling_rate=int(sr), return_tensors="pt")
+            ad: Dict[str, torch.Tensor] = {}
+            for k in ("input_features", "feature_attention_mask"):
+                if k in enc:
+                    ad[k] = enc[k]
+            if not ad:
+                ad = {k: enc[k] for k in enc.keys() if k not in ("input_ids", "attention_mask")}
+            audio_dicts.append(ad)
+
+        keys = set(audio_dicts[0].keys())
+        for d in audio_dicts[1:]:
+            if set(d.keys()) != keys:
+                raise ValueError("Inconsistent audio keys across batch.")
+        batched: Dict[str, torch.Tensor] = {}
+        for k in keys:
+            batched[k] = torch.cat([d[k] for d in audio_dicts], dim=0)
+        return {"audio": batched}

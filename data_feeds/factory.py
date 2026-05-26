@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 import torch
 from models.adapters import get_adapter
+import models
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +126,8 @@ def make_rollout_feed(
     if mc == "qwen2_audio":
         from data_feeds.audio_prompts import AudioPromptsFeed
         if processor is None:
-            from transformers import AutoProcessor
-            proc_name = getattr(params.model, "processor_name_or_path", None) or params.model.name
-            processor = AutoProcessor.from_pretrained(
-                proc_name, trust_remote_code=params.model.trust_remote_code
-            )
+            # Load processor via models/ to keep HF loading centralized.
+            processor = models.load(params.model, rank=0, components=("processor", "tokenizer")).processor
         return AudioPromptsFeed, {
             "adapter": get_adapter(mc),
             "audio_key": getattr(params.data, "audio_key", None) or "audio_bytes",

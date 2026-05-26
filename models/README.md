@@ -16,7 +16,7 @@ family and an algorithm is the `model_class` string set in your config.
 
 ```
 models/
-├── __init__.py              # public API: load_model_and_tokenizer()
+├── __init__.py              # public API: load()
 ├── registry.py              # @register / get_loader() — loader registry
 │
 ├── transformers/            # one module per model family (loading only)
@@ -55,8 +55,9 @@ Loaders are registered with `@register("model_class_key")` from `models/registry
 The public entry point is:
 
 ```python
-from models import load_model_and_tokenizer
-model, tokenizer, processor = load_model_and_tokenizer(model_cfg, rank=rank)
+import models
+bundle = models.load(model_cfg, rank=rank)
+model, tokenizer, processor = bundle.model, bundle.tokenizer, bundle.processor
 ```
 
 **Registered keys and what they load**

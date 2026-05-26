@@ -35,3 +35,12 @@ class ModelAdapter(Protocol):
         handle nested dicts/lists and leave non-tensor payloads untouched.
         """
         ...
+
+    def build_multi_modal_inputs(self, processor: Any, mm_items: list[Any]) -> Dict[str, Any]:
+        """
+        Convert rollout-time `multi_modal_data` items into training-time `multi_modal_inputs`.
+
+        `mm_items` is a list of per-sample payloads (typically dicts) as produced by rollout feeds,
+        e.g. {"image": PIL.Image} or {"audio": (waveform, sr)}.
+        """
+        ...

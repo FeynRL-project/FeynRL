@@ -10,7 +10,7 @@ import shutil
 from misc.utils import load_algorithm, ray_get_with_timeout, set_random_seeds
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
-from misc.setup_rl import load_tokenizer, save_checkpoint, load_checkpoint_for_resume, setup_ray
+from misc.setup_rl import save_checkpoint, load_checkpoint_for_resume, setup_ray
 from core.rl_engines import (Algorithm_Registry,
                             create_training_engines,
                             create_rollout_engines,
@@ -22,6 +22,7 @@ from core.rl_engines import (Algorithm_Registry,
                             sync_weights_direct,
                             refresh_rollout_engine,
                             reinit_nccl_weight_sync_group)
+import models
 
 def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
                    replay_buffer, policy_version, rollout_policy_version, global_step,
@@ -171,10 +172,10 @@ def main(args, config):
     # 4. load tokenizer
     ########
     logger.info(f"Loading tokenizer from {config.model.name}")
-    tokenizer = load_tokenizer(model_name=config.model.name,
-                               trust_remote_code=config.model.trust_remote_code,
-                               rank=rank)
+    bundle = models.load(config.model, rank=rank, components=("tokenizer", "processor"))
+    tokenizer, processor = bundle.tokenizer, bundle.processor
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
+    model_class = getattr(config.model, "model_class", None) or "llm"
 
     ########
     # 5. Initialize rollout engines
@@ -224,6 +225,8 @@ def main(args, config):
     # replay buffer size = rollout_samples_per_epoch (prompts) * n_samples (completions per prompt)
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
+                                 model_class=model_class,
+                                 processor=processor,
                                  )
     logger.info(f"Replay buffer initialized (max_seq_len={config.data.max_seq_len})")
 

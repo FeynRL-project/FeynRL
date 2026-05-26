@@ -1,7 +1,6 @@
 import os
 import json
 import ray
-from transformers import AutoTokenizer
 from misc.utils import ray_get_with_timeout, get_experiment_dir_name
 
 def setup_ray(ray_address):
@@ -24,25 +23,6 @@ def setup_ray(ray_address):
         master_addr = "127.0.0.1"
 
     return master_addr
-
-def load_tokenizer(model_name, trust_remote_code=False, rank=0):
-    '''
-       Load tokenizer from huggingface.
-    '''
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=trust_remote_code)
-
-    # if pad token is not present, we use eos token as pad token
-    if tokenizer.pad_token_id is None:
-        print("Warning: Pad token is not present, using eos token as pad token")
-        if getattr(tokenizer, 'eos_token', None) is not None:
-            # prefer explicit token if available
-            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-        else:
-            # fallback to eos token id
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    return tokenizer
 
 def load_checkpoint_for_resume(resume_path,
                                training_engines,

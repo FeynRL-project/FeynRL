@@ -39,3 +39,6 @@ class TextCausalLMAdapter(ModelAdapter):
 
     def to_device(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
         return move_to_device(batch, device)
+
+    def build_multi_modal_inputs(self, processor: Any, mm_items: list[Any]) -> Dict[str, Any]:
+        raise ValueError("TextCausalLMAdapter does not support multimodal inputs.")

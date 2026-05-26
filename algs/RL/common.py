@@ -34,7 +34,7 @@ class COMMON:
         This class provides common functions for policy gradient algorithms.
         Only contains methods that are 100% identical across all PG algorithms.
     '''
-    def policy_forward(self, input_ids, att_mask, pos_ids):
+    def policy_forward(self, input_ids, att_mask, pos_ids, multi_modal_inputs=None):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
@@ -42,6 +42,41 @@ class COMMON:
                 logits is [B, T-1, vocab_size]
                 entropies is [B, T-1]
         '''
+        # Multimodal RL: if multimodal inputs are provided, route forward through the
+        # model-family adapter so any extra kwargs (vision/audio tensors) are passed
+        # correctly to the model. This keeps RL algorithm math unchanged.
+        if multi_modal_inputs is not None:
+            from models.adapters import get_adapter
+            B, T = input_ids.shape
+            # Placeholder loss mask required by adapter contract; RL masking is handled
+            # separately by the algorithm's `mask` tensor.
+            loss_mask = torch.ones((B, max(0, T - 1)), device=input_ids.device, dtype=torch.int64)
+            batch = {
+                "input_ids": input_ids,
+                "attn_mask": att_mask,
+                "loss_mask": loss_mask,
+                "multi_modal_inputs": multi_modal_inputs,
+            }
+            if pos_ids is not None:
+                batch["position_ids"] = pos_ids
+
+            adapter = get_adapter(getattr(self, "model_class", None) or "llm")
+            out = adapter.forward(self.policy_engine, batch)
+            logits = out.logits  # [B, T-1, V]
+            target_ids = out.target_ids  # [B, T-1]
+
+            B2, T_minus_1, vocab_size = logits.shape
+            logprobs = compiled_log_softmax_and_gather(
+                logits.to(torch.float32).view(-1, vocab_size),
+                target_ids.view(-1),
+            ).view(B2, T_minus_1)
+
+            entropies = None
+            if self.ent_coeff > 0.0:
+                entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
+
+            return logprobs, entropies, target_ids
+
         # if pos_ids is not provided, HF will add that automatically.
         if pos_ids is not None:
             pos_ids = pos_ids.to(input_ids.device)
@@ -80,7 +115,7 @@ class COMMON:
 
         return logprobs, entropies, target_ids
 
-    def ref_forward(self, input_ids, att_mask, pos_ids):
+    def ref_forward(self, input_ids, att_mask, pos_ids, multi_modal_inputs=None):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
@@ -89,6 +124,31 @@ class COMMON:
         '''
         # feed data to model
         with torch.no_grad():
+            if multi_modal_inputs is not None:
+                from models.adapters import get_adapter
+                B, T = input_ids.shape
+                loss_mask = torch.ones((B, max(0, T - 1)), device=input_ids.device, dtype=torch.int64)
+                batch = {
+                    "input_ids": input_ids,
+                    "attn_mask": att_mask,
+                    "loss_mask": loss_mask,
+                    "multi_modal_inputs": multi_modal_inputs,
+                }
+                if pos_ids is not None:
+                    batch["position_ids"] = pos_ids
+
+                adapter = get_adapter(getattr(self, "model_class", None) or "llm")
+                out = adapter.forward(self.ref_model_engine, batch)
+                logits = out.logits
+                target_ids = out.target_ids
+
+                B2, T_minus_1, vocab_size = logits.shape
+                ref_logprobs = compiled_log_softmax_and_gather(
+                    logits.to(torch.float32).view(-1, vocab_size),
+                    target_ids.view(-1),
+                ).view(B2, T_minus_1)
+                return ref_logprobs
+
             if pos_ids is not None:
                 pos_ids = pos_ids.to(input_ids.device)
 

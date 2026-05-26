@@ -5,6 +5,7 @@ from torch.utils.data import Dataset
 
 # local imports
 from misc.utils import ensure_1d, pad_1d_to_length
+from models.adapters import get_adapter
 
 class ReplayBuffer(Dataset):
     '''
@@ -19,6 +20,8 @@ class ReplayBuffer(Dataset):
                 pad_token_id: int,
                 max_seq_len: int,
                 max_size: Optional[int] = None,
+                model_class: Optional[str] = None,
+                processor: Any = None,
                 ):
 
         if max_size is not None:
@@ -30,6 +33,8 @@ class ReplayBuffer(Dataset):
         self.max_size = max_size
         self.pad_token_id = int(pad_token_id)
         self.max_seq_len  = int(max_seq_len)
+        self.model_class = model_class or "llm"
+        self.processor = processor
         # this shows the total number of action tokens which are not masked which
         # can be used for token-weighted scaling later.
         self.total_action_tokens = 0
@@ -83,6 +88,7 @@ class ReplayBuffer(Dataset):
                      dones=sample["pred_dones"],
                      old_logprobs=sample["pred_old_logprobs"],
                      policy_version=sample["policy_version"],
+                     multi_modal_data=sample.get("multi_modal_data", None),
                      )
 
         if truncated_count > 0:
@@ -98,6 +104,7 @@ class ReplayBuffer(Dataset):
             dones: torch.Tensor,
             old_logprobs: torch.Tensor,
             policy_version: int,
+            multi_modal_data: Any = None,
             )-> None:
         '''
             input_ids, rewards, zscores, mask, done, old_logprobs
@@ -139,6 +146,7 @@ class ReplayBuffer(Dataset):
                             "dones": dones.detach().cpu(),
                             "zscores": zscores.detach().cpu(),
                             "policy_version": int(policy_version),
+                            "multi_modal_data": multi_modal_data,
                          })
 
         # Count only tokens we will ever train on
@@ -160,6 +168,7 @@ class ReplayBuffer(Dataset):
         # pad to batch_max_seq
         input_ids, attn_masks, old_logps = [], [], []
         masks, rewards, dones, zscores = [], [], [], []
+        mm_items = []
 
         for x in batch:
             # pad everything to zero except for input_ids which should
@@ -174,6 +183,7 @@ class ReplayBuffer(Dataset):
             rewards.append(pad_1d_to_length(x=x["rewards"], pad_value=0.0, target_len=target_len))
             dones.append(pad_1d_to_length(x=x["dones"], pad_value=0, target_len=target_len))
             zscores.append(pad_1d_to_length(x=x["zscores"], pad_value=0.0, target_len=target_len))
+            mm_items.append(x.get("multi_modal_data", None))
 
         # convert from list of [T] to [B, T]
         input_ids   = torch.stack(input_ids, dim=0)
@@ -192,7 +202,7 @@ class ReplayBuffer(Dataset):
         # this is per rank, this is not global. Should be revised outised this class.
         action_token_weight = float(batch_action_tokens) / float(total_action_tokens)
 
-        return {
+        out: Dict[str, Any] = {
                 "input_ids": input_ids, # [B, T]
                 "attn_mask": attn_masks, # [B, T]
                 "old_logprobs": old_logps, # [B, T]
@@ -203,6 +213,21 @@ class ReplayBuffer(Dataset):
                 "batch_action_tokens": batch_action_tokens, # scalar int
                 "action_token_weight": action_token_weight, # scalar float
                 }
+
+        # Optional multimodal conditioning. If present, compute multi_modal_inputs
+        # that adapters can pass through to HF multimodal forward().
+        if any(m is not None for m in mm_items):
+            if self.processor is None:
+                raise RuntimeError(
+                    "ReplayBuffer has multimodal samples but no processor. "
+                    "Pass processor=... when constructing ReplayBuffer."
+                )
+            adapter = get_adapter(self.model_class)
+            out["multi_modal_inputs"] = adapter.build_multi_modal_inputs(self.processor, mm_items)
+
+        return {
+            **out
+        }
 
     def __getitem__(self, idx) -> Dict[str, Any]:
         return self.items[idx]

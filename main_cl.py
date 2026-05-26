@@ -222,24 +222,13 @@ if __name__ == "__main__":
     ########
     model_class = config.model.model_class or "llm"
 
-    loaded = models.load_model_and_tokenizer(config.model, rank=rank)
-    if isinstance(loaded, tuple) and len(loaded) == 3:
-        model, tokenizer, processor = loaded
-    elif isinstance(loaded, tuple) and len(loaded) == 2:
-        model, tokenizer = loaded
-        processor = None
-    else:
-        raise RuntimeError(f"Unexpected return from models.load_model_and_tokenizer: {type(loaded)}")
+    bundle = models.load(config.model, rank=rank)
+    model, tokenizer, processor = bundle.model, bundle.tokenizer, bundle.processor
 
     ref_name = config.model.ref_model or config.model.name
     ref_cfg = config.model.model_copy(update={"name": ref_name})
-    ref_loaded = models.load_model_and_tokenizer(ref_cfg, rank=rank)
-    if isinstance(ref_loaded, tuple) and len(ref_loaded) == 3:
-        ref_model = ref_loaded[0]
-    elif isinstance(ref_loaded, tuple) and len(ref_loaded) == 2:
-        ref_model = ref_loaded[0]
-    else:
-        raise RuntimeError(f"Unexpected return from models.load_model_and_tokenizer (ref): {type(ref_loaded)}")
+    ref_bundle = models.load(ref_cfg, rank=rank, components=("model",))
+    ref_model = ref_bundle.model
 
     # apply PEFT module if enabled
     if config.peft.use_peft:

@@ -39,7 +39,7 @@ def test_registry_list_loaders_contains_expected_keys():
 
 
 # ---------------------------------------------------------------------------
-# load_model_and_tokenizer dispatch
+# models.load dispatch
 # ---------------------------------------------------------------------------
 
 
@@ -55,9 +55,10 @@ def test_load_dispatches_to_registered_loader():
 
     model_cfg = MagicMock()
     model_cfg.model_class = "_unit_test_dispatch"
-    assert models.load_model_and_tokenizer(model_cfg, rank=0) is sentinel
-    # Back-compat alias should behave identically.
-    assert models.load_sft_model_and_tokenizer(model_cfg, rank=0) is sentinel
+    model_cfg.name = "dummy"
+    model_cfg.trust_remote_code = False
+    out = models.load(model_cfg, rank=0, components=("model", "tokenizer"))
+    assert (out.model, out.tokenizer) == sentinel
 
 
 def test_load_none_model_class_raises():
@@ -66,7 +67,7 @@ def test_load_none_model_class_raises():
     model_cfg = MagicMock()
     model_cfg.model_class = None
     with pytest.raises(ValueError, match="model.model_class must be set"):
-        models.load_model_and_tokenizer(model_cfg)
+        models.load(model_cfg)
 
 
 def test_load_empty_model_class_raises():
@@ -75,7 +76,7 @@ def test_load_empty_model_class_raises():
     model_cfg = MagicMock()
     model_cfg.model_class = ""
     with pytest.raises(ValueError, match="model.model_class must be set"):
-        models.load_model_and_tokenizer(model_cfg)
+        models.load(model_cfg)
 
 
 # ---------------------------------------------------------------------------

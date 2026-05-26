@@ -73,3 +73,28 @@ class Qwen2_5VLAdapter(ModelAdapter):
 
     def to_device(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
         return move_to_device(batch, device)
+
+    def build_multi_modal_inputs(self, processor: Any, mm_items: list[Any]) -> Dict[str, Any]:
+        if processor is None:
+            raise ValueError("processor is required to build vision inputs for qwen2_5_vl")
+        if not mm_items:
+            return {}
+        vision_dicts = []
+        for m in mm_items:
+            if not isinstance(m, dict) or "image" not in m:
+                raise KeyError("Expected each mm_item to be a dict with key 'image' for qwen2_5_vl.")
+            enc = processor(text=" ", images=m["image"], return_tensors="pt")
+            if "pixel_values" in enc or "image_grid_thw" in enc:
+                vd = {k: enc[k] for k in ("pixel_values", "image_grid_thw") if k in enc}
+            else:
+                vd = {k: enc[k] for k in enc.keys() if k not in ("input_ids", "attention_mask")}
+            vision_dicts.append(vd)
+
+        keys = set(vision_dicts[0].keys())
+        for d in vision_dicts[1:]:
+            if set(d.keys()) != keys:
+                raise ValueError("Inconsistent vision keys across batch.")
+        batched: Dict[str, torch.Tensor] = {}
+        for k in keys:
+            batched[k] = torch.cat([d[k] for d in vision_dicts], dim=0)
+        return {"vision": batched}

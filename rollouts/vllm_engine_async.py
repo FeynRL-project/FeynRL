@@ -344,6 +344,9 @@ class VLLMRolloutEngineAsync(Base):
             prompt_len = len(prompt_ids)
             if prompt_len == 0:
                 raise ValueError(f"No prompt token ids found in generated output: {data}")
+            mm_data = None
+            if isinstance(prompt_data, dict):
+                mm_data = prompt_data.get("multi_modal_data", None)
 
             # process generated responses
             for response in data.outputs:
@@ -422,9 +425,13 @@ class VLLMRolloutEngineAsync(Base):
                     eos_in_tokens = (response_ids[-1] == self.eos_id)
                     ended_on_eos  = (finish_reason == "stop" and stop_reason is None and eos_in_tokens)
 
-                    group_samples.append({ "iter": int(current_iter),
+                group_samples.append({ "iter": int(current_iter),
                                         "policy_version": int(policy_version),
                                         "loaded_version": int(self.loaded_version),
+                                        # Optional multimodal payload from the prompt.
+                                        # Stored so RL training can condition on the same modality
+                                        # that was used during rollout generation.
+                                        "multi_modal_data": mm_data,
 
                                         # token-aligned
                                         "input_ids": input_ids, #[T]

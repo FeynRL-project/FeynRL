@@ -5,7 +5,6 @@ import numpy as np
 import argparse
 import importlib
 import torch
-from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 import ray
 import time
@@ -18,6 +17,7 @@ from rollouts.vllm_engine import VLLMRolloutEngine
 from misc.utils import set_random_seeds, ray_get_with_timeout, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 from rollouts.replay_buffer import ReplayBuffer
+import models
 
 
 def setup_ray(ray_address):
@@ -41,23 +41,14 @@ def setup_ray(ray_address):
     return master_addr
 
 def load_tokenizer(model_name, trust_remote_code=False, rank=0):
-    '''
-       Load tokenizer from huggingface.
-    '''
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=trust_remote_code)
-
-    # if pad token is not present, we use eos token as pad token
-    if tokenizer.pad_token_id is None:
-        print("Warning: Pad token is not present, using eos token as pad token")
-        if getattr(tokenizer, 'eos_token', None) is not None:
-            # prefer explicit token if available
-            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-        else:
-            # fallback to eos token id
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    return tokenizer
+    # Back-compat shim for older scripts; prefer `models.load(..., components=...)`.
+    class _Cfg:
+        def __init__(self):
+            self.name = model_name
+            self.trust_remote_code = trust_remote_code
+            self.model_class = "llm"
+            self.processor_name_or_path = None
+    return models.load(_Cfg(), rank=rank, components=("tokenizer",)).tokenizer
 
 def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
     '''
@@ -370,9 +361,8 @@ if __name__ == "__main__":
     # 5. load tokenizer
     ########
     logger.info(f"Loading tokenizer from {config.model.name}")
-    tokenizer = load_tokenizer(model_name=config.model.name,
-                               trust_remote_code=config.model.trust_remote_code,
-                               rank=rank)
+    bundle = models.load(config.model, rank=rank, components=("tokenizer", "processor"))
+    tokenizer, processor = bundle.tokenizer, bundle.processor
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
 
     ########
@@ -403,8 +393,11 @@ if __name__ == "__main__":
                                                   tokenizer=tokenizer,
                                                   num_rollout_engines=num_rollout_engines)
     logger.info(f"Rollout dataloader ready. Total batches per epoch: {len(rollout_dataloader)}")
+    model_class = getattr(config.model, "model_class", None) or "llm"
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
+                                 model_class=model_class,
+                                 processor=processor,
                                  )
     logger.info("Replay buffer initialized")
 

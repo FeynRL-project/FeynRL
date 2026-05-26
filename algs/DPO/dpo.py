@@ -23,6 +23,41 @@ class DPO:
         # use cross entropy loss
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction="none")
 
+    def _logprobs_from_logits_chunked(self, logits: torch.Tensor, target_ids: torch.Tensor, chunk_size_tokens: int = 4096) -> torch.Tensor:
+        """
+        Convert vocab logits -> per-token logprobs in chunks to reduce peak memory.
+
+        Args:
+            logits: [B, T-1, V]
+            target_ids: [B, T-1]
+            chunk_size_tokens: number of (B*(T-1)) tokens per chunk.
+        Returns:
+            logprobs: [B, T-1] float32
+        """
+        if logits.dim() != 3:
+            raise ValueError(f"Expected logits [B, T-1, V], got {list(logits.shape)}")
+        if target_ids.shape != logits.shape[:2]:
+            raise ValueError(f"target_ids shape {list(target_ids.shape)} does not match logits {list(logits.shape)}")
+        if chunk_size_tokens < 1:
+            raise ValueError(f"chunk_size_tokens must be >= 1, got {chunk_size_tokens}")
+
+        B, Tm1, V = logits.shape
+        flat_logits = logits.reshape(-1, V)
+        flat_targets = target_ids.reshape(-1)
+        N = flat_targets.numel()
+
+        out = torch.empty((N,), device=logits.device, dtype=torch.float32)
+
+        for start in range(0, N, chunk_size_tokens):
+            end = min(start + chunk_size_tokens, N)
+            chunk_logits = flat_logits[start:end].to(torch.float32)
+            chunk_targets = flat_targets[start:end]
+            # cross_entropy returns -logprobs when reduction="none", so we negate.
+            out[start:end] = -F.cross_entropy(chunk_logits, chunk_targets, reduction="none")
+            del chunk_logits, chunk_targets
+
+        return out.view(B, Tm1)
+
     def compute_per_sample_loss_and_metrics(self, logprobs, ref_logprobs, loss_mask):
         '''
             Computes per-sample loss and metrics.
@@ -139,11 +174,8 @@ class DPO:
                 del ref_output
 
             two_B, T_minus_1, v = ref_logits.shape
-            # ref_logits: [2B, T-1, vocab_size] -> [2B * (T-1), vocab_size]
-            # target_ids: [2B, T-1] -> [2B * (T-1)]
-            neg_ref_logprobs = self.cross_entropy(ref_logits.to(torch.float32).view(-1, v), target_ids.view(-1))
-            ref_logprobs = -neg_ref_logprobs.view(two_B, T_minus_1)
-            del ref_logits, neg_ref_logprobs
+            ref_logprobs = self._logprobs_from_logits_chunked(ref_logits, target_ids)
+            del ref_logits
 
         # Policy forward with grad tracking, then immediately reduce to token logprobs.
         if self.model_adapter is not None:
@@ -166,9 +198,8 @@ class DPO:
 
         # Compute per-token log-probs in float32 to avoid bf16/fp16 quantization.
         # cross_entropy returns -logprobs, so we negate.
-        neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
-        logprobs     = -neg_logprobs.view(two_B, T_minus_1)
-        del logits, neg_logprobs
+        logprobs = self._logprobs_from_logits_chunked(logits, target_ids)
+        del logits
 
         return logprobs, ref_logprobs, loss_mask
 

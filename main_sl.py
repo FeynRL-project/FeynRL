@@ -12,13 +12,15 @@ from peft import get_peft_model, LoraConfig
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
 from data_feeds.paired import PairedFeed
+from data_feeds.image_paired import ImagePairedFeed
+from data_feeds.audio_paired import AudioPairedFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
 from misc.batch_utils import move_to_device
 from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
 import models
-from models.adapters import get_sft_adapter
+from models.adapters import get_sft_adapter, get_adapter
 
 
 Algorithm_Registry = {# supported algorithms
@@ -106,7 +108,7 @@ def create_training_engine(deepspeed_config, model):
                                                         )
     return model_engine, optimizer
 
-def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
+def create_data_loader(params, tokenizer, rank, world_size, batch_size, split, processor=None, model_class=None):
     '''
        Setup DataLoader for distributed training.
        As a reminder, batch_size is the per-gpu-micro-batch size.
@@ -117,6 +119,31 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
 
     # steps_per_epoch is only needed for training (MixedDatasetSampler)
     steps_per_epoch = params.train.micro_batches_per_epoch if split == 'train' else None
+
+    # Select feed class and extra kwargs based on modality.
+    model_class = model_class or ""
+    if model_class == "qwen2_5_vl":
+        dataset_cls = ImagePairedFeed
+        dataset_kwargs = {
+            "processor": processor,
+            "adapter": get_adapter(model_class),
+            "image_bytes_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
+            "image_placeholder_token": getattr(params.data, "image_placeholder_token", None) or "<image>",
+            "insert_image_token_if_missing": getattr(params.data, "insert_image_token_if_missing", False) or False,
+            "max_image_pixels": getattr(params.data, "max_image_pixels", None),
+        }
+    elif model_class == "qwen2_audio":
+        dataset_cls = AudioPairedFeed
+        dataset_kwargs = {
+            "processor": processor,
+            "adapter": get_adapter(model_class),
+            "audio_key": getattr(params.data, "audio_key", None) or "audio_bytes",
+            "sampling_rate_key": getattr(params.data, "sampling_rate_key", None) or "sampling_rate",
+            "default_sampling_rate": getattr(params.data, "default_sampling_rate", None) or 16000,
+        }
+    else:
+        dataset_cls = PairedFeed
+        dataset_kwargs = {}
 
     dataset, sampler = create_dataset_and_sampler(data_paths=data_path,
                                                   prompt_key=params.data.prompt_key,
@@ -129,7 +156,8 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                                   world_size=world_size,
                                                   seed=params.run.seed,
                                                   local_batch_size=batch_size,
-                                                  dataset_cls=PairedFeed,
+                                                  dataset_cls=dataset_cls,
+                                                  dataset_kwargs=dataset_kwargs,
                                                   steps_per_epoch=steps_per_epoch,
                                                   shuffle_within_batch=True,
                                                   dynamic_ratio_every_step=params.train.dynamic_ratio_every_step)
@@ -208,7 +236,7 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, tokenizer = models.load_model_and_tokenizer(config.model, rank=rank)
+    model, tokenizer, processor = models.load_model_and_tokenizer(config.model, rank=rank)
     model_class = getattr(config.model, "model_class", "")
     model_adapter = get_sft_adapter(model_class)
     # apply PEFT module if enabled
@@ -254,14 +282,18 @@ if __name__ == "__main__":
                                                         batch_size=config.train.train_batch_size_per_gpu,
                                                         split='train',
                                                         world_size=world_size,
-                                                        rank=rank)
+                                                        rank=rank,
+                                                        processor=processor,
+                                                        model_class=model_class)
 
     val_dataloader, _ = create_data_loader(params=config,
                                           tokenizer=tokenizer,
                                           batch_size=config.train.val_batch_size_per_gpu,
                                           split='val',
                                           world_size=world_size,
-                                          rank=rank)
+                                          rank=rank,
+                                          processor=processor,
+                                          model_class=model_class)
 
     # With ZeRO-3, model parameters are partitioned across GPUs and only gathered temporarily
     # into gpu memory during a forward/backward pass. Peak memory scales with batch size.

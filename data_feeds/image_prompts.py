@@ -8,6 +8,9 @@ from PIL import Image
 
 from data_feeds.prompts import PromptsFeed
 
+# Some PNGs embed large ICC profiles that exceed PIL's default 1 MB cap.
+PIL.PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
+
 
 def _load_pil_image(payload: Any) -> Image.Image:
     """
@@ -18,8 +21,6 @@ def _load_pil_image(payload: Any) -> Image.Image:
     """
     if isinstance(payload, Image.Image):
         return payload
-    # Some PNGs embed large ICC profiles that exceed PIL's default 1 MB cap.
-    PIL.PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
     if isinstance(payload, (bytes, bytearray)):
         return Image.open(BytesIO(payload)).convert("RGB")
     if isinstance(payload, str):

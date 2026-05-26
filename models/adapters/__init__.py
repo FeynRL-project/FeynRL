@@ -17,19 +17,16 @@ __all__ = [
 
 
 def get_sft_adapter(model_class: str):
-    """
-    Keep SFT adapters simple for now: we support a single text LLM adapter.
-
-    Convention:
-      - set `model.model_class: llm` in configs for text-only HF causal LMs
-      - future model-specific / multimodal adapters can be added later
-    """
-    if model_class not in ("llm", "", None):
-        raise ValueError(
-            f"Unsupported model_class '{model_class}' for SFT adapter in this PR. "
-            "Use model.model_class: llm for text-only runs."
-        )
-    return TextCausalLMAdapter()
+    if model_class in ("llm", "", None):
+        return TextCausalLMAdapter()
+    if model_class == "qwen2_5_vl":
+        return Qwen2_5VLAdapter()
+    if model_class == "qwen2_audio":
+        return Qwen2AudioAdapter()
+    raise ValueError(
+        f"Unsupported model_class '{model_class}' for SFT. "
+        f"Supported: 'llm', 'qwen2_5_vl', 'qwen2_audio'."
+    )
 
 
 def get_adapter(model_class: str | None):

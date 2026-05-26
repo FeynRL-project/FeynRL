@@ -45,10 +45,21 @@ class Qwen2_5VLAdapter(ModelAdapter):
         if isinstance(mm, dict):
             vision = mm.get("vision", None)
             if isinstance(vision, dict):
-                for k in ("pixel_values", "image_grid_thw"):
-                    v = vision.get(k, None)
-                    if v is not None and torch.is_tensor(v):
-                        mm_kwargs[k] = v
+                pv = vision.get("pixel_values", None)
+                if pv is not None and torch.is_tensor(pv):
+                    # DataLoader stacks [N_patches, D] per sample into [B, N_patches, D].
+                    # The visual encoder expects [B*N_patches, D].
+                    if pv.ndim == 3:
+                        pv = pv.flatten(0, 1)
+                    mm_kwargs["pixel_values"] = pv
+
+                thw = vision.get("image_grid_thw", None)
+                if thw is not None and torch.is_tensor(thw):
+                    # DataLoader stacks [N_imgs, 3] per sample into [B, N_imgs, 3].
+                    # The visual encoder expects [B*N_imgs, 3].
+                    if thw.ndim == 3:
+                        thw = thw.flatten(0, 1)
+                    mm_kwargs["image_grid_thw"] = thw
 
         outputs = model_engine(
             input_ids=input_ids,

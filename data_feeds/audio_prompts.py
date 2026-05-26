@@ -55,6 +55,7 @@ class AudioPromptsFeed(PromptsFeed):
         sampling_rate_key: str = "sampling_rate",
         default_sampling_rate: int = 16000,
         adapter: Any | None = None,
+        processor: Any | None = None,
     ):
         super().__init__(
             prompt_key=prompt_key,
@@ -67,6 +68,7 @@ class AudioPromptsFeed(PromptsFeed):
         self.sampling_rate_key = sampling_rate_key
         self.default_sampling_rate = int(default_sampling_rate)
         self.adapter = adapter
+        self.processor = processor
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.data[int(idx)]
@@ -80,23 +82,9 @@ class AudioPromptsFeed(PromptsFeed):
         if self.adapter is not None:
             messages = self.adapter.prepare_messages(messages)
 
-        # Processor chat templates may accept structured content; AutoTokenizer templates may not.
-        try:
-            prompt_text = self.tokenizer.apply_chat_template(
-                conversation=messages,
-                add_generation_prompt=True,
-                tokenize=False,
-                skip_special_tokens=False,
-            )
-            prompt_ids = self.tokenizer.apply_chat_template(
-                conversation=messages,
-                add_generation_prompt=True,
-                tokenize=True,
-            )
-        except TypeError:
-            # Fallback: processor-style signature apply_chat_template(messages, ...)
-            prompt_text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            prompt_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        template_fn = getattr(self.processor, "apply_chat_template", None) or self.tokenizer.apply_chat_template
+        prompt_text = template_fn(messages, add_generation_prompt=True, tokenize=False)
+        prompt_ids = template_fn(messages, add_generation_prompt=True, tokenize=True)
 
         if not isinstance(prompt_ids, list) or len(prompt_ids) == 0:
             raise ValueError(f"Sample {idx}: tokenization produced empty prompt_ids")

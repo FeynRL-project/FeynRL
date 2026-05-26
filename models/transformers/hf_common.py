@@ -20,7 +20,7 @@ def normalize_pad_token(model: Any, tokenizer: Any, rank: int = 0) -> None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
 
-def load_hf_causal_lm(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
+def load_hf_causal_lm(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     assert cfg.dtype != "auto", "dtype must not be auto to avoid precision issues"
     assert getattr(cfg, "attn_implementation", None) in (None, "", "eager", "flash_attention_2"), (
         "attn_implementation must be one of None, '', 'eager', 'flash_attention_2'"
@@ -37,7 +37,7 @@ def load_hf_causal_lm(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
     )
     tokenizer = AutoTokenizer.from_pretrained(cfg.name, trust_remote_code=cfg.trust_remote_code)
     normalize_pad_token(model, tokenizer, rank=rank)
-    return model, tokenizer
+    return model, tokenizer, None
 
 
 # Back-compat alias.
@@ -45,15 +45,15 @@ load_hf_text_model = load_hf_causal_lm
 
 
 @register("llm")
-def _load_llm(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
+def _load_llm(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     return load_hf_causal_lm(cfg, rank=rank)
 
 
 @register("transformers_qwen2_5_sft_text")
-def _load_qwen2_5_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
+def _load_qwen2_5_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     return load_hf_causal_lm(cfg, rank=rank)
 
 
 @register("transformers_gemma3_sft_text")
-def _load_gemma3_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
+def _load_gemma3_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any, None]:
     return load_hf_causal_lm(cfg, rank=rank)

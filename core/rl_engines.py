@@ -208,12 +208,18 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
             "max_image_pixels": getattr(params.data, "max_image_pixels", None),
         }
     elif model_class == "qwen2_audio":
+        from transformers import AutoProcessor  # type: ignore
+        _proc_name = getattr(params.model, "processor_name_or_path", None) or params.model.name
+        _processor = AutoProcessor.from_pretrained(
+            _proc_name, trust_remote_code=params.model.trust_remote_code
+        )
         dataset_cls = AudioPromptsFeed
         dataset_kwargs = {
             "adapter": get_adapter(model_class),
             "audio_key": getattr(params.data, "audio_key", None) or "audio_bytes",
             "sampling_rate_key": getattr(params.data, "sampling_rate_key", None) or "sampling_rate",
             "default_sampling_rate": getattr(params.data, "default_sampling_rate", None) or 16000,
+            "processor": _processor,
         }
     else:
         dataset_cls = PromptsFeed

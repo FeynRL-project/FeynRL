@@ -141,9 +141,14 @@ class Data(BaseModel):
     answer_key: str
     solution_key: str | None = None
     # Optional multimodal dataset keys (used by MM SFT/DPO/RL feeds).
+    image_key: str | None = None
     image_bytes_key: str | None = None
     image_placeholder_token: str | None = None
     insert_image_token_if_missing: bool | None = None
+    max_image_pixels: int | None = None
+    audio_key: str | None = None
+    sampling_rate_key: str | None = None
+    default_sampling_rate: int | None = None
 
 class Model(BaseModel):
     '''
@@ -159,6 +164,7 @@ class Model(BaseModel):
     model_class: str = None
     attn_implementation: str = None
     gradient_checkpointing: bool = None
+    processor_name_or_path: str | None = None
 
 class Peft(BaseModel):
     model_config = ConfigDict(extra='forbid')

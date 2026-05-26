@@ -27,7 +27,6 @@ for mod in ("mlflow", "wandb", "tensorboardX", "datasets"):
 # data_feeds.prompts → exposes PromptsFeed
 _df_prompts = types.ModuleType("data_feeds.prompts")
 _df_prompts.PromptsFeed = MagicMock()
-sys.modules.setdefault("data_feeds", types.ModuleType("data_feeds"))
 sys.modules.setdefault("data_feeds.prompts", _df_prompts)
 
 # data_feeds.mixed_sampler → exposes create_prompt_dataset_and_sampler
@@ -69,6 +68,23 @@ from run_rl_async import (
 )
 from misc.nccl_utils import is_nccl_fatal_error
 from misc.nccl_env import nccl_watchdog_env_vars
+
+# Clean up global stubs so subsequent tests can import the real modules.
+# run_rl_async has already imported the symbols it needs from these modules.
+for _m in (
+    "datasets",
+    "mlflow",
+    "wandb",
+    "tensorboardX",
+    "data_feeds.prompts",
+    "data_feeds.mixed_sampler",
+    "rollouts.vllm_engine",
+    "rollouts.vllm_engine_async",
+    "vllm",
+    "ray.util",
+    "ray.util.queue",
+):
+    sys.modules.pop(_m, None)
 
 # Make the module's RayQueueEmpty match our fake so the helpers see it
 run_rl_async.RayQueueEmpty = _FakeRayQueueEmpty

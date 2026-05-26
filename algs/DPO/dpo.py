@@ -108,8 +108,7 @@ class DPO:
         adapter_batch = None
         if self.model_adapter is not None:
             # Minimal extra batch wrapper for model-family adapters.
-            # For multimodal preference batches, the collator already flattened
-            # MM tensors to match the [2B, ...] layout.
+            # Any optional, model-family-specific fields are passed through as-is.
             adapter_batch = {
                 "input_ids": input_ids,
                 "attn_mask": att_mask,

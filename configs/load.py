@@ -177,6 +177,18 @@ class Peft(BaseModel):
     # if None, apply lora to all linear layers (peft default).
     # otherwise, set explicitly to target specific modules, e.g. ["q_proj", "v_proj"].
     lora_target_modules: list[str] | None = None
+    # Optional path to a directory containing adapter-only weights + peft_config.json
+    # produced by this repo's checkpointing. When set, the adapter is loaded after
+    # LoRA wrapping and before DeepSpeed initialization.
+    init_adapter_dir: str | None = None
+    # How to save checkpoints when PEFT is enabled:
+    # - merged: save base weights with LoRA merged in (HF/vLLM friendly, current behavior)
+    # - adapter: save adapter-only artifact (portable across SFT/DPO/RL in this repo)
+    # - both: save both merged weights and adapter artifact
+    save_mode: str = "merged"
+    # For DPO, ref model is typically kept frozen base weights (no PEFT). This flag is
+    # provided for rare cases where the reference model should also load an adapter.
+    ref_use_peft: bool = False
 
 class DeepSpeed(BaseModel):
     '''
@@ -611,6 +623,14 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                     raise ValueError(f"lora_rank must be >= 1 when use_peft=True, got {config.peft.lora_rank}")
                 if config.peft.lora_alpha is None or config.peft.lora_alpha < 1:
                     raise ValueError(f"lora_alpha must be >= 1 when use_peft=True, got {config.peft.lora_alpha}")
+                if config.peft.save_mode not in ("merged", "adapter", "both"):
+                    raise ValueError(f"peft.save_mode must be one of merged|adapter|both, got {config.peft.save_mode}")
+
+            else:
+                if config.peft.init_adapter_dir:
+                    raise ValueError("peft.init_adapter_dir requires peft.use_peft=True")
+                if config.peft.save_mode not in ("merged", "adapter", "both"):
+                    raise ValueError(f"peft.save_mode must be one of merged|adapter|both, got {config.peft.save_mode}")
 
         # Method-specific checks
         if method == "sl":

@@ -7,7 +7,6 @@ import torch.distributed
 from tqdm import tqdm
 import gc
 import time
-from peft import get_peft_model, LoraConfig
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
@@ -19,6 +18,7 @@ from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
 import models
 from models.adapters import get_adapter
+from models.peft_utils import wrap_with_lora, load_lora_adapter_weights_
 
 
 Algorithm_Registry = {# supported algorithms
@@ -66,23 +66,10 @@ def init_rank_world_size():
     return rank, world_size, local_rank
 
 def apply_peft_module(model, peft_config, rank=0):
-    '''
-        Apply PEFT module to the model if it is enabled.
-    '''
-    if peft_config.peft_type == 'lora':
-        lora_config = LoraConfig(r=peft_config.lora_rank,
-                                 lora_alpha=peft_config.lora_alpha,
-                                 lora_dropout=peft_config.lora_dropout,
-                                 target_modules=peft_config.lora_target_modules,
-                                 task_type=peft_config.task_type)
-
-        model_peft = get_peft_model(model, lora_config)
-        if rank == 0:
-            print("LoRA model loaded successfully")
-        return model_peft
-
-    else:
-        raise ValueError(f"Unsupported PEFT type: {peft_config.peft_type}")
+    model_peft = wrap_with_lora(model=model, peft_config=peft_config)
+    if rank == 0:
+        print("LoRA model loaded successfully")
+    return model_peft
 
 def create_training_engine(deepspeed_config, deepspeed_ref_config, model, ref_model):
     '''
@@ -244,6 +231,12 @@ if __name__ == "__main__":
     # apply PEFT module if enabled
     if config.peft.use_peft:
         model = apply_peft_module(model=model, peft_config=config.peft, rank=rank)
+
+        if config.peft.init_adapter_dir:
+            result = load_lora_adapter_weights_(model, config.peft.init_adapter_dir, strict=True)
+            if rank == 0:
+                print(f"Loaded adapter weights from {config.peft.init_adapter_dir} "
+                      f"(missing={len(result['missing_keys'])}, unexpected={len(result['unexpected_keys'])})")
 
         if rank == 0:
             model.print_trainable_parameters()

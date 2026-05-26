@@ -1,10 +1,7 @@
 from __future__ import annotations
-
 import io
 from typing import Any, Dict, Optional, Tuple
-
 import numpy as np
-
 from data_feeds.prompts import PromptsFeed
 
 
@@ -102,4 +99,3 @@ class AudioPromptsFeed(PromptsFeed):
         if self.solution_key:
             out["solution"] = sample[self.solution_key]
         return out
-

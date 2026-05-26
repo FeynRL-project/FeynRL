@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from models.adapters.base import ForwardOutput, ModelAdapter
 from models.adapters.text_causal_lm import TextCausalLMAdapter
 from models.adapters.qwen2_5_vl import Qwen2_5VLAdapter

@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from typing import Any, Tuple
-
 from misc.utils import safe_string_to_torch_dtype
 from models.registry import register
 from models.transformers.hf_common import normalize_pad_token
@@ -37,4 +35,3 @@ def load_qwen2_5_vl(cfg: Any, rank: int = 0) -> Tuple[Any, Any, Any]:
 
     normalize_pad_token(model, tokenizer, rank=rank)
     return model, tokenizer, processor
-

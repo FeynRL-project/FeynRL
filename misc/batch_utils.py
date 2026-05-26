@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from typing import Any, Dict, Iterable
-
 import torch
 
 
@@ -48,4 +46,3 @@ def stack_text_tensors(samples: Iterable[Dict[str, Any]]) -> Dict[str, torch.Ten
         "attn_mask": torch.stack([s["attn_mask"] for s in samples], dim=0),
         "loss_mask": torch.stack([s["loss_mask"] for s in samples], dim=0),
     }
-

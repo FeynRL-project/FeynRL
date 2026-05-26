@@ -1,7 +1,6 @@
 import os
 import tempfile
 from unittest.mock import MagicMock
-
 import pandas as pd
 import pytest
 import torch
@@ -265,4 +264,3 @@ def test_synthetic_script_writes_valid_parquet(tmp_path):
     loaded = pd.read_parquet(path)
     assert list(loaded.columns) == ["prompt", "answer"]
     assert len(loaded) == 8
-

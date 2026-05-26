@@ -1,6 +1,5 @@
 import torch
 from unittest.mock import MagicMock
-
 from algs.DPO.dpo import DPO
 from data_feeds.factory import _preference_vision_collate
 from models.adapters.base import ForwardOutput
@@ -76,4 +75,3 @@ def test_dpo_forward_with_adapter_uses_multimodal_batch():
     assert ref_logprobs.shape == (4, T - 1)
     assert loss_mask.shape == (4, T - 1)
     assert adapter.calls == [ref_model_engine, model_engine]
-

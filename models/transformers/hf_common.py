@@ -1,9 +1,6 @@
 from __future__ import annotations
-
 from typing import Any, Tuple
-
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
 from misc.utils import safe_string_to_torch_dtype
 from models.registry import register
 

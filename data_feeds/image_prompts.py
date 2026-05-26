@@ -1,9 +1,6 @@
 from __future__ import annotations
-
 from typing import Any, Dict, Optional
-
 from PIL import Image
-
 from data_feeds.prompts import PromptsFeed
 from data_feeds.image_utils import _load_and_resize
 
@@ -79,4 +76,3 @@ class ImagePromptsFeed(PromptsFeed):
         if self.solution_key:
             out["solution"] = sample[self.solution_key]
         return out
-

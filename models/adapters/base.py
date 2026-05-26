@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol, Tuple
-
 import torch
 
 
@@ -53,4 +51,3 @@ class ModelAdapter(Protocol):
         handle nested dicts/lists and leave non-tensor payloads untouched.
         """
         ...
-

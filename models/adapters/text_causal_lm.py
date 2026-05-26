@@ -1,9 +1,6 @@
 from __future__ import annotations
-
 from typing import Any, Dict
-
 import torch
-
 from misc.batch_utils import move_to_device
 from models.adapters.base import ForwardOutput, ModelAdapter
 
@@ -42,4 +39,3 @@ class TextCausalLMAdapter(ModelAdapter):
 
     def to_device(self, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
         return move_to_device(batch, device)
-

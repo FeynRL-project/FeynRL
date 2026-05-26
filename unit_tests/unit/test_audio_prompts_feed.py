@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import numpy as np
 import pandas as pd
 
@@ -68,4 +67,3 @@ def test_audio_prompts_feed_falls_back_to_processor_signature(tmp_path):
     item = ds[0]
     assert item["prompt"] == "PROMPT"
     assert "multi_modal_data" in item
-

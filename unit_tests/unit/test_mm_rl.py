@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 import io
 from unittest.mock import MagicMock
-
 import pandas as pd
 from PIL import Image
 
@@ -135,4 +133,3 @@ def test_common_load_single_model_uses_registry_loader(monkeypatch):
 
     _ = c.load_single_model(model_path="dummy", dtype=torch.bfloat16, model_name="policy")
     get_loader.assert_called_with("qwen2_5_vl")
-

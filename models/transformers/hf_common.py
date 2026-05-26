@@ -20,7 +20,7 @@ def normalize_pad_token(model: Any, tokenizer: Any, rank: int = 0) -> None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
 
-def load_hf_text_model(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
+def load_hf_causal_lm(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
     assert cfg.dtype != "auto", "dtype must not be auto to avoid precision issues"
     assert getattr(cfg, "attn_implementation", None) in (None, "", "eager", "flash_attention_2"), (
         "attn_implementation must be one of None, '', 'eager', 'flash_attention_2'"
@@ -40,6 +40,20 @@ def load_hf_text_model(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
     return model, tokenizer
 
 
+# Back-compat alias.
+load_hf_text_model = load_hf_causal_lm
+
+
 @register("llm")
 def _load_llm(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
-    return load_hf_text_model(cfg, rank=rank)
+    return load_hf_causal_lm(cfg, rank=rank)
+
+
+@register("transformers_qwen2_5_sft_text")
+def _load_qwen2_5_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
+    return load_hf_causal_lm(cfg, rank=rank)
+
+
+@register("transformers_gemma3_sft_text")
+def _load_gemma3_sft_text(cfg: Any, rank: int = 0) -> Tuple[Any, Any]:
+    return load_hf_causal_lm(cfg, rank=rank)

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from models.adapters.base import ForwardOutput, ModelAdapter
-from models.adapters.hf_causal_lm import HFCausalLMAdapter
+from models.adapters.text_causal_lm import TextCausalLMAdapter
 
 __all__ = [
     "ForwardOutput",
     "ModelAdapter",
-    "HFCausalLMAdapter",
+    "TextCausalLMAdapter",
     "get_sft_adapter",
 ]
 
@@ -24,4 +24,4 @@ def get_sft_adapter(model_class: str):
             f"Unsupported model_class '{model_class}' for SFT adapter in this PR. "
             "Use model.model_class: llm for text-only runs."
         )
-    return HFCausalLMAdapter()
+    return TextCausalLMAdapter()

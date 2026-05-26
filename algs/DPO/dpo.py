@@ -105,10 +105,6 @@ class DPO:
             # [B, 2, T] -> [2B, T]
             pos_ids = pos_ids.view(-1, T).to(att_mask.device)
 
-        # label would be input_ids shifted by one
-        # [2B, T] -> [2B, T-1]
-        target_ids = input_ids[:, 1:].contiguous()
-
         adapter_batch = None
         if self.model_adapter is not None:
             # Minimal extra batch wrapper for model-family adapters.
@@ -123,6 +119,13 @@ class DPO:
                 adapter_batch["position_ids"] = pos_ids
             if "multi_modal_inputs" in batch:
                 adapter_batch["multi_modal_inputs"] = batch["multi_modal_inputs"]
+
+        # label would be input_ids shifted by one
+        # [2B, T] -> [2B, T-1]
+        # Only needed for the legacy text-only forward path; adapters compute target_ids.
+        target_ids = None
+        if adapter_batch is None:
+            target_ids = input_ids[:, 1:].contiguous()
 
         # Compute ref logprobs first and reduce to [2B, T-1] immediately.
         # This avoids holding full policy + ref vocab logits at the same time.
@@ -163,7 +166,6 @@ class DPO:
 
             # [2B, T, vocab_size] --> [2B, T-1, vocab_size]
             logits     = output.logits[:, :-1, :].contiguous()
-            target_ids = input_ids[:, 1:].contiguous()
             del output
 
         vocab_size = logits.shape[-1]

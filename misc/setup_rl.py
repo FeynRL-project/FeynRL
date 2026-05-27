@@ -120,7 +120,8 @@ def save_checkpoint(epoch,
                     experiment_id,
                     rank,
                     logger,
-                    save_timeout):
+                    save_timeout,
+                    processor=None):
     '''
        Save model checkpoint. This must run on all ranks for ZeRO-3.
        Writes hf compatible weights and for vllm, ds engine state
@@ -164,10 +165,12 @@ def save_checkpoint(epoch,
                          description=f"engine state save (epoch {epoch+1})",
                          logger=logger)
 
-    # 3. Driver-side files: Save the tokenizer only after all engine saves
-    # finish to avoid racing with rank 0 writing config.json on shared filesystems.
+    # 3. Driver-side files: Save the tokenizer (and processor for VLMs) only after all
+    # engine saves finish to avoid racing with rank 0 writing config.json on shared filesystems.
     if rank == 0:
         tokenizer.save_pretrained(model_path)
+        if processor is not None:
+            processor.save_pretrained(model_path)
 
         # Training metadata for resume
         training_state = {'epoch': epoch,

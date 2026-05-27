@@ -15,7 +15,7 @@ class Qwen2AudioAdapter(ModelAdapter):
         injected = False
         for turn in messages:
             if not isinstance(turn, dict):
-                continue
+                raise ValueError(f"Expected each turn to be a dict, got {type(turn)}: {turn!r}")
 
             role = turn.get("role", None)
             content = turn.get("content", "")

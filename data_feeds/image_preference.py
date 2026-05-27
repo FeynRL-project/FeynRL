@@ -63,27 +63,22 @@ class ImagePreferenceFeed:
     def __len__(self) -> int:
         return self.len_data
 
-    def _encode(self, messages: list, answer: str, pil: Image.Image) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        # Render prompt with chat template and append answer + eos.
+    def _encode(self, messages: list, answer: str, pil: Image.Image, prompt_len: int = None) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], int]:
         try:
             prompt_text = self.tokenizer.apply_chat_template(
-                conversation=messages,
-                add_generation_prompt=True,
-                tokenize=False,
-                skip_special_tokens=False,
+                conversation=messages, add_generation_prompt=True, tokenize=False, skip_special_tokens=False,
             )
         except TypeError:
-            # Some processors/tokenizers accept positional `messages` signature.
             prompt_text = self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
+                messages, add_generation_prompt=True, tokenize=False,
             )
-        eos = getattr(self.tokenizer, "eos_token", None) or ""
-        full_text = prompt_text + str(answer) + eos
 
+        if prompt_len is None:
+            prompt_len = self.processor(text=prompt_text, images=pil, return_tensors="pt")["input_ids"].shape[1]
+
+        eos = getattr(self.tokenizer, "eos_token", None) or ""
         enc = self.processor(
-            text=full_text,
+            text=prompt_text + str(answer) + eos,
             images=pil,
             return_tensors="pt",
             padding="max_length",
@@ -92,20 +87,15 @@ class ImagePreferenceFeed:
         )
         input_ids = enc["input_ids"][0]
         attn_mask = enc["attention_mask"][0]
-        # loss_mask: compute loss on all non-pad tokens except the first token (shifted labels)
-        loss_mask = attn_mask[1:].clone()
 
         mm_dict: Dict[str, torch.Tensor] = {}
         for k in ("pixel_values", "image_grid_thw"):
             if k in enc:
                 mm_dict[k] = enc[k]
         if not mm_dict:
-            # Fallback: include any non-text keys as vision tensors.
-            for k, v in enc.items():
-                if k not in ("input_ids", "attention_mask"):
-                    mm_dict[k] = v
+            mm_dict = {k: v for k, v in enc.items() if k not in ("input_ids", "attention_mask")}
 
-        return input_ids, attn_mask, mm_dict
+        return input_ids, attn_mask, mm_dict, prompt_len
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         idx = int(idx)
@@ -124,26 +114,8 @@ class ImagePreferenceFeed:
         else:
             messages = _ensure_image_token(messages, self.image_placeholder_token, self.insert_image_token_if_missing)
 
-        # Compute prompt length in encoded space (includes image patch tokens injected by the
-        # processor). Must match what PreferenceFeed does: zero loss on prompt positions.
-        try:
-            prompt_text = self.tokenizer.apply_chat_template(
-                conversation=messages,
-                add_generation_prompt=True,
-                tokenize=False,
-                skip_special_tokens=False,
-            )
-        except TypeError:
-            prompt_text = self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-        p_enc = self.processor(text=prompt_text, images=pil, return_tensors="pt", padding=False, truncation=False)
-        prompt_len = p_enc["input_ids"].shape[1]
-
-        chosen_ids, chosen_mask, vision = self._encode(messages, chosen, pil)
-        rejected_ids, rejected_mask, _vision2 = self._encode(messages, rejected, pil)
+        chosen_ids, chosen_mask, vision, prompt_len = self._encode(messages, chosen, pil)
+        rejected_ids, rejected_mask, _, _ = self._encode(messages, rejected, pil, prompt_len=prompt_len)
 
         chosen_loss_mask = chosen_mask[1:].clone()
         rejected_loss_mask = rejected_mask[1:].clone()

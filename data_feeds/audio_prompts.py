@@ -81,7 +81,7 @@ class AudioPromptsFeed(PromptsFeed):
 
         template_fn = getattr(self.processor, "apply_chat_template", None) or self.tokenizer.apply_chat_template
         prompt_text = template_fn(messages, add_generation_prompt=True, tokenize=False)
-        prompt_ids = template_fn(messages, add_generation_prompt=True, tokenize=True)
+        prompt_ids = self.tokenizer.encode(prompt_text)
 
         if not isinstance(prompt_ids, list) or len(prompt_ids) == 0:
             raise ValueError(f"Sample {idx}: tokenization produced empty prompt_ids")

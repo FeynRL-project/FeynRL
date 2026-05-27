@@ -118,7 +118,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split, p
     # steps_per_epoch is only needed for training (MixedDatasetSampler)
     steps_per_epoch = params.train.micro_batches_per_epoch if split == 'train' else None
 
-    dataset_cls, dataset_kwargs = make_sft_feed(model_class, params, processor)
+    dataset_cls, dataset_kwargs, collate_fn = make_sft_feed(model_class, params, processor)
 
     dataset, sampler = create_dataset_and_sampler(data_paths=data_path,
                                                   prompt_key=params.data.prompt_key,
@@ -150,6 +150,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split, p
                                 batch_sampler=sampler,
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
     else:
         # DistributedSampler yields individual indices.
@@ -159,6 +160,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split, p
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
                                 drop_last=False,  # ensure all validation samples are used
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
 
     return dataloader, sampler

@@ -57,11 +57,7 @@ class ImagePromptsFeed(PromptsFeed):
             skip_special_tokens=False,
         )
 
-        prompt_ids = self.tokenizer.apply_chat_template(
-            conversation=messages,
-            add_generation_prompt=True,
-            tokenize=True,
-        )
+        prompt_ids = self.tokenizer.encode(prompt_text)
         if not isinstance(prompt_ids, list) or len(prompt_ids) == 0:
             raise ValueError(f"Sample {idx}: tokenization produced empty prompt_ids")
         if len(prompt_ids) >= self.max_seq_len:

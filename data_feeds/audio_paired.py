@@ -75,6 +75,10 @@ class AudioPairedFeed:
         prompt_text = template_fn(
             messages, add_generation_prompt=True, tokenize=False
         )
+        # Audio features are separate from input_ids, so prompt token count is
+        # derivable from the tokenizer alone (no extra processor call needed).
+        _prompt_ids = template_fn(messages, add_generation_prompt=True, tokenize=True)
+        prompt_len = len(_prompt_ids) if isinstance(_prompt_ids, list) else int(_prompt_ids.numel())
 
         eos = getattr(self.tokenizer, "eos_token", None) or ""
         full_text = prompt_text + str(answer) + eos
@@ -91,6 +95,8 @@ class AudioPairedFeed:
         input_ids = enc["input_ids"][0]
         attn_mask = enc["attention_mask"][0]
         loss_mask = attn_mask[1:].clone()
+        if prompt_len > 1:
+            loss_mask[:prompt_len - 1] = 0
 
         audio_dict: Dict[str, torch.Tensor] = {}
         for k in ("input_features", "feature_attention_mask"):

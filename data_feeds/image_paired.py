@@ -19,7 +19,7 @@ class ImagePairedFeed:
     Returns per item:
       - input_ids:          [T]
       - attn_mask:          [T]
-      - loss_mask:          [T-1]  (all non-padding tokens; answer + prompt)
+      - loss_mask:          [T-1]  (1 on answer tokens, 0 on prompt + padding)
       - multi_modal_inputs: {"vision": {pixel_values, image_grid_thw, ...}}
     """
 
@@ -87,6 +87,9 @@ class ImagePairedFeed:
         eos = getattr(self.tokenizer, "eos_token", None) or ""
         full_text = prompt_text + str(answer) + eos
 
+        # Prompt length in the encoded space (includes injected visual tokens).
+        prompt_len = self.processor(text=prompt_text, images=pil, return_tensors="pt")["input_ids"].shape[1]
+
         enc = self.processor(
             text=full_text,
             images=pil,
@@ -106,6 +109,8 @@ class ImagePairedFeed:
             attn_mask = torch.cat([attn_mask, attn_mask.new_zeros(pad_len)])
 
         loss_mask = attn_mask[1:].clone()
+        if prompt_len > 1:
+            loss_mask[:prompt_len - 1] = 0
 
         mm_dict: Dict[str, torch.Tensor] = {}
         for k in ("pixel_values", "image_grid_thw"):

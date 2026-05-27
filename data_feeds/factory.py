@@ -6,8 +6,27 @@ import models
 
 
 # ---------------------------------------------------------------------------
-# Preference / DPO collate (previously data_feeds/collators.py)
+# Vision collate helpers
+#
+# PyTorch's default collate uses torch.stack, which requires identical shapes.
+# pixel_values is [N_patches, D] where N_patches varies by image aspect ratio,
+# so we must torch.cat along dim=0 instead.  Both SFT and DPO VLM feeds need
+# this; the DPO collate additionally interleaves vision to match its [2B] layout.
 # ---------------------------------------------------------------------------
+
+def _vision_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate for SFT image batches (ImagePairedFeed)."""
+    out: Dict[str, Any] = {
+        "input_ids": torch.stack([s["input_ids"] for s in batch]),
+        "attn_mask": torch.stack([s["attn_mask"] for s in batch]),
+        "loss_mask": torch.stack([s["loss_mask"] for s in batch]),
+    }
+    visions = [((s.get("multi_modal_inputs") or {}).get("vision") or {}) for s in batch]
+    if any(visions):
+        keys = visions[0].keys()
+        out["multi_modal_inputs"] = {"vision": {k: torch.cat([v[k] for v in visions], dim=0) for k in keys}}
+    return out
+
 
 def _preference_vision_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -61,8 +80,8 @@ def make_sft_feed(
     model_class: str | None,
     params: Any,
     processor: Any = None,
-) -> Tuple[Type, Dict[str, Any]]:
-    """Return (dataset_cls, dataset_kwargs) for SFT (paired) data loaders."""
+) -> Tuple[Type, Dict[str, Any], Optional[Callable]]:
+    """Return (dataset_cls, dataset_kwargs, collate_fn) for SFT (paired) data loaders."""
     from data_feeds.paired import PairedFeed
     mc = model_class or ""
     if mc == "qwen2_5_vl":
@@ -74,7 +93,7 @@ def make_sft_feed(
             "image_placeholder_token": getattr(params.data, "image_placeholder_token", None) or "<image>",
             "insert_image_token_if_missing": bool(getattr(params.data, "insert_image_token_if_missing", False)),
             "max_image_pixels": getattr(params.data, "max_image_pixels", None),
-        }
+        }, _vision_collate
     if mc == "qwen2_audio":
         from data_feeds.audio_paired import AudioPairedFeed
         return AudioPairedFeed, {
@@ -83,8 +102,8 @@ def make_sft_feed(
             "audio_key": getattr(params.data, "audio_key", None) or "audio_bytes",
             "sampling_rate_key": getattr(params.data, "sampling_rate_key", None) or "sampling_rate",
             "default_sampling_rate": getattr(params.data, "default_sampling_rate", None) or 16000,
-        }
-    return PairedFeed, {}
+        }, None
+    return PairedFeed, {}, None
 
 
 def make_preference_feed(

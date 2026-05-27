@@ -65,7 +65,11 @@ class COMMON:
         if multi_modal_inputs is not None:
             batch["multi_modal_inputs"] = multi_modal_inputs
 
-        out = self._get_cached_adapter().forward(self.policy_engine, batch)
+        adapter = self._get_cached_adapter()
+        # Ensure multimodal tensors (e.g. pixel_values / input_features) live on the same device
+        # as the model weights. DataLoader/replay buffer keeps everything on CPU by default.
+        batch = adapter.to_device(batch, input_ids.device)
+        out = adapter.forward(self.policy_engine, batch)
 
         # [B, T, V] -> [B, T-1, V]
         logits = out.logits
@@ -123,7 +127,9 @@ class COMMON:
             if multi_modal_inputs is not None:
                 batch["multi_modal_inputs"] = multi_modal_inputs
 
-            out = self._get_cached_adapter().forward(self.ref_model_engine, batch)
+            adapter = self._get_cached_adapter()
+            batch = adapter.to_device(batch, input_ids.device)
+            out = adapter.forward(self.ref_model_engine, batch)
 
             # [B, T, V] -> [B, T-1, V]
             logits = out.logits

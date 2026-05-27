@@ -325,10 +325,10 @@ class GRPO(COMMON):
             # 2. Compute loss
             ########
             # Forward pass through the current policy.
-            pi_logprobs, pi_entropies, target_ids = self.policy_forward(input_ids=input_ids,
-                                                                        att_mask=att_mask,
-                                                                        pos_ids=pos_ids,
-                                                                        multi_modal_inputs=micro_batch.get('multi_modal_inputs', None))
+            with self.forward_context(micro_batch):
+                pi_logprobs, pi_entropies, target_ids = self.policy_forward(input_ids=input_ids,
+                                                                            att_mask=att_mask,
+                                                                            pos_ids=pos_ids)
 
             # Snapshot pre-NaN valid token count for ga_denom correction.
             pre_nan_valid = (mask > 0.5).sum().item() if self.normalize_loss else 0
@@ -339,10 +339,10 @@ class GRPO(COMMON):
 
             ref_logprobs = None
             if self.kl_coeff > 0.0 and self.ref_model_engine is not None:
-                ref_logprobs = self.ref_forward(input_ids=input_ids,
-                                                att_mask=att_mask,
-                                                pos_ids=pos_ids,
-                                                multi_modal_inputs=micro_batch.get('multi_modal_inputs', None))
+                with self.forward_context(micro_batch):
+                    ref_logprobs = self.ref_forward(input_ids=input_ids,
+                                                    att_mask=att_mask,
+                                                    pos_ids=pos_ids)
 
                 ref_logprobs, ref_nan = self.sanitize_logprobs(logprobs=ref_logprobs, engine_id=engine_id, step=step, num_micro=num_micro)
                 mask = mask * (~ref_nan).to(mask.dtype)

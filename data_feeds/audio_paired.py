@@ -1,9 +1,28 @@
 from __future__ import annotations
+import io
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
+import numpy as np
 import torch
 from datasets import load_dataset
-from data_feeds.audio_prompts import _load_audio_bytes
+
+
+def _load_audio_bytes(payload: Any) -> Tuple[np.ndarray, Optional[int]]:
+    """Decode audio bytes to (waveform_float32, sampling_rate)."""
+    if isinstance(payload, np.ndarray):
+        return payload.astype(np.float32), None
+    if isinstance(payload, list):
+        return np.asarray(payload, dtype=np.float32), None
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            import soundfile as sf  # type: ignore
+        except Exception as e:
+            raise ImportError(
+                "soundfile is required to decode audio_bytes. Install it via `pip install soundfile`."
+            ) from e
+        waveform, sr = sf.read(io.BytesIO(payload), dtype="float32", always_2d=False)
+        return np.asarray(waveform, dtype=np.float32), int(sr)
+    raise TypeError(f"Unsupported audio payload type: {type(payload)}")
 
 
 class AudioPairedFeed:

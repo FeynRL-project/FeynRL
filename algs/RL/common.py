@@ -35,14 +35,114 @@ class COMMON:
         This class provides common functions for policy gradient algorithms.
         Only contains methods that are 100% identical across all PG algorithms.
     '''
+    def policy_forward(self, input_ids, att_mask, pos_ids):
+        '''
+            input_ids and att_mask are [B, T]
+            pos_ids is [B, T] or None
+            Returns:
+                logits is [B, T-1, vocab_size]
+                entropies is [B, T-1]
+        '''
+        # if pos_ids is not provided, HF will add that automatically.
+        if pos_ids is not None:
+            pos_ids = pos_ids.to(input_ids.device)
+
+        # feed data to model
+        # use_cache=False: KV cache is never useful during training
+        #
+        # NOTE: We always route through the model-family adapter (text or multimodal)
+        # so this forward remains model/modality-agnostic at the algorithm layer.
+        B, T = input_ids.shape
+        loss_mask = torch.ones((B, max(0, T - 1)), device=input_ids.device, dtype=torch.int64)
+        batch = {
+            "input_ids": input_ids,
+            "attn_mask": att_mask,
+            "loss_mask": loss_mask,
+        }
+        if pos_ids is not None:
+            batch["position_ids"] = pos_ids
+        multi_modal_inputs = getattr(self, "_forward_mm_inputs", None)
+        if multi_modal_inputs is not None:
+            batch["multi_modal_inputs"] = multi_modal_inputs
+
+        out = self._get_cached_adapter().forward(self.policy_engine, batch)
+
+        # [B, T, V] -> [B, T-1, V]
+        logits = out.logits
+        B, T_minus_1, vocab_size = logits.shape
+
+        # [B, T] -> [B, T-1]
+        target_ids = out.target_ids
+
+        # Inefficient way of computing cross_entropy:
+        # neg_logprobs = self.cross_entropy(logits.to(torch.float32).view(-1, vocab_size), target_ids.view(-1))
+        # logprobs = -neg_logprobs.view(B, T_minus_1)
+        # Above has two kernels:
+        # kernel1: log_softmax: reads [B*T, V], writes  [B*T, V]
+        # kernel2: gather: reads that entire [B*T, V], picks one value per row, writes [B*T] output
+        # torch.compile fuses log_softmax + gather into a single kernel,
+        # avoiding the full [B*T, V] logprobs intermediate tensor. In particualr,
+        # it computes log_softmax and gathers the target index in the same kernel, in registers
+        # logits: [B, T-1, V] --> [B*(T-1), V], target_ids: [B, T-1] --> [B*(T-1)]
+        # The [B*T, V] intermediate never gets allocated in GPU memory in fused verson.
+        logprobs = compiled_log_softmax_and_gather(logits.to(torch.float32).view(-1, vocab_size),
+                                                   target_ids.view(-1)).view(B, T_minus_1)
+
+        entropies = None
+        if self.ent_coeff > 0.0:
+            entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
+
+        return logprobs, entropies, target_ids
+
+    def ref_forward(self, input_ids, att_mask, pos_ids):
+        '''
+            input_ids and att_mask are [B, T]
+            pos_ids is [B, T] or None
+            Returns:
+                ref_logprobs is [B, T-1]
+        '''
+        # feed data to model
+        with torch.no_grad():
+            if pos_ids is not None:
+                pos_ids = pos_ids.to(input_ids.device)
+
+            # use_cache=False: full-sequence forward
+            #
+            # NOTE: We always route through the model-family adapter (text or multimodal)
+            # so this forward remains model/modality-agnostic at the algorithm layer.
+            B, T = input_ids.shape
+            loss_mask = torch.ones((B, max(0, T - 1)), device=input_ids.device, dtype=torch.int64)
+            batch = {
+                "input_ids": input_ids,
+                "attn_mask": att_mask,
+                "loss_mask": loss_mask,
+            }
+            if pos_ids is not None:
+                batch["position_ids"] = pos_ids
+            multi_modal_inputs = getattr(self, "_forward_mm_inputs", None)
+            if multi_modal_inputs is not None:
+                batch["multi_modal_inputs"] = multi_modal_inputs
+
+            out = self._get_cached_adapter().forward(self.ref_model_engine, batch)
+
+            # [B, T, V] -> [B, T-1, V]
+            logits = out.logits
+            B, T_minus_1, vocab_size = logits.shape
+
+            # [B, T] -> [B, T-1]
+            target_ids = out.target_ids
+
+            # Compute logprobs in float32 for KL stability.
+            # logits: [B, T-1, V] --> [B*(T-1), V], target_ids: [B, T-1] --> [B*(T-1)]
+            ref_logprobs = compiled_log_softmax_and_gather(logits.to(torch.float32).view(-1, vocab_size),
+                                                           target_ids.view(-1)).view(B, T_minus_1)
+
+        return ref_logprobs
+
     @contextmanager
     def forward_context(self, micro_batch: dict):
         """
         Attach optional multimodal tensors for the duration of a forward pass.
-
-        Algorithms remain modality-agnostic: they call policy_forward/ref_forward
-        as usual, while COMMON picks up `multi_modal_inputs` from the current batch
-        if present.
         """
         prev = getattr(self, "_forward_mm_inputs", None)
         mm = None
@@ -62,83 +162,6 @@ class COMMON:
             adapter = get_adapter(getattr(self, "model_class", None) or "llm")
             self._model_adapter = adapter
         return adapter
-
-    def policy_forward(self, input_ids, att_mask, pos_ids):
-        '''
-            input_ids and att_mask are [B, T]
-            pos_ids is [B, T] or None
-            Returns:
-                logits is [B, T-1, vocab_size]
-                entropies is [B, T-1]
-        '''
-        # Always route through the model-family adapter (text or multimodal) so
-        # RL remains model/modality-agnostic at the algorithm layer.
-        multi_modal_inputs = getattr(self, "_forward_mm_inputs", None)
-        B, T = input_ids.shape
-        # Placeholder loss mask required by adapter contract; RL masking is handled
-        # separately by the algorithm's `mask` tensor.
-        loss_mask = torch.ones((B, max(0, T - 1)), device=input_ids.device, dtype=torch.int64)
-        batch = {
-            "input_ids": input_ids,
-            "attn_mask": att_mask,
-            "loss_mask": loss_mask,
-        }
-        if pos_ids is not None:
-            batch["position_ids"] = pos_ids
-        if multi_modal_inputs is not None:
-            batch["multi_modal_inputs"] = multi_modal_inputs
-
-        adapter = self._get_cached_adapter()
-        out = adapter.forward(self.policy_engine, batch)
-        logits = out.logits  # [B, T-1, V]
-        target_ids = out.target_ids  # [B, T-1]
-
-        B2, T_minus_1, vocab_size = logits.shape
-        logprobs = compiled_log_softmax_and_gather(
-            logits.to(torch.float32).view(-1, vocab_size),
-            target_ids.view(-1),
-        ).view(B2, T_minus_1)
-
-        entropies = None
-        if self.ent_coeff > 0.0:
-            entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
-
-        return logprobs, entropies, target_ids
-
-    def ref_forward(self, input_ids, att_mask, pos_ids):
-        '''
-            input_ids and att_mask are [B, T]
-            pos_ids is [B, T] or None
-            Returns:
-                ref_logprobs is [B, T-1]
-        '''
-        # feed data to model
-        with torch.no_grad():
-            # Always route through the model-family adapter (text or multimodal).
-            multi_modal_inputs = getattr(self, "_forward_mm_inputs", None)
-            B, T = input_ids.shape
-            loss_mask = torch.ones((B, max(0, T - 1)), device=input_ids.device, dtype=torch.int64)
-            batch = {
-                "input_ids": input_ids,
-                "attn_mask": att_mask,
-                "loss_mask": loss_mask,
-            }
-            if pos_ids is not None:
-                batch["position_ids"] = pos_ids
-            if multi_modal_inputs is not None:
-                batch["multi_modal_inputs"] = multi_modal_inputs
-
-            adapter = self._get_cached_adapter()
-            out = adapter.forward(self.ref_model_engine, batch)
-            logits = out.logits
-            target_ids = out.target_ids
-
-            B2, T_minus_1, vocab_size = logits.shape
-            ref_logprobs = compiled_log_softmax_and_gather(
-                logits.to(torch.float32).view(-1, vocab_size),
-                target_ids.view(-1),
-            ).view(B2, T_minus_1)
-            return ref_logprobs
 
     def compute_kl_distance(self, logprobs, ref_logprobs):
         '''

@@ -263,6 +263,31 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
         Args:
             peft_config: object with .use_peft, .lora_alpha, .lora_rank attributes.
     '''
+    # ZeRO-3 note:
+    # With overlap_comm enabled, some parameters can be left in an "INFLIGHT" state
+    # right after forward/backward/validation. If we enter GatheredParameters while
+    # a param is still inflight, DeepSpeed can assert when it tries to partition it
+    # back on context manager exit ("Cannot partition a param in flight").
+    #
+    # Best-effort mitigation:
+    # - synchronize CUDA streams
+    # - if available, ask DeepSpeed's parameter offload helper to (re)partition all
+    #   parameters to a stable state before we start gathering for save.
+    if zero_stage == 3:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception as e:
+            logger.warning(f"[Epoch {epoch+1}] CUDA synchronize before checkpoint failed (continuing): {e}")
+
+        try:
+            opt = getattr(model_engine, "optimizer", None)
+            po = getattr(opt, "parameter_offload", None) if opt is not None else None
+            if po is not None and hasattr(po, "partition_all_parameters"):
+                po.partition_all_parameters()
+        except Exception as e:
+            logger.warning(f"[Epoch {epoch+1}] ZeRO-3 pre-gather stabilization failed (continuing): {e}")
+
     # 1. Save HF-compatible weights (all ranks must participate for ZeRO-3 gather)
     raw_sd = gather_params_for_save(model_engine.module, rank)
     save_ok = True

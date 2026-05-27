@@ -1,12 +1,13 @@
 import torch
 
 class SFT:
-    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1):
+    def __init__(self, model_engine, optimizer, normalize_loss=False, world_size=1, model_adapter=None):
 
         self.model_engine = model_engine
         self.optimizer = optimizer
         self.normalize_loss = normalize_loss
         self.world_size = world_size
+        self.model_adapter = model_adapter
 
         # use cross entropy loss
         self.loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
@@ -74,9 +75,16 @@ class SFT:
                 y is [B, T-1]
                 loss_mask is [B, T-1]
         '''
+        if self.model_adapter is not None:
+            # Delegate to model-family adapter (supports multimodal kwargs and
+            # model-specific forward signatures) and return the canonical triple.
+            out = self.model_adapter.forward(self.model_engine, batch)
+            return out.logits, out.target_ids, out.loss_mask
+
+        # Fallback legacy text-only path.
         # input_ids and att_mask are [B, T]
         input_ids = batch['input_ids']
-        att_mask  = batch['attn_mask']
+        att_mask = batch['attn_mask']
         # loss_mask is [B, T - 1]
         loss_mask = batch['loss_mask']
 
@@ -85,11 +93,12 @@ class SFT:
         if pos_ids is not None:
             pos_ids = pos_ids.to(att_mask.device)
 
-        # feed data to model
-        output = self.model_engine(input_ids=input_ids,
-                                   attention_mask=att_mask,
-                                   position_ids=pos_ids,
-                                   use_cache=False)
+        output = self.model_engine(
+            input_ids=input_ids,
+            attention_mask=att_mask,
+            position_ids=pos_ids,
+            use_cache=False,
+        )
 
         # [B, T, vocab_size]
         every_token_logits = output.logits
@@ -100,7 +109,6 @@ class SFT:
         # target_ids would be input_ids shifted by one
         # so the size is [B, T-1]
         target_ids = input_ids[:, 1:].contiguous()
-
         return logits, target_ids, loss_mask
 
     def eval_step(self, micro_batch):

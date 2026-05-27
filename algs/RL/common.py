@@ -12,7 +12,6 @@ from misc.utils import set_random_seeds, torch_dtype_to_str
 import copy
 import time
 import types
-from contextlib import contextmanager
 # internal and local import
 from misc.nccl_utils import create_nccl_process_group
 
@@ -35,7 +34,7 @@ class COMMON:
         This class provides common functions for policy gradient algorithms.
         Only contains methods that are 100% identical across all PG algorithms.
     '''
-    def policy_forward(self, input_ids, att_mask, pos_ids):
+    def policy_forward(self, input_ids, att_mask, pos_ids, micro_batch=None):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
@@ -61,9 +60,7 @@ class COMMON:
         }
         if pos_ids is not None:
             batch["position_ids"] = pos_ids
-        multi_modal_inputs = getattr(self, "_forward_mm_inputs", None)
-        if multi_modal_inputs is not None:
-            batch["multi_modal_inputs"] = multi_modal_inputs
+        batch["multi_modal_inputs"] = micro_batch.get("multi_modal_inputs") if micro_batch is not None else None
 
         adapter = self._get_cached_adapter()
         # Ensure multimodal tensors (e.g. pixel_values / input_features) live on the same device
@@ -98,7 +95,7 @@ class COMMON:
 
         return logprobs, entropies, target_ids
 
-    def ref_forward(self, input_ids, att_mask, pos_ids):
+    def ref_forward(self, input_ids, att_mask, pos_ids, micro_batch=None):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
@@ -123,9 +120,7 @@ class COMMON:
             }
             if pos_ids is not None:
                 batch["position_ids"] = pos_ids
-            multi_modal_inputs = getattr(self, "_forward_mm_inputs", None)
-            if multi_modal_inputs is not None:
-                batch["multi_modal_inputs"] = multi_modal_inputs
+            batch["multi_modal_inputs"] = micro_batch.get("multi_modal_inputs") if micro_batch is not None else None
 
             adapter = self._get_cached_adapter()
             batch = adapter.to_device(batch, input_ids.device)
@@ -144,21 +139,6 @@ class COMMON:
                                                            target_ids.view(-1)).view(B, T_minus_1)
 
         return ref_logprobs
-
-    @contextmanager
-    def forward_context(self, micro_batch: dict):
-        """
-        Attach optional multimodal tensors for the duration of a forward pass.
-        """
-        prev = getattr(self, "_forward_mm_inputs", None)
-        mm = None
-        if isinstance(micro_batch, dict):
-            mm = micro_batch.get("multi_modal_inputs", None)
-        self._forward_mm_inputs = mm
-        try:
-            yield
-        finally:
-            self._forward_mm_inputs = prev
 
     def _get_cached_adapter(self):
         from models.adapters import get_adapter
@@ -295,7 +275,8 @@ class COMMON:
                 # curr_logprobs is [B, T-1], shift happoens inside policy_forward
                 curr_logprobs, _, _ = self.policy_forward(input_ids=input_ids,
                                                           att_mask=att_mask,
-                                                          pos_ids=pos_ids)
+                                                          pos_ids=pos_ids,
+                                                          micro_batch=micro_batch)
                 curr_logprobs, prox_nan_mask = self.sanitize_logprobs(logprobs=curr_logprobs, engine_id=engine_id, step=step, num_micro=len(micro_batches))
             nan_masks.append(prox_nan_mask)
             logprobs_prox.append(curr_logprobs.detach())

@@ -112,16 +112,25 @@ class AudioPairedFeed:
         # True prompt length including audio feature tokens injected by the processor.
         prompt_len = self.processor(text=prompt_text, return_tensors="pt", **audio_kw)["input_ids"].shape[1]
 
-        enc = self.processor(
-            text=full_text,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_seq_len,
-            **audio_kw,
-        )
-        input_ids = enc["input_ids"][0]
-        attn_mask = enc["attention_mask"][0]
+        # Do NOT pass padding/truncation/max_length to the combined processor call — those
+        # kwargs are routed to the audio feature extractor via _merge_kwargs, overriding its
+        # internal max_length=3000 mel frames and causing shape errors in the audio tower.
+        # Instead, pad/truncate the text tensors manually below.
+        enc = self.processor(text=full_text, return_tensors="pt", **audio_kw)
+
+        ids_raw = enc["input_ids"][0]
+        mask_raw = enc["attention_mask"][0]
+        T = ids_raw.shape[0]
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        if T >= self.max_seq_len:
+            input_ids = ids_raw[:self.max_seq_len]
+            attn_mask = mask_raw[:self.max_seq_len]
+        else:
+            pad = self.max_seq_len - T
+            input_ids = torch.cat([ids_raw, ids_raw.new_full((pad,), pad_id)])
+            attn_mask = torch.cat([mask_raw, mask_raw.new_zeros(pad)])
+
         loss_mask = attn_mask[1:].clone()
         if prompt_len > 1:
             loss_mask[:prompt_len - 1] = 0

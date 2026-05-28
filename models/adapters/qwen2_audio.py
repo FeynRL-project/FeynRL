@@ -77,7 +77,7 @@ class Qwen2AudioAdapter(ModelAdapter):
             if not isinstance(m, dict) or "audio" not in m:
                 raise KeyError("Expected each mm_item to be a dict with key 'audio' for qwen2_audio.")
             waveform, sr = m["audio"]
-            enc = processor(text=" ", audios=waveform, sampling_rate=int(sr), return_tensors="pt")
+            enc = processor(text=" ", audio=waveform, sampling_rate=int(sr), return_tensors="pt")
             ad: Dict[str, torch.Tensor] = {}
             for k in ("input_features", "feature_attention_mask"):
                 if k in enc:

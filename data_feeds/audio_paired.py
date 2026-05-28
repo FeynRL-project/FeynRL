@@ -129,7 +129,7 @@ class AudioPairedFeed:
         audio_dict: Dict[str, torch.Tensor] = {}
         for k in ("input_features", "feature_attention_mask"):
             if k in enc:
-                audio_dict[k] = enc[k]
+                audio_dict[k] = enc[k][0]  # strip the batch=1 dim added by return_tensors="pt"
 
         return input_ids, attn_mask, loss_mask, audio_dict
 

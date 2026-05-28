@@ -1,10 +1,23 @@
 from __future__ import annotations
+import inspect
 import io
 import os
 from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import torch
 from datasets import load_dataset
+
+
+def _get_audio_kwarg(processor: Any) -> str:
+    """Return the kwarg name this processor uses for the audio waveform."""
+    try:
+        params = inspect.signature(processor.__call__).parameters
+    except (ValueError, TypeError):
+        return "audios"
+    for name in ("audios", "audio", "raw_speech"):
+        if name in params:
+            return name
+    return "audios"
 
 
 def _load_audio_bytes(payload: Any) -> Tuple[np.ndarray, Optional[int]]:
@@ -71,6 +84,7 @@ class AudioPairedFeed:
         self.audio_key = audio_key
         self.sampling_rate_key = sampling_rate_key
         self.default_sampling_rate = int(default_sampling_rate)
+        self._audio_kwarg = _get_audio_kwarg(processor)
         self._load_data()
 
     def _load_data(self) -> None:
@@ -88,28 +102,23 @@ class AudioPairedFeed:
     def _encode(
         self, messages: list, answer: str, waveform, sr: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        # Use the processor's apply_chat_template — it handles multimodal content blocks
-        # (list-type content with {"type": "audio", ...}) that the bare tokenizer cannot render.
         template_fn = getattr(self.processor, "apply_chat_template", None) or self.tokenizer.apply_chat_template
-        prompt_text = template_fn(
-            messages, add_generation_prompt=True, tokenize=False
-        )
-        # Audio features are separate from input_ids, so prompt token count is
-        # derivable from the tokenizer alone (no extra processor call needed).
-        _prompt_ids = template_fn(messages, add_generation_prompt=True, tokenize=True)
-        prompt_len = len(_prompt_ids) if isinstance(_prompt_ids, list) else int(_prompt_ids.numel())
-
+        prompt_text = template_fn(messages, add_generation_prompt=True, tokenize=False)
         eos = getattr(self.tokenizer, "eos_token", None) or ""
         full_text = prompt_text + str(answer) + eos
 
+        audio_kw = {self._audio_kwarg: waveform, "sampling_rate": sr}
+
+        # True prompt length including audio feature tokens injected by the processor.
+        prompt_len = self.processor(text=prompt_text, return_tensors="pt", **audio_kw)["input_ids"].shape[1]
+
         enc = self.processor(
             text=full_text,
-            audios=waveform,
-            sampling_rate=sr,
             return_tensors="pt",
             padding="max_length",
             truncation=True,
             max_length=self.max_seq_len,
+            **audio_kw,
         )
         input_ids = enc["input_ids"][0]
         attn_mask = enc["attention_mask"][0]

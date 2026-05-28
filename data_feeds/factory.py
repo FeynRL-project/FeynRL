@@ -23,7 +23,11 @@ def _vision_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
     visions = [((s.get("multi_modal_inputs") or {}).get("vision") or {}) for s in batch]
     if any(visions):
-        keys = visions[0].keys()
+        first = next(v for v in visions if v)
+        keys = set(first.keys())
+        for v in visions:
+            if set(v.keys()) != keys:
+                raise ValueError("Inconsistent vision tensor keys across batch")
         out["multi_modal_inputs"] = {"vision": {k: torch.cat([v[k] for v in visions], dim=0) for k in keys}}
     return out
 

@@ -38,9 +38,7 @@ def load(model_cfg: Any, *, rank: int = 0, components: Components = ("model", "t
     if not want.issubset({"model", "tokenizer", "processor"}):
         raise ValueError(f"Invalid components={sorted(want)}")
 
-    model_class = getattr(model_cfg, "model_class", None)
-    if not model_class:
-        raise ValueError("model.model_class must be set in your config.")
+    model_class = getattr(model_cfg, "model_class", None) or "llm"
     name = getattr(model_cfg, "name", None)
     if not name:
         raise ValueError("model.name must be set in your config.")

@@ -4,7 +4,7 @@ from typing import Any, Dict, Tuple
 import torch
 from datasets import load_dataset
 from PIL import Image
-from data_feeds.image_utils import _ensure_image_token, _load_pil_image
+from data_feeds.image_utils import _load_pil_image
 
 
 class ImagePairedFeed:
@@ -32,9 +32,6 @@ class ImagePairedFeed:
         data_path: str,
         processor: Any,
         adapter: Any = None,
-        image_bytes_key: str = "image_bytes",
-        image_placeholder_token: str = "<image>",
-        insert_image_token_if_missing: bool = False,
         max_image_pixels: int | None = None,
     ):
         assert prompt_key
@@ -51,10 +48,6 @@ class ImagePairedFeed:
         self.processor = processor
         self.adapter = adapter
         self.data_path = data_path
-        self.image_bytes_key = image_bytes_key
-        self.image_placeholder_token = image_placeholder_token
-        self.insert_image_token_if_missing = bool(insert_image_token_if_missing)
-
         # Each Qwen2.5-VL visual token covers a 28×28-pixel block (14-px patch × merge_size 2).
         # Cap the processor's image resolution so the visual tokens leave room for text.
         effective = max_image_pixels if max_image_pixels is not None else (self.max_seq_len - 256) * 28 * 28
@@ -129,15 +122,13 @@ class ImagePairedFeed:
         messages = sample[self.prompt_key]
         answer = sample[self.answer_key]
 
-        image_payload = sample.get(self.image_bytes_key)
+        image_payload = sample.get("image_bytes")
         if image_payload is None:
-            raise KeyError(f"Missing '{self.image_bytes_key}' in sample keys={list(sample.keys())}")
+            raise KeyError(f"Missing 'image_bytes' in sample keys={list(sample.keys())}")
         pil = _load_pil_image(image_payload)
 
         if self.adapter is not None and hasattr(self.adapter, "prepare_messages"):
             messages = self.adapter.prepare_messages(messages)
-        else:
-            messages = _ensure_image_token(messages, self.image_placeholder_token, self.insert_image_token_if_missing)
 
         input_ids, attn_mask, loss_mask, vision = self._encode(messages, answer, pil)
 

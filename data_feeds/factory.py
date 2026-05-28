@@ -4,7 +4,6 @@ import torch
 from models.adapters import get_adapter
 import models
 
-
 # ---------------------------------------------------------------------------
 # Vision collate helpers
 #
@@ -29,6 +28,7 @@ def _vision_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             if set(v.keys()) != keys:
                 raise ValueError("Inconsistent vision tensor keys across batch")
         out["multi_modal_inputs"] = {"vision": {k: torch.cat([v[k] for v in visions], dim=0) for k in keys}}
+
     return out
 
 
@@ -73,6 +73,7 @@ def _preference_vision_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         vision_batched[k] = t.repeat_interleave(2, dim=0)
 
     out["multi_modal_inputs"] = {"vision": vision_batched}
+
     return out
 
 
@@ -93,9 +94,6 @@ def make_sft_feed(
         return ImagePairedFeed, {
             "processor": processor,
             "adapter": get_adapter(mc),
-            "image_bytes_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
-            "image_placeholder_token": getattr(params.data, "image_placeholder_token", None) or "<image>",
-            "insert_image_token_if_missing": bool(getattr(params.data, "insert_image_token_if_missing", False)),
             "max_image_pixels": getattr(params.data, "max_image_pixels", None),
         }, _vision_collate
     if mc == "qwen2_audio":
@@ -123,9 +121,6 @@ def make_preference_feed(
         return ImagePreferenceFeed, {
             "processor": processor,
             "adapter": get_adapter(mc),
-            "image_bytes_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
-            "image_placeholder_token": getattr(params.data, "image_placeholder_token", None) or "<image>",
-            "insert_image_token_if_missing": bool(getattr(params.data, "insert_image_token_if_missing", False)),
         }, _preference_vision_collate
     # TODO: add AudioPreferenceFeed + audio collator to support qwen2_audio DPO.
     return PreferenceFeed, {}, None
@@ -143,7 +138,7 @@ def make_rollout_feed(
         from data_feeds.image_prompts import ImagePromptsFeed
         return ImagePromptsFeed, {
             "adapter": get_adapter(mc),
-            "image_key": getattr(params.data, "image_bytes_key", None) or "image_bytes",
+            "image_key": "image_bytes",
             "max_image_pixels": getattr(params.data, "max_image_pixels", None),
         }
     if mc == "qwen2_audio":

@@ -141,9 +141,6 @@ class Data(BaseModel):
     answer_key: str
     solution_key: str | None = None
     # Optional multimodal dataset keys (used by MM SFT/DPO/RL feeds).
-    image_bytes_key: str | None = None
-    image_placeholder_token: str | None = None
-    insert_image_token_if_missing: bool | None = None
     max_image_pixels: int | None = None
     audio_key: str | None = None
     sampling_rate_key: str | None = None

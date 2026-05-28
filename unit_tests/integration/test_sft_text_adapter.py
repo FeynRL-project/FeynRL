@@ -7,7 +7,6 @@ Runs fully offline using TinyModel and a minimal mock tokenizer.
 import os
 import tempfile
 
-import pandas as pd
 import pytest
 import torch
 import torch.optim as optim
@@ -51,6 +50,7 @@ def test_sft_train_step_uses_adapter_forward():
     ).PairedFeed
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        pd = pytest.importorskip("pandas", reason="pandas required to write parquet fixture")
         parquet_path = os.path.join(tmpdir, "smoke.parquet")
         df = pd.DataFrame(
             [

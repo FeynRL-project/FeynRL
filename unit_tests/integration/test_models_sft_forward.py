@@ -48,17 +48,17 @@ class _MockTokenizer:
 
 
 def test_synthetic_data_paired_feed_and_forward_pass():
-    from data_prep.synthetic import build_synthetic_dataframe
     PairedFeed = pytest.importorskip(
         "data_feeds.paired",
         reason="Requires 'datasets'/'huggingface_hub' runtime deps.",
     ).PairedFeed
+    datasets_mod = pytest.importorskip("datasets", reason="Requires datasets.")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # 1. Write synthetic Parquet
         parquet_path = os.path.join(tmpdir, "smoke.parquet")
-        df = build_synthetic_dataframe(n=8)
-        df.to_parquet(parquet_path, index=False)
+        rows = [{"prompt": [{"role": "user", "content": f"q{i}"}], "answer": f"a{i}"} for i in range(8)]
+        datasets_mod.Dataset.from_list(rows).to_parquet(parquet_path)
 
         # 2. Build PairedFeed
         tokenizer = _MockTokenizer()
@@ -96,17 +96,17 @@ def test_synthetic_data_paired_feed_and_forward_pass():
 
 def test_sft_train_step_with_synthetic_data():
     """One full SFT train step: forward + loss + backward + optimizer step."""
-    from data_prep.synthetic import build_synthetic_dataframe
     PairedFeed = pytest.importorskip(
         "data_feeds.paired",
         reason="Requires 'datasets'/'huggingface_hub' runtime deps.",
     ).PairedFeed
+    datasets_mod = pytest.importorskip("datasets", reason="Requires datasets.")
     from algs.SFT.sft import SFT
 
     with tempfile.TemporaryDirectory() as tmpdir:
         parquet_path = os.path.join(tmpdir, "smoke.parquet")
-        df = build_synthetic_dataframe(n=4)
-        df.to_parquet(parquet_path, index=False)
+        rows = [{"prompt": [{"role": "user", "content": f"q{i}"}], "answer": f"a{i}"} for i in range(4)]
+        datasets_mod.Dataset.from_list(rows).to_parquet(parquet_path)
 
         tokenizer = _MockTokenizer()
         dataset = PairedFeed(

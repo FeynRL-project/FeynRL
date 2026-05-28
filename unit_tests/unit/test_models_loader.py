@@ -1,7 +1,6 @@
 import os
 import tempfile
 from unittest.mock import MagicMock
-import pandas as pd
 import pytest
 import torch
 
@@ -33,9 +32,10 @@ def test_registry_list_loaders_contains_expected_keys():
 
     keys = set(list_loaders())
     assert "llm" in keys
-    # Provided by models/transformers/hf_common.py for convenience
-    assert "transformers_qwen2_5_sft_text" in keys
-    assert "transformers_gemma3_sft_text" in keys
+    assert "qwen2_5" in keys
+    assert "gemma3" in keys
+    assert "qwen2_5_vl" in keys
+    assert "qwen2_audio" in keys
 
 
 # ---------------------------------------------------------------------------
@@ -61,22 +61,27 @@ def test_load_dispatches_to_registered_loader():
     assert (out.model, out.tokenizer) == sentinel
 
 
-def test_load_none_model_class_raises():
+@pytest.mark.parametrize("model_class", [None, ""])
+def test_load_falsy_model_class_defaults_to_llm(model_class):
     import models
+    from models.registry import register, get_loader
 
-    model_cfg = MagicMock()
-    model_cfg.model_class = None
-    with pytest.raises(ValueError, match="model.model_class must be set"):
-        models.load(model_cfg)
+    sentinel = (MagicMock(), MagicMock())
+    original_llm = get_loader("llm")
 
+    @register("llm")
+    def _mock_llm(cfg, rank):
+        return sentinel
 
-def test_load_empty_model_class_raises():
-    import models
-
-    model_cfg = MagicMock()
-    model_cfg.model_class = ""
-    with pytest.raises(ValueError, match="model.model_class must be set"):
-        models.load(model_cfg)
+    try:
+        model_cfg = MagicMock()
+        model_cfg.model_class = model_class
+        model_cfg.name = "dummy"
+        model_cfg.trust_remote_code = False
+        out = models.load(model_cfg, rank=0, components=("model", "tokenizer"))
+        assert (out.model, out.tokenizer) == sentinel
+    finally:
+        register("llm")(original_llm)
 
 
 # ---------------------------------------------------------------------------
@@ -210,14 +215,14 @@ def test_llm_loader_is_registered_and_callable():
 def test_qwen2_5_loader_is_registered_and_callable():
     from models.registry import get_loader
 
-    loader = get_loader("transformers_qwen2_5_sft_text")
+    loader = get_loader("qwen2_5")
     assert callable(loader)
 
 
 def test_gemma3_loader_is_registered_and_callable():
     from models.registry import get_loader
 
-    loader = get_loader("transformers_gemma3_sft_text")
+    loader = get_loader("gemma3")
     assert callable(loader)
 
 
@@ -226,42 +231,3 @@ def test_gemma3_loader_is_registered_and_callable():
 # ---------------------------------------------------------------------------
 
 
-def test_synthetic_dataframe_schema():
-    from data_prep.synthetic import build_synthetic_dataframe
-
-    df = build_synthetic_dataframe(n=4)
-    assert list(df.columns) == ["prompt", "answer"]
-    assert len(df) == 4
-    for prompt in df["prompt"]:
-        assert isinstance(prompt, list) and len(prompt) >= 1
-        assert prompt[-1]["role"] == "user"
-    for answer in df["answer"]:
-        assert isinstance(answer, str) and len(answer) > 0
-
-
-def test_synthetic_dataframe_with_system_prompt():
-    from data_prep.synthetic import build_synthetic_dataframe
-
-    df = build_synthetic_dataframe(n=4, system_prompt="Be concise.")
-    for prompt in df["prompt"]:
-        assert prompt[0]["role"] == "system"
-        assert prompt[1]["role"] == "user"
-
-
-def test_synthetic_dataframe_repeats_to_fill_n():
-    from data_prep.synthetic import build_synthetic_dataframe
-
-    df = build_synthetic_dataframe(n=32)
-    assert len(df) == 32
-
-
-def test_synthetic_script_writes_valid_parquet(tmp_path):
-    from data_prep.synthetic import build_synthetic_dataframe
-
-    path = str(tmp_path / "smoke.parquet")
-    df = build_synthetic_dataframe(n=8)
-    df.to_parquet(path, index=False)
-
-    loaded = pd.read_parquet(path)
-    assert list(loaded.columns) == ["prompt", "answer"]
-    assert len(loaded) == 8

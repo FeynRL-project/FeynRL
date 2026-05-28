@@ -84,7 +84,7 @@ class SFT:
         # Fallback legacy text-only path.
         # input_ids and att_mask are [B, T]
         input_ids = batch['input_ids']
-        att_mask = batch['attn_mask']
+        att_mask  = batch['attn_mask']
         # loss_mask is [B, T - 1]
         loss_mask = batch['loss_mask']
 
@@ -93,12 +93,11 @@ class SFT:
         if pos_ids is not None:
             pos_ids = pos_ids.to(att_mask.device)
 
-        output = self.model_engine(
-            input_ids=input_ids,
-            attention_mask=att_mask,
-            position_ids=pos_ids,
-            use_cache=False,
-        )
+        # feed data to model
+        output = self.model_engine(input_ids=input_ids,
+                                   attention_mask=att_mask,
+                                   position_ids=pos_ids,
+                                   use_cache=False,)
 
         # [B, T, vocab_size]
         every_token_logits = output.logits

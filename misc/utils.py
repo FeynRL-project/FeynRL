@@ -74,17 +74,6 @@ def safe_string_to_torch_dtype(dtype_in):
     raise ValueError(f"Unsupported model_dtype: {dtype_in}")
 
 
-def torch_dtype_to_str(dtype: torch.dtype) -> str:
-    if dtype == torch.bfloat16:
-        return "bfloat16"
-    if dtype == torch.float16:
-        return "float16"
-    if dtype == torch.float32:
-        return "float32"
-    if dtype == torch.float64:
-        return "float64"
-    return str(dtype).replace("torch.", "")
-
 def ensure_1d(x: torch.Tensor, name: str) -> torch.Tensor:
     '''
         Sanity check to make sure the input is a 1D tensor.

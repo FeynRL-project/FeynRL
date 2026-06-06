@@ -69,7 +69,7 @@ def load(model_cfg: Any, *, rank: int = 0, components: Components = ("model", "t
         return ModelBundle(model=model, tokenizer=tokenizer, processor=processor)
 
     # Tokenizer/processor-only path (no model weights).
-    if model_class in ("qwen2_vl", "qwen2_5_vl", "qwen2_audio"):
+    if model_class in ("qwen2_vl", "qwen2_5_vl"):
         from transformers import AutoProcessor  # type: ignore
 
         try:

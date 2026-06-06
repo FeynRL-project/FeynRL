@@ -41,6 +41,6 @@ class ModelAdapter(Protocol):
         Convert rollout-time `multi_modal_data` items into training-time `multi_modal_inputs`.
 
         `mm_items` is a list of per-sample payloads (typically dicts) as produced by rollout feeds,
-        e.g. {"image": PIL.Image} or {"audio": (waveform, sr)}.
+        e.g. {"image": PIL.Image}.
         """
         ...

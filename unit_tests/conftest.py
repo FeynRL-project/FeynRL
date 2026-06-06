@@ -1,4 +1,5 @@
 import sys
+import types
 from unittest.mock import MagicMock
 
 # Define mocks for heavy dependencies that might fail

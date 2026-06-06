@@ -143,9 +143,6 @@ class Data(BaseModel):
     # Optional multimodal dataset keys (used by MM SFT/DPO/RL feeds).
     image_key: str | None = None
     max_image_pixels: int | None = None
-    audio_key: str | None = None
-    sampling_rate_key: str | None = None
-    default_sampling_rate: int | None = None
 
 class Model(BaseModel):
     '''

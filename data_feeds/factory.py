@@ -50,13 +50,4 @@ def make_sft_feed(
             "adapter": get_adapter(mc),
             "max_image_pixels": getattr(params.data, "max_image_pixels", None),
         }, _vision_collate
-    if mc == "qwen2_audio":
-        from data_feeds.audio_paired import AudioPairedFeed
-        return AudioPairedFeed, {
-            "processor": processor,
-            "adapter": get_adapter(mc),
-            "audio_key": getattr(params.data, "audio_key", None) or "audio_bytes",
-            "sampling_rate_key": getattr(params.data, "sampling_rate_key", None) or "sampling_rate",
-            "default_sampling_rate": getattr(params.data, "default_sampling_rate", None) or 16000,
-        }, None
     return PairedFeed, {}, None

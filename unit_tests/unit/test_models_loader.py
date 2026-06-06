@@ -35,7 +35,6 @@ def test_registry_list_loaders_contains_expected_keys():
     assert "qwen2_5" in keys
     assert "gemma3" in keys
     assert "qwen2_5_vl" in keys
-    assert "qwen2_audio" in keys
 
 
 # ---------------------------------------------------------------------------
@@ -229,5 +228,3 @@ def test_gemma3_loader_is_registered_and_callable():
 # ---------------------------------------------------------------------------
 # Synthetic data script
 # ---------------------------------------------------------------------------
-
-

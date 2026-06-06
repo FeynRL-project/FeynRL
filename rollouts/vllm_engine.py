@@ -39,6 +39,7 @@ class VLLMRolloutEngine(Base):
                  engine_id: int = 0,
                  batch_invariant: bool = False,
                  quantization: Optional[str] = None,
+                 processor_name_or_path: Optional[str] = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -87,6 +88,7 @@ class VLLMRolloutEngine(Base):
         self.trust_remote_code = trust_remote_code
         # Online quantization for vllm and only "fp8" is supported.
         self.quantization = quantization
+        self.processor_name_or_path = processor_name_or_path
         self.vllm_engine = None
         self.refresh_model(model_path, 0)
         self.sampling_params = self.make_sampling_params()
@@ -186,6 +188,9 @@ class VLLMRolloutEngine(Base):
 
         if self.quantization is not None:
             llm_kwargs["quantization"] = self.quantization
+
+        if self.processor_name_or_path is not None:
+            llm_kwargs["tokenizer"] = self.processor_name_or_path
 
         self.vllm_engine = LLM(**llm_kwargs)
         self.log(f"Successfully loaded vllm model from {self.model_path}")

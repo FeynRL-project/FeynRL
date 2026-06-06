@@ -5,7 +5,6 @@ import numpy as np
 import argparse
 import importlib
 import torch
-from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 import ray
 import time
@@ -13,11 +12,14 @@ from tqdm import tqdm
 
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
+from data_feeds.images import ImagePromptsFeed
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
 from rollouts.vllm_engine import VLLMRolloutEngine
 from misc.utils import set_random_seeds, ray_get_with_timeout, get_determinism_env_vars
 from misc.logging import setup_logging, setup_tracker
 from rollouts.replay_buffer import ReplayBuffer
+import models
+from models.adapters import get_adapter
 
 
 def setup_ray(ray_address):
@@ -40,36 +42,27 @@ def setup_ray(ray_address):
 
     return master_addr
 
-def load_tokenizer(model_name, trust_remote_code=False, rank=0):
-    '''
-       Load tokenizer from huggingface.
-    '''
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=trust_remote_code)
-
-    # if pad token is not present, we use eos token as pad token
-    if tokenizer.pad_token_id is None:
-        print("Warning: Pad token is not present, using eos token as pad token")
-        if getattr(tokenizer, 'eos_token', None) is not None:
-            # prefer explicit token if available
-            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-        else:
-            # fallback to eos token id
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    return tokenizer
-
-def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
+def create_rollout_dataloader(params, tokenizer, num_rollout_engines, processor=None, model_adapter=None):
     '''
        This dataloader is used for rollout generation which 
        would be used to train the policy.
     '''
     # 1. Initialize our custom datasets
-    prompt_ds = PromptsFeed(prompt_key=params.data.prompt_key,
+    dataset_cls = PromptsFeed
+    dataset_kwargs = {}
+    if getattr(params.data, "image_key", None):
+        dataset_cls = ImagePromptsFeed
+        dataset_kwargs = {
+            "image_key": params.data.image_key,
+            "processor": processor,
+            "model_adapter": model_adapter,
+        }
+    prompt_ds = dataset_cls(prompt_key=params.data.prompt_key,
                             max_seq_len=params.data.max_seq_len,
                             tokenizer=tokenizer,
                             data_path=params.data.test_files_path,
                             solution_key=params.data.solution_key,
+                            **dataset_kwargs,
                             )
 
     # since we split the data across the rollout engines
@@ -121,6 +114,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "batch_invariant":params.rollout.batch_invariant,
+              "processor_name_or_path":getattr(params.model, "processor_name_or_path", None),
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
@@ -367,13 +361,29 @@ if __name__ == "__main__":
     logger.info(f"Ray initialized. Master address: {master_addr}")
 
     ########
-    # 5. load tokenizer
+    # 5. load tokenizer (+ optional processor for multimodal families)
     ########
-    logger.info(f"Loading tokenizer from {config.model.name}")
-    tokenizer = load_tokenizer(model_name=config.model.name,
-                               trust_remote_code=config.model.trust_remote_code,
-                               rank=rank)
+    logger.info(f"Loading tokenizer/processor for {config.model.name}")
+    bundle = models.load(config.model, rank=rank, components=("tokenizer", "processor"))
+    tokenizer, processor = bundle.tokenizer, bundle.processor
+    if tokenizer is None:
+        raise ValueError("Tokenizer load failed (got None)")
+    # if pad token is not present, we use eos token as pad token
+    if tokenizer.pad_token_id is None:
+        logger.warning("Pad token is not present, using eos token as pad token")
+        if getattr(tokenizer, 'eos_token', None) is not None:
+            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+        else:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
+
+    # If the model path is a local checkpoint that's missing the processor config
+    # (because it wasn't saved during training), write it in now so vLLM can load it.
+    if processor is not None and os.path.isdir(config.model.name):
+        _proc_cfg = os.path.join(config.model.name, "preprocessor_config.json")
+        if not os.path.exists(_proc_cfg):
+            processor.save_pretrained(config.model.name)
+            logger.info(f"Wrote processor config to {config.model.name} for vLLM compatibility")
 
     ########
     # 6. initialize inference engine
@@ -399,9 +409,12 @@ if __name__ == "__main__":
     # 6. Load the test datat
     ########
     logger.info(f"Loading rollout dataloader from {config.data.test_files_path}")
+    model_adapter = get_adapter(getattr(config.model, "model_class", None))
     rollout_dataloader = create_rollout_dataloader(params=config,
                                                   tokenizer=tokenizer,
-                                                  num_rollout_engines=num_rollout_engines)
+                                                  num_rollout_engines=num_rollout_engines,
+                                                  processor=processor,
+                                                  model_adapter=model_adapter)
     logger.info(f"Rollout dataloader ready. Total batches per epoch: {len(rollout_dataloader)}")
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,

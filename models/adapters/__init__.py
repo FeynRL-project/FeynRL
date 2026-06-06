@@ -18,11 +18,11 @@ def get_adapter(model_class: str | None) -> ModelAdapter:
     model_class = model_class or "llm"
     if model_class in ("llm", "qwen2_5", "gemma3", ""):
         return TextCausalLMAdapter()
-    if model_class == "qwen2_5_vl":
+    if model_class in ("qwen2_vl", "qwen2_5_vl"):
         return Qwen2_5VLAdapter()
     if model_class == "qwen2_audio":
         return Qwen2AudioAdapter()
     raise ValueError(
         f"Unknown model_class '{model_class}'. "
-        f"Supported: 'llm', 'qwen2_5', 'gemma3', 'qwen2_5_vl', 'qwen2_audio'."
+        f"Supported: 'llm', 'qwen2_5', 'gemma3', 'qwen2_vl', 'qwen2_5_vl', 'qwen2_audio'."
     )

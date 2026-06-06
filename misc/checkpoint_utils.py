@@ -254,7 +254,7 @@ def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_s
     return start_epoch, global_step
 
 
-def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None, ref_model_name=None):
+def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_path, peft_config, rank, world_size, logger, label, zero_stage=None, model_dtype=None, ref_model_name=None, processor=None, base_model_name=None):
     '''
         Save a full training checkpoint: HF-compatible weights, model config,
         generation config, tokenizer, DeepSpeed engine state (optimizer/scheduler/RNG),
@@ -348,6 +348,10 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
             tokenizer.save_pretrained(model_path)
             logger.info(f"[Epoch {epoch+1}] Tokenizer saved")
 
+            if processor is not None:
+                processor.save_pretrained(model_path)
+                logger.info(f"[Epoch {epoch+1}] Processor saved")
+
     except Exception as e:
         save_ok = False
         logger.error(f"[Epoch {epoch+1}] Error saving config/tokenizer: {e}")
@@ -379,7 +383,8 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
                           'model_dtype': model_dtype,
                           'use_peft': peft_config.use_peft,
                           'peft_type': getattr(peft_config, 'peft_type', None) if peft_config.use_peft else None,
-                          'ref_model_name': ref_model_name}
+                          'ref_model_name': ref_model_name,
+                          'base_model_name': base_model_name}
 
         state_file = os.path.join(model_path, "training_state.json")
         with open(state_file, "w") as f:

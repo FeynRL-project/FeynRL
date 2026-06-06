@@ -69,10 +69,24 @@ def load(model_cfg: Any, *, rank: int = 0, components: Components = ("model", "t
         return ModelBundle(model=model, tokenizer=tokenizer, processor=processor)
 
     # Tokenizer/processor-only path (no model weights).
-    if model_class in ("qwen2_5_vl", "qwen2_audio"):
+    if model_class in ("qwen2_vl", "qwen2_5_vl", "qwen2_audio"):
         from transformers import AutoProcessor  # type: ignore
 
-        processor = AutoProcessor.from_pretrained(processor_name, trust_remote_code=trust_remote_code)
+        try:
+            processor = AutoProcessor.from_pretrained(processor_name, trust_remote_code=trust_remote_code)
+        except OSError:
+            import json as _json
+            import os as _os
+            _state_path = _os.path.join(processor_name, "training_state.json")
+            _base = None
+            if _os.path.isfile(_state_path):
+                with open(_state_path) as _f:
+                    _base = _json.load(_f).get("base_model_name")
+            if _base:
+                processor = AutoProcessor.from_pretrained(_base, trust_remote_code=trust_remote_code)
+            else:
+                raise
+
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is None:
             from transformers import AutoTokenizer  # type: ignore

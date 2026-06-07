@@ -993,14 +993,15 @@ def main(args, config):
     logger.info(f"Loading training algorithm: {config.train.alg_name}")
     alg_class = load_algorithm(config.train.alg_name, Algorithm_Registry)
 
-    training_engines = create_training_engines(params=config,
-                                               alg=alg_class,
-                                               world_size=training_gpus,
-                                               master_addr=master_addr,
-                                               master_port=config.run.ray_master_port)
+    training_engines, training_rank0_addr = create_training_engines(params=config,
+                                                                    alg=alg_class,
+                                                                    world_size=training_gpus,
+                                                                    master_addr=master_addr,
+                                                                    master_port=config.run.ray_master_port)
 
     assert len(training_engines) == training_gpus, "Number of training engines does not match number of training gpus"
     logger.info(f"Created {len(training_engines)} training engine runners")
+    logger.info(f"Training rank-0 rendezvous address: {training_rank0_addr}")
 
     # Synchronization barrier to prevent deepspeed rendezvous hang
     # wait for all training actors to finish initialization before proceeding
@@ -1137,7 +1138,7 @@ def main(args, config):
     ########
     nccl_world_size, nccl_gname = reinit_nccl_weight_sync_group(training_engines=training_engines,
                                                                 rollout_engines=rollout_engines,
-                                                                master_addr=master_addr,
+                                                                master_addr=training_rank0_addr,
                                                                 nccl_port=nccl_port,
                                                                 tp_size=int(config.rollout.tensor_parallel_size),
                                                                 logger=logger,

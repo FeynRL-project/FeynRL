@@ -3,6 +3,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import ray
+try:
+    from ray.util.placement_group import placement_group, placement_group_table
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:
+    placement_group = ray.util.placement_group
+    placement_group_table = ray.util.placement_group_table
+    PlacementGroupSchedulingStrategy = ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy
 import time
 
 # imports local methods, classes, etc.
@@ -21,6 +28,44 @@ Algorithm_Registry = {# supported algorithms
                       'ppo':   ('algs.PPO.ppo', 'PPO'),
                       'p4o':   ('algs.P4O.p4o', 'P4O'),
                      }
+
+def _get_placement_group_bundle_node_ip(pg, bundle_index, timeout):
+    if timeout is None:
+        raise RuntimeError(
+            "Placement group readiness requires run.init_timeout "
+            "(or run.ray_init_timeout) to be set"
+        )
+
+    try:
+        ray.get(pg.ready(), timeout=timeout)
+    except Exception as exc:
+        if exc.__class__.__name__ == "GetTimeoutError":
+            raise RuntimeError(
+                f"Placement group bundle {bundle_index} did not become ready within "
+                f"{timeout}s while resolving the training rank-0 node IP. Check Ray "
+                "cluster resources, GPU fragmentation, and run.init_timeout."
+            ) from exc
+        raise
+
+    pg_table = placement_group_table(pg)
+    bundle_node_ids = pg_table.get("bundles_to_node_id", {})
+    node_id = bundle_node_ids.get(bundle_index)
+    if node_id is None:
+        node_id = bundle_node_ids.get(str(bundle_index))
+    if not node_id:
+        raise RuntimeError(
+            f"Could not resolve node for placement group bundle {bundle_index}"
+        )
+
+    for node in ray.nodes():
+        if node.get("NodeID") == node_id and node.get("Alive", True):
+            node_ip = node.get("NodeManagerAddress")
+            if node_ip:
+                return node_ip
+
+    raise RuntimeError(
+        f"Could not resolve IP address for placement group bundle {bundle_index} node {node_id}"
+    )
 
 def create_training_engines(params, alg, world_size, master_addr, master_port):
     '''
@@ -70,6 +115,13 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
 
     # setup ray runners
     ray_runners = []
+    pg = placement_group([{"GPU": 1, "CPU": 1} for _ in range(world_size)], strategy="PACK")
+    # Rank 0 binds the DeepSpeed rendezvous address, so use bundle 0's node,
+    # not the Ray driver node that created the placement group.
+    init_timeout = getattr(params.run, "init_timeout", None)
+    if init_timeout is None:
+        init_timeout = getattr(params.run, "ray_init_timeout", None)
+    master_addr = _get_placement_group_bundle_node_ip(pg, 0, timeout=init_timeout)
     cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
     for rank in range(world_size):
         # Since NCCL identifies gpus by their actual PCIe/NVLink topology,
@@ -97,11 +149,17 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
         if params.run.nccl_ib_hca:
             ray_vars["NCCL_IB_HCA"] = params.run.nccl_ib_hca
 
-        runner = alg.options(num_gpus=1, runtime_env={"env_vars": ray_vars}
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=rank,
+        )
+        runner = alg.options(num_gpus=1,
+                             runtime_env={"env_vars": ray_vars},
+                             scheduling_strategy=scheduling_strategy,
                             ).remote(**kwargs)
         ray_runners.append(runner)
 
-    return ray_runners
+    return ray_runners, master_addr
 
 def create_rollout_engines(params, reward_fnc, eos_id):
     '''
@@ -144,6 +202,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
 
     # if model doesn't fit in one gpu, tp can be > 1
     num_engines = max(1, rollout_gpus // tp)
+    pg = placement_group([{"GPU": tp, "CPU": 1} for _ in range(num_engines)], strategy="PACK")
     engines = []
     cublas_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG", get_determinism_env_vars())
     for i in range(num_engines):
@@ -166,16 +225,23 @@ def create_rollout_engines(params, reward_fnc, eos_id):
         if params.run.nccl_ib_hca:
             rollout_env_vars["NCCL_IB_HCA"] = params.run.nccl_ib_hca
 
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=i,
+        )
+
         if params.overlap and params.overlap.enabled:
             engines.append(VLLMRolloutEngineAsync.options(num_gpus=tp,
-                                                          runtime_env={"env_vars": rollout_env_vars}
+                                                          runtime_env={"env_vars": rollout_env_vars},
+                                                          scheduling_strategy=scheduling_strategy,
                                                          ).remote(**kwargs))
 
         else:
             # quantization is for sync-only mode.
             sync_kwargs = {**kwargs, "quantization": params.rollout.quantization}
             engines.append(VLLMRolloutEngine.options(num_gpus=tp,
-                                                    runtime_env={"env_vars": rollout_env_vars}
+                                                    runtime_env={"env_vars": rollout_env_vars},
+                                                    scheduling_strategy=scheduling_strategy,
                                                     ).remote(**sync_kwargs))
 
     return engines

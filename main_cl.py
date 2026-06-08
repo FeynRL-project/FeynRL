@@ -2,7 +2,6 @@ import os
 import argparse
 import deepspeed
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from torch.utils.data import DataLoader
 import torch.distributed
 from tqdm import tqdm
@@ -14,7 +13,8 @@ from peft import get_peft_model, LoraConfig
 import configs.load as cfg # all config arguments
 from data_feeds.preference import PreferenceFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
+from misc.utils import get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
+from misc.model_loading import build_hf_model, load_tokenizer_or_processor, ensure_pad_token
 from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
 
@@ -82,61 +82,38 @@ def apply_peft_module(model, peft_config, rank=0):
     else:
         raise ValueError(f"Unsupported PEFT type: {peft_config.peft_type}")
 
-def load_models_and_tokenizer(model_name, model_dtype, ref_model_name,trust_remote_code, attn_impl, rank):
+def load_models_and_tokenizer(model_name, model_dtype, ref_model_name, model_class, trust_remote_code, attn_impl, rank):
     '''
-        Load models and tokenizer.
+        Load the policy model, reference model, and tokenizer/processor for the given
+        model_class ("llm" or "vlm"). For "llm" the processor is None; for "vlm" it is
+        the AutoProcessor used by the data feed.
     '''
-    assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-    assert attn_impl is None or attn_impl == '' or attn_impl in ['eager', 'flash_attention_2'], \
-        "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
+    # 1. policy model (bare HF model; PEFT/grad-ckpt/DeepSpeed are applied later in main)
+    model = build_hf_model(model_path=model_name,
+                           model_dtype=model_dtype,
+                           model_class=model_class,
+                           trust_remote_code=trust_remote_code,
+                           attn_impl=attn_impl)
 
-    # convert string to torch dtype if it is not already
-    model_dtype = safe_string_to_torch_dtype(model_dtype)
-
-    # 1. model and its config initialization
-    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(model_name,
-                                                dtype=model_dtype,
-                                                trust_remote_code=trust_remote_code,
-                                                config=model_config,
-                                                attn_implementation=None if attn_impl == '' else attn_impl)
-    # 2. load reference model
+    # 2. reference model (defaults to the policy model path)
     if ref_model_name is None:
         ref_model_name = model_name
+    ref_model = build_hf_model(model_path=ref_model_name,
+                               model_dtype=model_dtype,
+                               model_class=model_class,
+                               trust_remote_code=trust_remote_code,
+                               attn_impl=attn_impl)
 
-    ref_model_config = AutoConfig.from_pretrained(ref_model_name, trust_remote_code=trust_remote_code)
-    ref_model = AutoModelForCausalLM.from_pretrained(ref_model_name,
-                                                     dtype=model_dtype,
-                                                     trust_remote_code=trust_remote_code,
-                                                     config=ref_model_config,
-                                                     attn_implementation=None if attn_impl == '' else attn_impl)
+    # 3. tokenizer + processor for vlm (tokenizer comes from the policy model path)
+    tokenizer, processor = load_tokenizer_or_processor(model_path=model_name,
+                                                       model_class=model_class,
+                                                       trust_remote_code=trust_remote_code)
 
-    # 3. Tokenizer initialization
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    # 4. ensure pad token exists and sync pad_token_id into BOTH model configs.
+    # vllm and similar read pad_token_id from config.json, not the tokenizer.
+    ensure_pad_token(tokenizer, model, ref_model, rank=rank)
 
-    # if pad token is not present, we use eos token as pad token
-    # log warning if pad token is not present.
-    if tokenizer.pad_token_id is None:
-        if rank == 0:
-            print("Warning: Pad token is not present, using eos token as pad token")
-
-        if getattr(tokenizer, 'eos_token', None) is not None:
-            # prefer explicit token if available
-            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-
-        else:
-            # fallback to eos token id
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # Sync pad_token_id into model config so exported checkpoints are consistent
-    # as vllm and similar read pad_token_id from config.json, not tokenizer
-    if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
-    if ref_model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
-        ref_model.config.pad_token_id = tokenizer.pad_token_id
-
-    return model, ref_model, tokenizer
+    return model, ref_model, tokenizer, processor
 
 def create_training_engine(deepspeed_config, deepspeed_ref_config, model, ref_model):
     '''
@@ -267,9 +244,11 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, ref_model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
+    # processor is None for llm; for vlm it is passed to the data feed (wired in a later step).
+    model, ref_model, tokenizer, processor = load_models_and_tokenizer(model_name=config.model.name,
                                                             model_dtype=config.model.dtype,
                                                             ref_model_name=config.model.ref_model,
+                                                            model_class=config.model.model_class,
                                                             trust_remote_code=config.model.trust_remote_code,
                                                             attn_impl=config.model.attn_implementation,
                                                             rank=rank)
@@ -603,7 +582,8 @@ if __name__ == "__main__":
                                      label="cl",
                                      zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
                                      model_dtype=config.model.dtype,
-                                     ref_model_name=config.model.ref_model or config.model.name)
+                                     ref_model_name=config.model.ref_model or config.model.name,
+                                     processor=processor)
 
     total_training_time = time.time() - training_start_time
     logger.info(f"Training completed successfully! Total time: {total_training_time:.2f}s ({total_training_time/3600:.2f}h)")

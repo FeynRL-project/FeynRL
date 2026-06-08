@@ -100,3 +100,32 @@ Contributions are welcome! Please see our **[Contributing Guidelines](CONTRIBUTI
 ## ❓ FAQ
 
 Check out the [FAQ](docs/FAQ.md) for common questions and answers.
+
+
+## 🙏 Acknowledgements
+
+Special thanks to the [Open-Instruct](https://github.com/allenai/open-instruct) and [PipelineRL](https://github.com/ServiceNow/PipelineRL) projects, both of which provided valuable resources for this work and the broader community.
+
+## 📚 Citation
+
+If you use FeynRL in your work, please cite the following:
+
+```bibtex
+@misc{FeynRL,
+  author       = {Rasool Fakoor and Murdock Aubry and FeynRL Contributors},
+  title        = {FeynRL: A Modular and Scalable LLM Post-Training Framework},
+  year         = {2026},
+  howpublished = {\url{https://github.com/FeynRL-project/FeynRL}},
+  note         = {GitHub repository. Corresponding author: Rasool Fakoor}
+}
+
+@misc{fakoor2026trustbatchonoffpolicy,
+  title         = {Trust the Batch, On- or Off-Policy: Adaptive Policy Optimization for RL Post-Training},
+  author        = {Rasool Fakoor and Murdock Aubry and Nicholas Stranges and Alexander J. Smola},
+  year          = {2026},
+  eprint        = {2605.12380},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2605.12380}
+}
+```

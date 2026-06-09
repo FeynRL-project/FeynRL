@@ -140,6 +140,10 @@ class Data(BaseModel):
     prompt_key: str
     answer_key: str
     solution_key: str | None = None
+    # vlm only: parquet column holding the image(s) and an optional cap on
+    # image pixels (width*height) to bound the image-token count. Ignored for llm.
+    image_key: str | None = None
+    max_image_pixels: int | None = None
 
 class Model(BaseModel):
     '''

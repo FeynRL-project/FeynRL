@@ -202,6 +202,7 @@ def save_checkpoint(epoch,
                           'policy_version': version,
                           'global_step': global_step,
                           'training_gpus': len(training_engines),
+                          'save_ds_engine': save_ds_engine,
                          }
         state_file = os.path.join(model_path, "training_state.json")
         with open(state_file, "w") as f:

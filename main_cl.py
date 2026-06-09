@@ -603,7 +603,7 @@ if __name__ == "__main__":
                                      label="cl",
                                      zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
                                      model_dtype=config.model.dtype,
-                                     save_ds_engine=config.deepspeed.save_ds_engine,
+                                     save_ds_engine=config.run.save_ds_engine,
                                      ref_model_name=config.model.ref_model or config.model.name)
 
     total_training_time = time.time() - training_start_time

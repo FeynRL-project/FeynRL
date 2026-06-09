@@ -32,6 +32,12 @@ class Run(BaseModel):
     # Save a disk checkpoint every N epochs for persistence/resumability.
     # 0 = only at end.
     checkpoint_save_interval: int | None = 1
+    # When True (default), each checkpoint also writes DeepSpeed optimizer/scheduler/RNG
+    # state to ds_engine/, which is required to resume training from that checkpoint.
+    # Set to False to skip ds_engine/ and reduce disk usage when resumability is not needed
+    # (e.g. eval-only jobs, final checkpoints). Checkpoints saved with save_ds_engine=False
+    # are NOT resumable — attempting to resume from them will raise an error.
+    save_ds_engine: bool = True
 
     # NCCL configuration for network transport.
     # Leave nccl_socket_ifname and nccl_ib_hca null for single-node or when NCCL auto-detection works.
@@ -206,13 +212,6 @@ class DeepSpeed(BaseModel):
 
     # Monitor config
     monitor_config: Dict[str, Any] | None = None
-
-    # Whether to save the DeepSpeed engine state (optimizer, scheduler, RNG)
-    # alongside the HF-compatible weights. Set to False to skip the ds_engine/
-    # directory when resume is not needed (e.g. eval-only or final checkpoints).
-    # The optimizer state is typically several times larger than the raw weights,
-    # so skipping it saves significant disk space per checkpoint.
-    save_ds_engine: bool = True
 
     def model_dump(self, **kwargs):
         # Exclude None values by default for ds compatibility.

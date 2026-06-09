@@ -174,6 +174,14 @@ def resume_from_checkpoint(resume_path, model_engine, world_size, logger, zero_s
     with open(state_path) as f:
         training_state = json.load(f)
 
+    if not training_state.get('save_ds_engine', True):
+        raise RuntimeError(
+            f"Checkpoint at {resume_path} was saved with save_ds_engine=False. "
+            f"The DeepSpeed optimizer/scheduler/RNG state was not written, so this "
+            f"checkpoint cannot be resumed. To resume training, use a checkpoint saved "
+            f"with save_ds_engine=True (the default)."
+        )
+
     saved_epoch = training_state['epoch']
     global_step = training_state['global_step']
 
@@ -357,7 +365,8 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
                           'model_dtype': model_dtype,
                           'use_peft': peft_config.use_peft,
                           'peft_type': getattr(peft_config, 'peft_type', None) if peft_config.use_peft else None,
-                          'ref_model_name': ref_model_name}
+                          'ref_model_name': ref_model_name,
+                          'save_ds_engine': save_ds_engine}
 
         state_file = os.path.join(model_path, "training_state.json")
         with open(state_file, "w") as f:

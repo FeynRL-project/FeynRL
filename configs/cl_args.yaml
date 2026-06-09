@@ -7,6 +7,9 @@ run:
   # Save a disk checkpoint every N epochs for persistence/resumability.
   # 0 = only at end.
   checkpoint_save_interval: 1
+  # Set to false to skip saving ds_engine/ (optimizer/scheduler/RNG state) at each checkpoint.
+  # Saves significant disk space but makes checkpoints NOT resumable. Default: true.
+  save_ds_engine: true
 
   # NCCL config for multi-node training over InfiniBand.
   # Leave nccl_socket_ifname and nccl_ib_hca null for single-node or when NCCL auto-detection works.
@@ -91,11 +94,6 @@ data:
   answer_key: "answer"
 
 deepspeed:
-  # Set to false to skip saving the ds_engine/ directory (optimizer/scheduler/RNG states).
-  # The optimizer state is typically several times larger than the raw weights, so
-  # skipping it saves significant disk space when training resume is not needed.
-  save_ds_engine: true
-
   zero_optimization:
     # 0:Disabled, 1:OptState, 2:Opt+Grad, 3:Opt+Grad+Param
     stage: 3

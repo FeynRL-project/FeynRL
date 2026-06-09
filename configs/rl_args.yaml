@@ -17,6 +17,9 @@ run:
   # Save a disk checkpoint every N epochs for persistence/resumability.
   # 0 = only at end. Only applies when weight_sync_method="direct".
   checkpoint_save_interval: 1
+  # Set to false to skip saving ds_engine/ (optimizer/scheduler/RNG state) at each checkpoint.
+  # Saves significant disk space but makes checkpoints NOT resumable. Default: true.
+  save_ds_engine: true
 
   # NCCL fabric config. Leave null for auto-detect (works for single-node and
   # most multi-node setups). Only set if fabric init fails. See docs/TROUBLESHOOTING.md.
@@ -170,11 +173,6 @@ data:
   solution_key: null
 
 deepspeed:
-  # Set to false to skip saving the ds_engine/ directory (optimizer/scheduler/RNG states).
-  # The optimizer state is typically several times larger than the raw weights, so
-  # skipping it saves significant disk space when training resume is not needed.
-  save_ds_engine: true
-
   zero_optimization:
     # 0:Disabled, 1:OptState, 2:Opt+Grad, 3:Opt+Grad+Param
     stage: 3

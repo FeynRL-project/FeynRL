@@ -12,6 +12,7 @@ from peft import get_peft_model, LoraConfig
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
 from data_feeds.paired import PairedFeed
+from data_feeds.image_paired import ImagePairedFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
 from misc.utils import get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
 from misc.model_loading import build_hf_model, load_tokenizer_or_processor, ensure_pad_token
@@ -127,11 +128,12 @@ def create_training_engine(deepspeed_config, model):
                                                         )
     return model_engine, optimizer
 
-def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
+def create_data_loader(params, tokenizer, rank, world_size, batch_size, split, processor=None):
     '''
        Setup DataLoader for distributed training.
        As a reminder, batch_size is the per-gpu-micro-batch size.
        Hence, global batch size = batch_size * world_size * gradient_accumulation_steps.
+       processor is the multimodal AutoProcessor (only used when model_class == "vlm").
     '''
     # 1. Initialize our custom datasets
     data_path = params.data.train_files_path if split == 'train' else params.data.val_files_path
@@ -139,7 +141,17 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     # steps_per_epoch is only needed for training (MixedDatasetSampler)
     steps_per_epoch = params.train.micro_batches_per_epoch if split == 'train' else None
 
-    dataset, sampler = create_dataset_and_sampler(data_paths=data_path,
+    # Select the text vs multimodal feed and its constructor kwargs.
+    if params.model.model_class == "vlm":
+        dataset_cls = ImagePairedFeed
+        dataset_kwargs = {"processor": processor,
+                          "image_key": params.data.image_key,
+                          "max_image_pixels": params.data.max_image_pixels}
+    else:
+        dataset_cls = PairedFeed
+        dataset_kwargs = {"tokenizer": tokenizer}
+
+    dataset, sampler, collate_fn = create_dataset_and_sampler(data_paths=data_path,
                                                   prompt_key=params.data.prompt_key,
                                                   answer_key=params.data.answer_key,
                                                   max_seq_len=params.data.max_seq_len,
@@ -150,10 +162,11 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                                   world_size=world_size,
                                                   seed=params.run.seed,
                                                   local_batch_size=batch_size,
-                                                  dataset_cls=PairedFeed,
+                                                  dataset_cls=dataset_cls,
                                                   steps_per_epoch=steps_per_epoch,
                                                   shuffle_within_batch=True,
-                                                  dynamic_ratio_every_step=params.train.dynamic_ratio_every_step)
+                                                  dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                  dataset_kwargs=dataset_kwargs)
 
     # 2. Initialize data loader
     def worker_init_fn(worker_id):
@@ -168,6 +181,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                 batch_sampler=sampler,
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
     else:
         # DistributedSampler yields individual indices.
@@ -177,6 +191,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
                                 drop_last=False,  # ensure all validation samples are used
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
 
     return dataloader, sampler
@@ -279,14 +294,16 @@ if __name__ == "__main__":
                                                         batch_size=config.train.train_batch_size_per_gpu,
                                                         split='train',
                                                         world_size=world_size,
-                                                        rank=rank)
+                                                        rank=rank,
+                                                        processor=processor)
 
     val_dataloader, _ = create_data_loader(params=config,
                                           tokenizer=tokenizer,
                                           batch_size=config.train.val_batch_size_per_gpu,
                                           split='val',
                                           world_size=world_size,
-                                          rank=rank)
+                                          rank=rank,
+                                          processor=processor)
 
     # With ZeRO-3, model parameters are partitioned across GPUs and only gathered temporarily
     # into gpu memory during a forward/backward pass. Peak memory scales with batch size.

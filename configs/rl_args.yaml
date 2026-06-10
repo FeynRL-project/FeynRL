@@ -19,7 +19,7 @@ run:
   checkpoint_save_interval: 1
   # Set to false to skip saving ds_engine/ (optimizer/scheduler/RNG state) at each checkpoint.
   # Saves significant disk space but makes checkpoints NOT resumable. Default: true.
-  save_ds_engine: true
+  save_optimizer_state: true
 
   # NCCL fabric config. Leave null for auto-detect (works for single-node and
   # most multi-node setups). Only set if fabric init fails. See docs/TROUBLESHOOTING.md.

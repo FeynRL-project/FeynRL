@@ -141,7 +141,7 @@ def save_checkpoint(epoch,
                     rank,
                     logger,
                     save_timeout,
-                    save_ds_engine=True):
+                    save_optimizer_state=True):
     '''
        Save model checkpoint. This must run on all ranks for ZeRO-3.
        Writes hf compatible weights and for vllm, ds engine state
@@ -149,7 +149,7 @@ def save_checkpoint(epoch,
        CHECKPOINT_COMPLETE marker for crash-safe.
 
        Args:
-           save_ds_engine: When False, skip saving the DeepSpeed engine state
+           save_optimizer_state: When False, skip saving the DeepSpeed engine state
                            (optimizer/scheduler/RNG). The optimizer state is
                            typically several times larger than the raw weights,
                            so this saves significant disk space per checkpoint.
@@ -186,7 +186,7 @@ def save_checkpoint(epoch,
     # 2. save DeepSpeed engine state so we can resume training later.
     # Directory creation happens inside save_engine_state on DS rank 0.
     engine_state_dir = os.path.join(model_path, "ds_engine")
-    state_futures = [engine.save_engine_state.remote(engine_state_dir, save_ds_engine) for engine in training_engines]
+    state_futures = [engine.save_engine_state.remote(engine_state_dir, save_optimizer_state) for engine in training_engines]
     ray_get_with_timeout(refs=state_futures,
                          timeout=save_timeout,
                          description=f"engine state save (epoch {epoch+1})",
@@ -202,7 +202,7 @@ def save_checkpoint(epoch,
                           'policy_version': version,
                           'global_step': global_step,
                           'training_gpus': len(training_engines),
-                          'save_ds_engine': save_ds_engine,
+                          'save_optimizer_state': save_optimizer_state,
                          }
         state_file = os.path.join(model_path, "training_state.json")
         with open(state_file, "w") as f:

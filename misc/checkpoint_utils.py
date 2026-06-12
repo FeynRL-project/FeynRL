@@ -9,12 +9,13 @@ import deepspeed
 from safetensors.torch import save_file
 from huggingface_hub import split_torch_state_dict_into_shards
 
-def gather_params_for_save(module, rank):
+def gather_params_for_save(model_engine, rank):
     '''
-        Gather all parameters from a deepspeed wrapped module.
+        Gather all parameters from a deepspeed wrapped engine.
         Returns {name: cpu_tensor} on rank 0, empty dict on others.
         Must be called on ALL ranks for ZeRO-3 collective correctness.
     '''
+    module = model_engine.module
     params = []
     names = []
     for name, param in module.named_parameters():
@@ -25,12 +26,37 @@ def gather_params_for_save(module, rank):
     state_dict = {}
 
     if is_zero3:
-        # Gather one param at a time to avoid oon. Each param is materialized
-        # on rank 0, copied to cpu, then released before the next param is gathered.
-        for name, param in zip(names, params):
-            with deepspeed.zero.GatheredParameters([param], modifier_rank=0):
-                if rank == 0:
-                    state_dict[name] = param.data.cpu().clone()
+        # Under ZeRO-3 each weight is split across the GPUs. To save it we glue a weight back
+        # together on rank 0 (GatheredParameters), copy it to CPU, then split it apart again.
+        # Problem: for speed DeepSpeed sometimes starts gluing a weight before we ask and keeps
+        # small weights glued all the time, so at save time some weights are "mid-glue". You
+        # cannot split a mid-glue weight apart -> `assert ... Cannot partition a param in flight`
+        #
+        # To handle this:
+        #   1. before the loop: finish/cancel any half-done gluing and split EVERY weight apart
+        #      cleanly (covers frozen base weights AND trainable adapters, so LoRA + full
+        #      fine-tuning).
+        #   2. after the loop: re-glue the always-on small weights so training continues as before.
+        # Guarded by hasattr so a non-ZeRO-3 / different DeepSpeed version just skips them.
+        opt = getattr(model_engine, 'optimizer', None)
+        has_prologue = opt is not None and hasattr(opt, 'checkpoint_event_prologue')
+        has_epilogue = opt is not None and hasattr(opt, 'checkpoint_event_epilogue')
+
+        if has_prologue:
+             # step 1: clean up + split all weights apart
+            opt.checkpoint_event_prologue()
+
+        try:
+            # Gather one weight at a time to avoid OOM: glue it on rank 0, copy to CPU, then it
+            # is split apart again before the next one is gathered (peak = one full weight).
+            for name, param in zip(names, params):
+                with deepspeed.zero.GatheredParameters([param], modifier_rank=0):
+                    if rank == 0:
+                        state_dict[name] = param.data.cpu().clone()
+        finally:
+            if has_epilogue:
+                # step 2: re-glue the always-on small weights
+                opt.checkpoint_event_epilogue()
     else:
         if rank == 0:
             for name, param in zip(names, params):
@@ -268,7 +294,7 @@ def save_training_checkpoint(epoch, global_step, model_engine, tokenizer, model_
                          are complete for inference/resume. None for llm runs.
     '''
     # 1. Save HF-compatible weights (all ranks must participate for ZeRO-3 gather)
-    raw_sd = gather_params_for_save(model_engine.module, rank)
+    raw_sd = gather_params_for_save(model_engine, rank)
     save_ok = True
     try:
         if rank == 0:

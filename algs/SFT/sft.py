@@ -69,6 +69,8 @@ class SFT:
         '''
             batch['input_ids/attn_mask'] are [B, T]
             batch['position_ids'] is [B, T] or None
+            For multimodal batches, batch also carries the processor's image tensors
+            (e.g. pixel_values, image_grid_thw); they are passed straight through to the model.
             Returns:
                 logits is [B, T-1, vocab_size]
                 y is [B, T-1]
@@ -80,16 +82,33 @@ class SFT:
         # loss_mask is [B, T - 1]
         loss_mask = batch['loss_mask']
 
-        # if pos_ids is not provided, hf will add it automatically.
+        # if pos_ids is not provided, hf will add it automatically. For vlm models this must
+        # stay None so the model computes its own multimodal position ids (e.g. Qwen mRoPE).
         pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
             pos_ids = pos_ids.to(att_mask.device)
+
+        # Forward any multimodal tensors the data feed added.
+        # Text-only batches carry none, so this is a no-op for llm.
+        reserved_keys = ('input_ids', 'attn_mask', 'loss_mask', 'position_ids')
+        mm_kwargs = {k: v for k, v in batch.items() if k not in reserved_keys}
+
+        # Processor image tensors (e.g. pixel_values) come in float32; cast floating mm tensors
+        # to the model's compute dtype (e.g. bf16) so the vision tower doesn't hit a dtype
+        # mismatch. Integer tensors (image_grid_thw, token_type_ids) are left unchanged. We use
+        # the input-embedding dtype, which stays the base compute dtype even under PEFT/LoRA
+        # (where adapter params may be float32).
+        if mm_kwargs:
+            compute_dtype = self.model_engine.module.get_input_embeddings().weight.dtype
+            mm_kwargs = {k: (v.to(compute_dtype) if torch.is_floating_point(v) else v)
+                         for k, v in mm_kwargs.items()}
 
         # feed data to model
         output = self.model_engine(input_ids=input_ids,
                                    attention_mask=att_mask,
                                    position_ids=pos_ids,
-                                   use_cache=False)
+                                   use_cache=False,
+                                   **mm_kwargs)
 
         # [B, T, vocab_size]
         every_token_logits = output.logits

@@ -277,6 +277,10 @@ class Rollout(BaseModel):
     max_model_len: int | None = None
     # Online quantization for the rollout engine. Only the sync engine supports this and only "fp8".
     quantization: str | None = None
+    # vlm only: max images per prompt, forwarded to vLLM's limit_mm_per_prompt={"image": N}.
+    # Must be >= the largest image count any sample carries, or vLLM rejects the prompt.
+    # None means default to 1. Ignored for llm.
+    max_images_per_prompt: int | None = None
 
 class Config(BaseModel):
     '''
@@ -778,12 +782,9 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if not config.reward or not config.reward.reward_func:
                 raise ValueError("reward.reward_func must be specified for RL training")
 
-            # TP must evenly divide rollout GPUs
-            tp = config.rollout.tensor_parallel_size
-            rg = config.run.rollout_gpus
-            if tp and rg and rg % tp != 0:
-                raise ValueError(f"rollout_gpus ({rg}) must be divisible by tensor_parallel_size ({tp}). "
-                                 f"Currently {rg} % {tp} = {rg % tp}.")
+            # Note: tp must evenly divide rollout_gpus and tp <= rollout_gpus are
+            # validated in the shared "Validate rollout engine resources" block below
+            # (these constraints apply to both rl and eval).
 
             # Ray port
             if config.run.ray_master_port is None:
@@ -818,6 +819,14 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
                     raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")
 
+        elif method == "eval":
+            if not config.run.checkpoint_dir or config.run.checkpoint_dir.strip() == "":
+                raise ValueError("run.checkpoint_dir must be specified for eval "
+                                 "(used to save rollout_stats.json and experiment_config.yaml)")
+
+            if config.run.rollout_gpus is None or config.run.rollout_gpus < 1:
+                raise ValueError(f"run.rollout_gpus must be >= 1 for eval, got {config.run.rollout_gpus}")
+
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:
             try:
@@ -847,13 +856,19 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             # Sync AFTER updating world_size
             config.sync_deepspeed_config(world_size)
 
-        # Validate rollout engine resources
-        if method == "rl" and config.rollout:
+        # Validate rollout engine resources. Both rl and eval launch the same
+        # vLLM rollout engines (num_engines = max(1, rollout_gpus // tp)), so the
+        # tp/rollout_gpus constraints are shared.
+        if method in ("rl", "eval") and config.rollout:
             tp = config.rollout.tensor_parallel_size
             rg = config.run.rollout_gpus
             if tp and rg and tp > rg:
                 raise ValueError(f"tensor_parallel_size ({tp}) cannot be greater than rollout_gpus ({rg}). "
                                 f"Please increase rollout_gpus or decrease tensor_parallel_size.")
+
+            if tp and rg and rg % tp != 0:
+                raise ValueError(f"rollout_gpus ({rg}) must be divisible by tensor_parallel_size ({tp}). "
+                                 f"Currently {rg} % {tp} = {rg % tp}.")
 
         if rank == 0:
             print( "\n" + 20*"=" + "Config" + 20*"=")

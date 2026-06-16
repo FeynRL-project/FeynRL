@@ -168,6 +168,9 @@ data:
   answer_key: "answer"
   # Ground truth for reward calculation.
   solution_key: null
+  # vlm only (ignored when model.model_class is "llm")
+  image_key: null
+  max_image_pixels: null
 
 deepspeed:
   zero_optimization:

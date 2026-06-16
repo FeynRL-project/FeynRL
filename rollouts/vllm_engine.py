@@ -40,6 +40,7 @@ class VLLMRolloutEngine(Base):
                  batch_invariant: bool = False,
                  quantization: Optional[str] = None,
                  model_class: str = "llm",
+                 max_images_per_prompt: int | None = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -85,6 +86,8 @@ class VLLMRolloutEngine(Base):
         self.model_path = model_path
         self.model_dtype = model_dtype
         self.model_class = model_class
+        # vlm only: cap on images per prompt for vLLM's limit_mm_per_prompt. Default 1.
+        self.max_images_per_prompt = int(max_images_per_prompt) if max_images_per_prompt is not None else 1
         self.loaded_version = -1
         self.trust_remote_code = trust_remote_code
         # Online quantization for vllm and only "fp8" is supported.
@@ -191,9 +194,9 @@ class VLLMRolloutEngine(Base):
 
         if self.model_class == "vlm":
             # vLLM auto-detects the VLM architecture; cap images per prompt so the scheduler
-            # sizes multimodal buffers. The eval data feed sends one image per prompt -- raise
-            # this for multi-image datasets. Images arrive via each prompt's "multi_modal_data".
-            llm_kwargs["limit_mm_per_prompt"] = {"image": 1}
+            # sizes multimodal buffers. Driven by rollout.max_images_per_prompt (default 1) so
+            # multi-image datasets work. Images arrive via each prompt's "multi_modal_data".
+            llm_kwargs["limit_mm_per_prompt"] = {"image": self.max_images_per_prompt}
 
         self.vllm_engine = LLM(**llm_kwargs)
         self.log(f"Successfully loaded vllm model from {self.model_path}")

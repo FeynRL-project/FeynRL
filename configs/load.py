@@ -782,10 +782,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if not config.reward or not config.reward.reward_func:
                 raise ValueError("reward.reward_func must be specified for RL training")
 
-            # Note: tp must evenly divide rollout_gpus and tp <= rollout_gpus are
-            # validated in the shared "Validate rollout engine resources" block below
-            # (these constraints apply to both rl and eval).
-
             # Ray port
             if config.run.ray_master_port is None:
                 raise ValueError("run.ray_master_port must be specified for RL training")

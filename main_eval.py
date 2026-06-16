@@ -130,6 +130,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "model_dtype":params.model.dtype,
               "max_seq_len":params.data.max_seq_len,
               "max_model_len":params.rollout.max_model_len,
+              "max_images_per_prompt":params.rollout.max_images_per_prompt,
 
               # reward related arguments
               "reward_func":reward_fnc,
@@ -385,7 +386,7 @@ if __name__ == "__main__":
     ########
     logger.info(f"Loading tokenizer/processor from {config.model.name} (model_class={config.model.model_class})")
     # processor is None for llm; for vlm it builds the image-expanded prompts in ImagePromptsFeed.
-    tokenizer, processor = load_tokenizer_or_processor(model_name=config.model.name,
+    tokenizer, processor = load_tokenizer_or_processor(model_path=config.model.name,
                                                        model_class=config.model.model_class,
                                                        trust_remote_code=config.model.trust_remote_code)
     ensure_pad_token(tokenizer)

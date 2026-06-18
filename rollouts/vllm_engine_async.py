@@ -602,12 +602,16 @@ class VLLMRolloutEngineAsync(Base):
         self._request_counter += len(prompts)
 
         async def generate_one(request_id, prompt_data):
-            # vllm v1 (AsyncLLM) takes the prompt as a dict. For VLM the feed sends a text
-            # "prompt" + "multi_modal_data" (vLLM expands the image placeholder once); for
-            # text-only it sends pre-tokenized "prompt_token_ids".
-            if "multi_modal_data" in prompt_data:
-                vllm_prompt = {"prompt": prompt_data["prompt"],
-                               "multi_modal_data": prompt_data["multi_modal_data"]}
+            # vllm v1 (AsyncLLM) takes the prompt as a dict. The VLM feed (ImagePromptsFeed)
+            # sends a text "prompt" (vLLM expands the image placeholder once), plus
+            # "multi_modal_data" ONLY when the row actually has an image -- a VLM row with no
+            # image still has "prompt" but no "multi_modal_data". The text-only feed
+            # (PromptsFeed) sends pre-tokenized "prompt_token_ids" (no "prompt" key). So branch
+            # on "prompt" first, and attach images only if present.
+            if "prompt" in prompt_data:
+                vllm_prompt = {"prompt": prompt_data["prompt"]}
+                if "multi_modal_data" in prompt_data:
+                    vllm_prompt["multi_modal_data"] = prompt_data["multi_modal_data"]
             else:
                 vllm_prompt = {"prompt_token_ids": prompt_data["prompt_token_ids"]}
             final_output = None

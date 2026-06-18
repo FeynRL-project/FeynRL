@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from typing import NamedTuple
 from peft import PeftModel, get_peft_model, LoraConfig
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoConfig
 from safetensors.torch import load_file
 
 class ValueOutput(NamedTuple):
@@ -46,8 +46,10 @@ class ValueNetwork(nn.Module):
                 "Expected .model or .transformer attribute."
             )
 
-        # Add a value head with hidden_dim equals to 1.
-        self.value_head = nn.Linear(base_model.config.hidden_size, 1, bias=False)
+        # Add a value head with hidden_dim equals to 1. hidden_size is at the config
+        # top level for most models, but under text_config for some VLMs (e.g. Gemma-3).
+        hidden_size = getattr(base_model.config, 'hidden_size', None) or base_model.config.text_config.hidden_size
+        self.value_head = nn.Linear(hidden_size, 1, bias=False)
         # Initialize near-zero so initial values don't dominate early training
         nn.init.zeros_(self.value_head.weight)
 
@@ -56,9 +58,12 @@ class ValueNetwork(nn.Module):
         if first_param is not None:
             self.value_head.to(device=first_param.device, dtype=first_param.dtype)
 
-    def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+    def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False, **mm_kwargs):
         '''
             input_ids, attention_mask, position_ids: [B, T]
+            mm_kwargs: VLM vision tensors (pixel_values, image_grid_thw, ...) or empty for llm.
+                       For a VLM the backbone (e.g. Qwen2VLModel) consumes them and splices
+                       image features at the image-token positions; no-op for text-only.
             return: ValueOutput(logits=[B, T, 1])
         '''
         # [B, T, hidden_dim]
@@ -66,6 +71,7 @@ class ValueNetwork(nn.Module):
                                 attention_mask=attention_mask,
                                 position_ids=position_ids,
                                 use_cache=use_cache,
+                                **mm_kwargs,
                                 )
         # [B, T, hidden_dim]
         hidden_states = outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs[0]
@@ -106,7 +112,8 @@ class ValueNetwork(nn.Module):
                              checkpoint_dir:str ,
                              base_model_path:str,
                              dtype:torch.dtype,
-                             trust_remote_code:bool):
+                             trust_remote_code:bool,
+                             model_class:str="llm"):
         '''
             Load a ValueNetwork from a saved checkpoint directory. It supports both 
             non-PEFT and PEFT models (using peft_config.json in checkpoint dir.)
@@ -119,9 +126,10 @@ class ValueNetwork(nn.Module):
             Returns:
                 ValueNetwork with loaded weights
         '''
-        # 1. Build the base CausalLM architecture (random weights, no download)
+        # 1. Build the base architecture (random weights, no download). vlm -> image-text model.
         config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=trust_remote_code)
-        base_model = AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code)
+        base_cls = AutoModelForImageTextToText if model_class == "vlm" else AutoModelForCausalLM
+        base_model = base_cls.from_config(config, trust_remote_code=trust_remote_code)
         base_model = base_model.to(dtype=dtype)
 
         # 2. Apply PEFT/LoRA if the checkpoint was saved with it.

@@ -13,6 +13,7 @@ from ray.util.queue import Queue as RayQueue, Empty as RayQueueEmpty, Full as Ra
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
 from misc.setup_rl import load_tokenizer, save_checkpoint, load_checkpoint_for_resume, setup_ray
+from misc.model_loading import load_tokenizer_or_processor, ensure_pad_token
 from misc.nccl_utils import is_nccl_fatal_error
 import misc.rollout_stats as rollout_stats
 
@@ -1023,6 +1024,17 @@ def main(args, config):
                                rank=rank)
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
 
+    # For VLM rollouts we also need the multimodal processor (used by ImagePromptsFeed to
+    # build text prompts + raw images, and by the replay buffer to make pixel_values).
+    # Text-only runs leave processor=None.
+    processor = None
+    if config.model.model_class == "vlm":
+        _, processor = load_tokenizer_or_processor(model_path=config.model.name,
+                                                    model_class="vlm",
+                                                    trust_remote_code=config.model.trust_remote_code)
+        ensure_pad_token(processor.tokenizer)
+        logger.info("Loaded VLM processor for rollout image prompts")
+
     ########
     # 5. Initialize rollout engines
     ########
@@ -1065,7 +1077,8 @@ def main(args, config):
     rollout_dataloader = create_rollout_dataloader(params=config,
                                                   tokenizer=tokenizer,
                                                   num_rollout_engines=num_rollout_engines,
-                                                  samples_per_epoch=config.rollout.rollout_samples_per_epoch)
+                                                  samples_per_epoch=config.rollout.rollout_samples_per_epoch,
+                                                  processor=processor)
 
     logger.info(f"Rollout dataloader with {len(rollout_dataloader)} batches/machine, "
                 f"n_samples={config.rollout.n_samples} per prompt")
@@ -1105,6 +1118,7 @@ def main(args, config):
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
                                  max_size=replay_buffer_size,
+                                 processor=processor,
                                  )
     logger.info(f"Pipeline capacities: replay_buffer={replay_buffer_size}, "
                 f"results_queue={results_queue_maxsize}, prompt_queue={prompt_queue_maxsize}, "
@@ -1328,7 +1342,8 @@ def main(args, config):
                                          experiment_id=config.run.experiment_id,
                                          rank=rank,
                                          logger=logger,
-                                         save_timeout=save_timeout)
+                                         save_timeout=save_timeout,
+                                         processor=processor)
             logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
 
         # NCCL sync metrics

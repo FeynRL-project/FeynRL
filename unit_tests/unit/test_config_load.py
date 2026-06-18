@@ -178,3 +178,109 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         yaml.dump(config_dict, f)
     config = load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)
     assert config.run.checkpoint_save_interval == 5
+
+
+# ---------------------------------------------------------------------------
+# VLM config + eval-branch validation
+# ---------------------------------------------------------------------------
+
+def _vlm_rl_config(tmp_path):
+    '''A minimal valid sync-GRPO VLM RL config dict.'''
+    return {
+        "run": {
+            "experiment_id": "t", "seed": 42, "project_name": "p", "tracking_uri": "",
+            "checkpoint_dir": str(tmp_path), "training_gpus": 1, "rollout_gpus": 1,
+            "ray_master_port": 29500, "weight_sync_method": "direct", "checkpoint_save_interval": 1,
+            "init_timeout": 60, "rollout_timeout": 60, "train_step_timeout": 60,
+            "save_timeout": 60, "sync_timeout": 60,
+        },
+        "train": {
+            "optimizer_name": "adamw", "alg_name": "grpo", "lr": 1e-6, "adam_epsilon": 1e-8,
+            "betas": [0.9, 0.95], "weight_decay": 0.01, "warmup_steps_ratio": 0.1,
+            "clip_grad_norm": 1.0, "lr_scheduler": "WarmupCosineLR", "total_number_of_epochs": 1,
+            "train_steps_per_epoch": 1, "train_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1, "val_batch_size_per_gpu": 2,
+            "dynamic_ratio_every_step": False, "normalize_loss": True,
+            "update_after_full_replay": True, "kl_coeff": 0.0,
+            "clip_low": 0.2, "clip_high": 0.2, "entropy_coeff": 0.0,
+        },
+        "reward": {"broadcast": False, "reward_func": "dummy_reward_func"},
+        "rollout": {
+            "temperature": 1.0, "max_tokens": 128, "n_samples": 4, "top_p": 1.0, "top_k": -1,
+            "ignore_eos": False, "gpu_memory_utilization": 0.5, "force_strict_on_policy": True,
+            "tensor_parallel_size": 1, "rollout_batch_size_per_gpu": 2,
+            "rollout_samples_per_epoch": 4, "max_images_per_prompt": 1,
+        },
+        "model": {
+            "name": "Qwen/Qwen2-VL-2B-Instruct", "dtype": "bfloat16", "trust_remote_code": False,
+            "model_class": "vlm", "attn_implementation": "eager",
+        },
+        "data": {
+            "train_files_path": ["t.parquet"], "num_workers": 0, "max_seq_len": 1024,
+            "prompt_key": "prompt", "answer_key": "answer", "solution_key": "solution",
+            "image_key": "image_bytes", "max_image_pixels": 65536,
+        },
+        "deepspeed": {"zero_optimization": {"stage": 3}},
+    }
+
+def _write(tmp_path, cfg, name="c.yaml"):
+    p = tmp_path / name
+    with open(p, "w") as f:
+        yaml.dump(cfg, f)
+    return str(p)
+
+def test_config_rl_vlm_validates(tmp_path):
+    '''A VLM RL config (model_class=vlm + image_key + max_images_per_prompt) loads.'''
+    cfg = _vlm_rl_config(tmp_path)
+    config = load_and_verify(method="rl", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)
+    assert config.model.model_class == "vlm"
+    assert config.data.image_key == "image_bytes"
+    assert config.rollout.max_images_per_prompt == 1
+
+def test_config_max_images_per_prompt_defaults_none():
+    '''New rollout field is optional and defaults to None (engine -> 1).'''
+    r = Rollout(rollout_samples_per_epoch=100, n_samples=1)
+    assert r.max_images_per_prompt is None
+
+def test_config_rl_tp_exceeds_rollout_gpus_raises(tmp_path):
+    '''Shared engine-resource check: tp > rollout_gpus is rejected (rl).'''
+    cfg = _vlm_rl_config(tmp_path)
+    cfg["rollout"]["tensor_parallel_size"] = 2
+    cfg["run"]["rollout_gpus"] = 1
+    with pytest.raises(ValueError, match="cannot be greater than rollout_gpus"):
+        load_and_verify(method="rl", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)
+
+def _eval_config(tmp_path):
+    '''A minimal valid eval config (LLM); eval needs run/reward/rollout/model/data only.'''
+    return {
+        "run": {"experiment_id": "t", "seed": 42, "project_name": "p", "tracking_uri": "",
+                "checkpoint_dir": str(tmp_path), "rollout_gpus": 2},
+        "reward": {"broadcast": False, "reward_func": "dummy_reward_func"},
+        "rollout": {"temperature": 1.0, "max_tokens": 128, "n_samples": 4, "top_p": 1.0,
+                    "top_k": -1, "ignore_eos": False, "gpu_memory_utilization": 0.5,
+                    "force_strict_on_policy": False, "tensor_parallel_size": 1,
+                    "rollout_batch_size_per_gpu": 2},
+        "model": {"name": "m", "dtype": "bfloat16", "trust_remote_code": False, "model_class": "llm"},
+        "data": {"test_files_path": "t.parquet", "num_workers": 0, "max_seq_len": 512,
+                 "prompt_key": "prompt", "answer_key": "answer", "solution_key": "solution"},
+    }
+
+def test_config_eval_validates(tmp_path):
+    cfg = _eval_config(tmp_path)
+    config = load_and_verify(method="eval", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)
+    assert config.run.method == "eval"
+    assert config.run.rollout_gpus == 2
+
+def test_config_eval_requires_checkpoint_dir(tmp_path):
+    cfg = _eval_config(tmp_path)
+    cfg["run"]["checkpoint_dir"] = ""
+    with pytest.raises(ValueError, match="checkpoint_dir must be specified for eval"):
+        load_and_verify(method="eval", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)
+
+def test_config_eval_tp_divisibility(tmp_path):
+    '''Eval shares the rl tp/rollout_gpus checks (tp must divide rollout_gpus).'''
+    cfg = _eval_config(tmp_path)
+    cfg["rollout"]["tensor_parallel_size"] = 3
+    cfg["run"]["rollout_gpus"] = 4
+    with pytest.raises(ValueError, match="must be divisible by tensor_parallel_size"):
+        load_and_verify(method="eval", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)

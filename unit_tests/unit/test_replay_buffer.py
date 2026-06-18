@@ -181,3 +181,80 @@ def test_replay_buffer_unbounded_reset_stays_list():
     rb.reset()
     assert isinstance(rb.items, list)
     assert len(rb) == 0
+
+
+# ---------------------------------------------------------------------------
+# VLM: processor reprocesses stored raw images into the vision bag at collate
+# ---------------------------------------------------------------------------
+
+class _MockImageProcessor:
+    '''Mimics a Qwen2-VL image_processor: per image -> 256 patches x 1176, grid [1,16,16].'''
+    def __call__(self, images, return_tensors="pt"):
+        n = len(images)
+        return {"pixel_values": torch.zeros(256 * n, 1176, dtype=torch.float32),
+                "image_grid_thw": torch.tensor([[1, 16, 16]] * n, dtype=torch.long)}
+
+class _MockProcessor:
+    def __init__(self):
+        self.image_processor = _MockImageProcessor()
+
+def _collate_item(input_ids, images=None):
+    n = len(input_ids)
+    item = {
+        "input_ids": torch.tensor(input_ids),
+        "attn_masks": torch.ones(n, dtype=torch.long),
+        "old_logps": torch.zeros(n),
+        "masks": torch.ones(n, dtype=torch.long),
+        "rewards": torch.zeros(n),
+        "dones": torch.zeros(n, dtype=torch.long),
+        "zscores": torch.zeros(n),
+    }
+    if images is not None:
+        item["images"] = images
+    return item
+
+def test_replay_buffer_collate_vlm_bags_images():
+    '''With a processor set, collate reprocesses each item's raw image(s) and
+    concatenates the vision bag along dim 0 (one image per item -> 256 patches each).'''
+    rb = ReplayBuffer(pad_token_id=0, max_seq_len=10, processor=_MockProcessor())
+    img = object()  # stand-in PIL; the mock image_processor ignores content
+    batch = [_collate_item([1, 2, 3], images={"image": [img]}),
+             _collate_item([4, 5, 6], images={"image": [img]})]
+    out = rb.collate_fn(batch)
+    # text tensors still stacked
+    assert out["input_ids"].shape == (2, 3)
+    # vision bag: 256 patches/image * 2 images = 512 rows; one grid row per image
+    assert out["pixel_values"].shape == (512, 1176)
+    assert out["pixel_values"].dtype == torch.float32  # trainer casts later, not here
+    assert out["image_grid_thw"].shape == (2, 3)
+
+def test_replay_buffer_collate_vlm_mixed_some_no_image():
+    '''A batch where only some items have images: only those contribute to the bag.'''
+    rb = ReplayBuffer(pad_token_id=0, max_seq_len=10, processor=_MockProcessor())
+    img = object()
+    batch = [_collate_item([1, 2, 3], images={"image": [img]}),
+             _collate_item([4, 5, 6], images=None)]  # text-only row
+    out = rb.collate_fn(batch)
+    assert out["pixel_values"].shape == (256, 1176)  # only the 1 image item
+    assert out["image_grid_thw"].shape == (1, 3)
+
+def test_replay_buffer_collate_llm_no_vision_keys():
+    '''No processor (LLM) -> collate produces no vision keys, behaves as before.'''
+    rb = ReplayBuffer(pad_token_id=0, max_seq_len=10)  # processor=None
+    batch = [_collate_item([1, 2, 3]), _collate_item([4, 5])]
+    out = rb.collate_fn(batch)
+    assert "pixel_values" not in out
+    assert "image_grid_thw" not in out
+    assert out["input_ids"].shape == (2, 3)
+
+def test_replay_buffer_add_batch_seqs_stores_images():
+    '''add_batch_seqs threads multi_modal_data into the stored item as "images".'''
+    rb = ReplayBuffer(pad_token_id=0, max_seq_len=10, processor=_MockProcessor())
+    mm = {"image": [object()]}
+    sample = _mk_sample(version=0)
+    sample["multi_modal_data"] = mm
+    rb.add_batch_seqs([sample])
+    assert rb[0]["images"] is mm
+    # an llm sample (no multi_modal_data) stores images=None
+    rb.add_batch_seqs([_mk_sample(version=1)])
+    assert rb[1]["images"] is None

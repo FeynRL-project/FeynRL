@@ -37,6 +37,8 @@ import transformers
 transformers.generation.GenerationMixin = MagicMock()
 transformers.AutoConfig = MagicMock()
 transformers.AutoModelForCausalLM = MagicMock()
+# VLM model class (imported by algs/RL/common.py and algs/PPO/value_net.py).
+transformers.AutoModelForImageTextToText = MagicMock()
 
 # Ensure PeftModel is a class for isinstance checks
 import peft

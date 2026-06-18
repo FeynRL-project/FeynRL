@@ -245,10 +245,16 @@ def create_prompt_dataset_and_sampler(data_paths,
                                       dynamic_ratio_every_step,
                                       steps_per_epoch,
                                       shuffle_within_batch=True,
+                                      dataset_kwargs=None,
                                       ):
     '''
         Creates a concat dataset and MixedDatasetSampler for rollout generation.
+        dataset_kwargs: extra constructor kwargs for dataset_cls (e.g. the VLM feed's
+                        processor/image_key/max_image_pixels). A VLM feed takes a
+                        `processor` instead of a `tokenizer`, so when dataset_kwargs
+                        carries "processor" we do NOT also pass tokenizer.
     '''
+    dataset_kwargs = dataset_kwargs or {}
     all_datasets = []
     dname_list = []
     len_datasets = {}
@@ -258,11 +264,14 @@ def create_prompt_dataset_and_sampler(data_paths,
         dname = d_path.split("/")[-1].split(".")[0]
         dname_list.append(dname)
         # load each dataset
-        dataset = dataset_cls(prompt_key=prompt_key,
-                              solution_key=solution_key,
-                              max_seq_len=max_seq_len,
-                              tokenizer=tokenizer,
-                              data_path=d_path)
+        base_kwargs = dict(prompt_key=prompt_key,
+                           solution_key=solution_key,
+                           max_seq_len=max_seq_len,
+                           data_path=d_path)
+        # text feeds take a tokenizer; VLM feeds derive it from the processor instead.
+        if "processor" not in dataset_kwargs:
+            base_kwargs["tokenizer"] = tokenizer
+        dataset = dataset_cls(**base_kwargs, **dataset_kwargs)
 
         all_datasets.append(dataset)
         len_datasets[dname] = len(dataset)

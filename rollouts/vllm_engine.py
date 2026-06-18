@@ -374,6 +374,11 @@ class VLLMRolloutEngine(Base):
                     if prompt_len == 0:
                         raise ValueError(f"No prompt token ids found in generated output: {data}")
 
+                    # For VLM, carry the prompt's raw image(s) onto each sample so the
+                    # training engine can reprocess them to pixel_values and recompute
+                    # logprobs over the image tokens. None for text-only.
+                    prompt_mm = prompt_data.get("multi_modal_data") if isinstance(prompt_data, dict) else None
+
                     # process generated responses
                     for response in data.outputs:
                         response_ids = list(response.token_ids)
@@ -479,6 +484,9 @@ class VLLMRolloutEngine(Base):
                                                 "response_len": response_len,
                                                 "truncated": 1 if finish_reason == "length" else 0,
                                                 "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                                # raw image(s) for VLM; None for text-only. Used by the
+                                                # training engine to recompute logprobs with pixel_values.
+                                                "multi_modal_data": prompt_mm,
                                                     })
                     self.normalize_rewards(samples=group_samples,
                                            stats=group_stats,

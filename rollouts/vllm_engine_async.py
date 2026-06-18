@@ -42,6 +42,8 @@ class VLLMRolloutEngineAsync(Base):
                  max_model_len: int | None = None,
                  engine_id: int = 0,
                  batch_invariant: bool = False,
+                 model_class: str = "llm",
+                 max_images_per_prompt: int | None = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -86,6 +88,9 @@ class VLLMRolloutEngineAsync(Base):
         # vllm engine config
         self.model_path = model_path
         self.model_dtype = model_dtype
+        self.model_class = model_class
+        # vlm only: cap on images per prompt for vLLM's limit_mm_per_prompt. Default 1.
+        self.max_images_per_prompt = int(max_images_per_prompt) if max_images_per_prompt is not None else 1
         self.loaded_version = -1
         self.trust_remote_code = trust_remote_code
 
@@ -175,6 +180,11 @@ class VLLMRolloutEngineAsync(Base):
 
         if self.batch_invariant:
             engine_kwargs["attention_backend"] = "FLASH_ATTN"
+
+        if self.model_class == "vlm":
+            # vLLM expands the image placeholder from multi_modal_data; cap images/prompt so
+            # the scheduler sizes multimodal buffers. Driven by rollout.max_images_per_prompt.
+            engine_kwargs["limit_mm_per_prompt"] = {"image": self.max_images_per_prompt}
 
         # Create engine inside the running event loop. vllm's AsyncLLM.__init__
         # checks asyncio.get_running_loop() and skips its output handler setup
@@ -345,6 +355,10 @@ class VLLMRolloutEngineAsync(Base):
             if prompt_len == 0:
                 raise ValueError(f"No prompt token ids found in generated output: {data}")
 
+            # For VLM, carry the prompt's raw image(s) onto each sample so the training
+            # engine can reprocess them to pixel_values. None for text-only.
+            prompt_mm = prompt_data.get("multi_modal_data") if isinstance(prompt_data, dict) else None
+
             # process generated responses
             for response in data.outputs:
                 response_ids = list(response.token_ids)
@@ -451,6 +465,8 @@ class VLLMRolloutEngineAsync(Base):
                                         "response_len": response_len,
                                         "truncated": 1 if finish_reason == "length" else 0,
                                         "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                        # raw image(s) for VLM; None for text-only.
+                                        "multi_modal_data": prompt_mm,
                                             })
 
             self.normalize_rewards(samples=group_samples, stats=group_stats, prompt_len=prompt_len, is_per_token=is_per_token)
@@ -586,11 +602,16 @@ class VLLMRolloutEngineAsync(Base):
         self._request_counter += len(prompts)
 
         async def generate_one(request_id, prompt_data):
-            prompt_token_ids = prompt_data['prompt_token_ids']
+            # vllm v1 (AsyncLLM) takes the prompt as a dict. For VLM the feed sends a text
+            # "prompt" + "multi_modal_data" (vLLM expands the image placeholder once); for
+            # text-only it sends pre-tokenized "prompt_token_ids".
+            if "multi_modal_data" in prompt_data:
+                vllm_prompt = {"prompt": prompt_data["prompt"],
+                               "multi_modal_data": prompt_data["multi_modal_data"]}
+            else:
+                vllm_prompt = {"prompt_token_ids": prompt_data["prompt_token_ids"]}
             final_output = None
-            # vllm v1 (AsyncLLM) takes token IDs via the prompt parameter as a dict.
-            # The old prompt_token_ids keyword was removed in the v1 API.
-            async for output in self.async_engine.generate(prompt={"prompt_token_ids": prompt_token_ids},
+            async for output in self.async_engine.generate(prompt=vllm_prompt,
                                                            sampling_params=sampling_params,
                                                            request_id=str(request_id)):
                 final_output = output

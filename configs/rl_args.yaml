@@ -135,6 +135,7 @@ rollout:
   max_model_len: null
   # Sync engine only and only "fp8".
   quantization: null
+  max_images_per_prompt: null
 
 model:
   name: "google/gemma-3-1b-it"

@@ -56,14 +56,34 @@ class ImagePromptsFeed(PromptsFeed):
                     mm_content.extend(content)
                 else:
                     mm_content.append({"type": "text", "text": content})
+
                 new_message.append({**turn, "content": mm_content})
                 placed = num_images
+
             else:
                 new_message.append(turn)
 
         return new_message, placed
 
     def __getitem__(self, idx):
+        '''
+           Each data row is a dict with the following format:
+           {
+                "prompt":   [{"role": "system", "content": "..."},
+                             {"role": "user",   "content": "What is in this image?"}],
+                "images":   <image>,    # the image_key column: a PIL image, raw bytes, a file
+                                        # path, a HF {"bytes":..., "path":...} dict, or a list of
+                                        # any of these (decoded by data_feeds.image_utils.load_images)
+                "solution": "..."       # optional, the reward's ground truth
+           }
+           Returns a vllm TextPrompt dict (expansion deferred to vLLM):
+           {
+                "prompt":           "<chat-template text with one un-expanded image placeholder>",
+                "multi_modal_data": {"image": [<PIL RGB images>]},   # omitted if no image
+                "solution":         "..."                            # only if solution_key is set
+           }
+           system prompt is optional.
+        '''
         sample = self.data[idx]
         if self.prompt_key not in sample:
             raise KeyError(f"Missing key '{self.prompt_key}' in sample {sample}: keys={list(sample.keys())}")
@@ -100,6 +120,8 @@ class ImagePromptsFeed(PromptsFeed):
         out = {"prompt": text}
         if n_used > 0:
             out["multi_modal_data"] = {"image": images[:n_used]}
+
         if self.solution_key:
             out["solution"] = sample[self.solution_key]
+
         return out

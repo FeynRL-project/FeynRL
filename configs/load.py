@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
 import yaml
 import sys
@@ -146,6 +146,10 @@ class Data(BaseModel):
     prompt_key: str
     answer_key: str
     solution_key: str | None = None
+    # vlm only: parquet column holding the image(s) and an optional cap on
+    # image pixels (width*height) to bound the image-token count. Ignored for llm.
+    image_key: str | None = None
+    max_image_pixels: int | None = None
 
 class Model(BaseModel):
     '''
@@ -158,8 +162,11 @@ class Model(BaseModel):
     value_model: str = None  # PPO value model path if alg_name is ppo
     ref_model_offload_to_cpu: bool = False
     trust_remote_code: bool
-    model_class: str = None
-    attn_implementation: str = None
+    # "llm" = text-only causal LM, "vlm" = vision-language model. Other families added later.
+    model_class: Literal["llm", "vlm"] = "llm"
+    # A single value applies to the whole model. For vlm, a dict maps sub-model configs to
+    # different impls, e.g. {"text_config": "flash_attention_2", "vision_config": "eager"}.
+    attn_implementation: Literal["", "eager", "flash_attention_2"] | Dict[str, str] | None = None
     gradient_checkpointing: bool = None
 
 class Peft(BaseModel):
@@ -568,8 +575,17 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                     f"'auto' is not allowed to avoid precision ambiguity."
                 )
 
-            if config.model.attn_implementation is not None and config.model.attn_implementation not in ("", "eager", "flash_attention_2"):
-                raise ValueError(f"model.attn_implementation must be '', 'eager', or 'flash_attention_2', got '{config.model.attn_implementation}'")
+            # A dict attn_implementation only makes sense for vlm (per module), and its
+            # values must still be valid impls. The plain-string case is covered by the Literal.
+            if isinstance(config.model.attn_implementation, dict):
+                if config.model.model_class != "vlm":
+                    raise ValueError("model.attn_implementation as a dict is only valid for model_class='vlm'")
+
+                allowed_attn = {"eager", "flash_attention_2"}
+                bad_attn = {k: v for k, v in config.model.attn_implementation.items() if v not in allowed_attn}
+                if bad_attn:
+                    raise ValueError(f"model.attn_implementation dict values must be one of {sorted(allowed_attn)}, "
+                                     f"got {bad_attn}")
 
             # Training loop checks
             if config.train.total_number_of_epochs < 1:

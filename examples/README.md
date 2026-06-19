@@ -142,7 +142,7 @@ At 8 hours, the sync run is at **0.526** reward and the async run is at **0.584*
 To reproduce the primary training run:
 
 ```bash
-python main_rl.py --config examples/qwen3-4b-thinking-2507/train.yaml
+python main_rl.py --config examples/qwen3-4b-thinking-2507/train_sync.yaml
 ```
 
 To reproduce the dedicated sync and async comparison runs:
@@ -175,7 +175,7 @@ python main_eval.py --config examples/qwen3-4b-thinking-2507/eval.yaml
 
 ### Primary Training Settings
 
-These settings correspond to [`qwen3-4b-thinking-2507/train.yaml`](qwen3-4b-thinking-2507/train.yaml).
+These settings correspond to [`qwen3-4b-thinking-2507/train_sync.yaml`](qwen3-4b-thinking-2507/train_sync.yaml).
 
 | Parameter              | Value                                                                                 |
 | ---------------------- | ------------------------------------------------------------------------------------- |

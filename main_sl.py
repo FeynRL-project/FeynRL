@@ -2,7 +2,6 @@ import os
 import argparse
 import deepspeed
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from torch.utils.data import DataLoader
 import torch.distributed
 from tqdm import tqdm
@@ -13,8 +12,10 @@ from peft import get_peft_model, LoraConfig
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
 from data_feeds.paired import PairedFeed
+from data_feeds.image_paired import ImagePairedFeed
 from data_feeds.mixed_sampler import create_dataset_and_sampler
-from misc.utils import safe_string_to_torch_dtype, get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
+from misc.utils import get_experiment_dir_name, load_algorithm, set_random_seeds, get_determinism_env_vars
+from misc.model_loading import build_hf_model, load_tokenizer_or_processor, ensure_pad_token
 from misc.logging import setup_logging, setup_tracker
 from misc.checkpoint_utils import resume_from_checkpoint, save_training_checkpoint, cleanup_incomplete_checkpoints
 
@@ -81,49 +82,28 @@ def apply_peft_module(model, peft_config, rank=0):
     else:
         raise ValueError(f"Unsupported PEFT type: {peft_config.peft_type}")
 
-def load_models_and_tokenizer(model_name, model_dtype, trust_remote_code, attn_impl, rank):
+def load_models_and_tokenizer(model_name, model_dtype, model_class, trust_remote_code, attn_impl, rank):
     '''
-        Load models and tokenizer.
+        Load the model and tokenizer/processor for the given model_class ("llm" or "vlm").
+        For "llm" the processor is None; for "vlm" it is the AutoProcessor used by the data feed.
     '''
-    assert model_dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-    assert attn_impl is None or attn_impl == '' or attn_impl in ['eager', 'flash_attention_2'], \
-        "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
+    # 1. model bare HF model. PEFT/grad-ckpt/DeepSpeed are applied later in main.
+    model = build_hf_model(model_path=model_name,
+                           model_dtype=model_dtype,
+                           model_class=model_class,
+                           trust_remote_code=trust_remote_code,
+                           attn_impl=attn_impl)
 
-    # convert string to torch dtype if it is not already
-    model_dtype = safe_string_to_torch_dtype(model_dtype)
+    # 2. tokenizer + processor for vlm
+    tokenizer, processor = load_tokenizer_or_processor(model_path=model_name,
+                                                       model_class=model_class,
+                                                       trust_remote_code=trust_remote_code)
 
-    # 1. model and its config initialization
-    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(model_name,
-                                                dtype=model_dtype,
-                                                trust_remote_code=trust_remote_code,
-                                                config=model_config,
-                                                attn_implementation=None if attn_impl == '' else attn_impl)
+    # 3. ensure pad token exists and sync pad_token_id into the model config.
+    # This handles the vlm text_config nesting as vllm and similar read pad_token_id from config.json, not the tokenizer.
+    ensure_pad_token(tokenizer, model, rank=rank)
 
-    # 2. Tokenizer initialization
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=trust_remote_code)
-
-    # if pad token is not present, we use eos token as pad token
-    # log warning if pad token is not present.
-    if tokenizer.pad_token_id is None:
-        if rank == 0:
-            print("Warning: Pad token is not present, using eos token as pad token")
-
-        if getattr(tokenizer, 'eos_token', None) is not None:
-            # prefer explicit token if available
-            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-
-        else:
-            # fallback to eos token id
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # Sync pad_token_id into model config so exported checkpoints are consistent
-    # as vllm and similar read pad_token_id from config.json, not tokenizer
-    if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-
-    return model, tokenizer
+    return model, tokenizer, processor
 
 def create_training_engine(deepspeed_config, model):
     '''
@@ -148,11 +128,12 @@ def create_training_engine(deepspeed_config, model):
                                                         )
     return model_engine, optimizer
 
-def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
+def create_data_loader(params, tokenizer, rank, world_size, batch_size, split, processor=None):
     '''
        Setup DataLoader for distributed training.
        As a reminder, batch_size is the per-gpu-micro-batch size.
        Hence, global batch size = batch_size * world_size * gradient_accumulation_steps.
+       processor is the multimodal AutoProcessor (only used when model_class == "vlm").
     '''
     # 1. Initialize our custom datasets
     data_path = params.data.train_files_path if split == 'train' else params.data.val_files_path
@@ -160,7 +141,17 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
     # steps_per_epoch is only needed for training (MixedDatasetSampler)
     steps_per_epoch = params.train.micro_batches_per_epoch if split == 'train' else None
 
-    dataset, sampler = create_dataset_and_sampler(data_paths=data_path,
+    # Select the text vs multimodal feed and its constructor kwargs.
+    if params.model.model_class == "vlm":
+        dataset_cls = ImagePairedFeed
+        dataset_kwargs = {"processor": processor,
+                          "image_key": params.data.image_key,
+                          "max_image_pixels": params.data.max_image_pixels}
+    else:
+        dataset_cls = PairedFeed
+        dataset_kwargs = {"tokenizer": tokenizer}
+
+    dataset, sampler, collate_fn = create_dataset_and_sampler(data_paths=data_path,
                                                   prompt_key=params.data.prompt_key,
                                                   answer_key=params.data.answer_key,
                                                   max_seq_len=params.data.max_seq_len,
@@ -171,10 +162,11 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                                   world_size=world_size,
                                                   seed=params.run.seed,
                                                   local_batch_size=batch_size,
-                                                  dataset_cls=PairedFeed,
+                                                  dataset_cls=dataset_cls,
                                                   steps_per_epoch=steps_per_epoch,
                                                   shuffle_within_batch=True,
-                                                  dynamic_ratio_every_step=params.train.dynamic_ratio_every_step)
+                                                  dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                  dataset_kwargs=dataset_kwargs)
 
     # 2. Initialize data loader
     def worker_init_fn(worker_id):
@@ -189,6 +181,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                 batch_sampler=sampler,
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
     else:
         # DistributedSampler yields individual indices.
@@ -198,6 +191,7 @@ def create_data_loader(params, tokenizer, rank, world_size, batch_size, split):
                                 num_workers=params.data.num_workers,
                                 pin_memory=True,
                                 drop_last=False,  # ensure all validation samples are used
+                                collate_fn=collate_fn,
                                 worker_init_fn=worker_init_fn)
 
     return dataloader, sampler
@@ -250,11 +244,13 @@ if __name__ == "__main__":
     ########
     # 4. load model or previous checkpoints
     ########
-    model, tokenizer = load_models_and_tokenizer(model_name=config.model.name,
-                                                 model_dtype=config.model.dtype,
-                                                 trust_remote_code=config.model.trust_remote_code,
-                                                 attn_impl=config.model.attn_implementation,
-                                                 rank=rank)
+    # processor is None for llm; for vlm it is passed to the data feed (wired in a later step).
+    model, tokenizer, processor = load_models_and_tokenizer(model_name=config.model.name,
+                                                            model_dtype=config.model.dtype,
+                                                            model_class=config.model.model_class,
+                                                            trust_remote_code=config.model.trust_remote_code,
+                                                            attn_impl=config.model.attn_implementation,
+                                                            rank=rank)
     # apply PEFT module if enabled
     if config.peft.use_peft:
         model = apply_peft_module(model=model, peft_config=config.peft, rank=rank)
@@ -298,14 +294,16 @@ if __name__ == "__main__":
                                                         batch_size=config.train.train_batch_size_per_gpu,
                                                         split='train',
                                                         world_size=world_size,
-                                                        rank=rank)
+                                                        rank=rank,
+                                                        processor=processor)
 
     val_dataloader, _ = create_data_loader(params=config,
                                           tokenizer=tokenizer,
                                           batch_size=config.train.val_batch_size_per_gpu,
                                           split='val',
                                           world_size=world_size,
-                                          rank=rank)
+                                          rank=rank,
+                                          processor=processor)
 
     # With ZeRO-3, model parameters are partitioned across GPUs and only gathered temporarily
     # into gpu memory during a forward/backward pass. Peak memory scales with batch size.
@@ -553,7 +551,8 @@ if __name__ == "__main__":
                                      label="sl",
                                      zero_stage=config.deepspeed.zero_optimization.get("stage", 0),
                                      model_dtype=config.model.dtype,
-                                     save_optimizer_state=config.run.save_optimizer_state)
+                                     save_optimizer_state=config.run.save_optimizer_state,
+                                     processor=processor)
 
     total_training_time = time.time() - training_start_time
     logger.info(f"Training completed successfully! Total time: {total_training_time:.2f}s ({total_training_time/3600:.2f}h)")

@@ -8,7 +8,7 @@ class PairedFeed(Dataset):
         This is a general dataset to handle prompt and answer pairs.
         The data should be in a parquet format and system prompt is optional.
     '''
-    def __init__(self, 
+    def __init__(self,
                 prompt_key,
                 answer_key, 
                 max_seq_len,
@@ -75,6 +75,30 @@ class PairedFeed(Dataset):
 
         return answer_ids, answer_attn_mask
 
+    def _encode_prompt(self, message, add_generation_prompt):
+        '''
+           Tokenize a conversation into prompt token ids.
+           Returns (prompt_ids[1D LongTensor], mm_dict).
+           The text-only base returns an empty mm_dict. Multimodal subclasses override this
+           to encode via a processor and return image tensors in mm_dict.
+        '''
+        # When tokenize=True and return_tensors='pt', it returns shape [1, seq_len]
+        # [0]: [1, seq_len] -> [seq_len]
+        prompt_ids = self.tokenizer.apply_chat_template(conversation=message,
+                                                        add_generation_prompt=add_generation_prompt,
+                                                        tokenize=True,
+                                                        return_tensors='pt'
+                                                        )[0]
+        return prompt_ids, {}
+
+    def _align_mm(self, multimodal_data, prompt_len, seq_len):
+        '''
+           Hook to align per-token multimodal tensors to the full padded sequence length.
+           The text-only base has no such tensors, so this is a no-op; multimodal subclasses
+           override it.
+        '''
+        return multimodal_data
+
     def __getitem__(self, idx):
         '''
           Each example has the following format:
@@ -120,14 +144,9 @@ class PairedFeed(Dataset):
         '''
            Handles a single turn of the conversation.
         '''
-        # 1. Tokenize the prompt
-        # When tokenize=True and return_tensors='pt', it returns shape [1, seq_len]
-        # [0]: [1, seq_len] -> [seq_len]
-        prompt_ids = self.tokenizer.apply_chat_template(conversation=message,
-                                                        add_generation_prompt=True,
-                                                        tokenize=True,
-                                                        return_tensors='pt'
-                                                        )[0]
+        # 1. Tokenize the prompt via the encode hook. text-only base returns no mm
+        # tensors but multimodal subclasses return image tensors in mm.
+        prompt_ids, multimodal_data = self._encode_prompt(message, add_generation_prompt=True)
         prompt_attn_mask = torch.ones_like(prompt_ids)
         prompt_len = len(prompt_ids)
 
@@ -194,11 +213,13 @@ class PairedFeed(Dataset):
                          f"Prompt length: {len(prompt_ids)}, Answer length: {len(answer_ids)}, "
                          f"Total length: {total_seq_len}.")
 
-        return {
-            "input_ids": seq_ids, # T
-            "attn_mask": seq_attn_mask, # T
-            "loss_mask": loss_mask, # T-1
-        }
+        # align per-token multimodal tensors (e.g. token_type_ids) to the full sequence
+        multimodal_data = self._align_mm(multimodal_data, prompt_len, len(seq_ids))
+        return {"input_ids": seq_ids,       # [T]
+                "attn_mask": seq_attn_mask, # [T]
+                "loss_mask": loss_mask,     # [T-1]
+                **multimodal_data,          # multimodal tensors (e.g. pixel_values)
+               }
 
     def _get_multi_turns(self, idx, message, answer):
         '''
@@ -210,15 +231,12 @@ class PairedFeed(Dataset):
         current_len = 0
 
         for i, turn in enumerate(message):
-            # Tokenize conversation up to and including this turn
+            # Tokenize conversation up to and including this turn via the encode.
+            # For multimodal, this includes expanded image tokens, so assistant
+            # boundaries are tracked in the same expanded index space. We only need the
+            # length here, so the mm tensors are discarded. And no generation prompt for intermediate turns
             conversation_so_far = message[:i + 1]
-            # When tokenize=True and return_tensors='pt', it returns shape [1, seq_len]
-            # [0]: [1, seq_len] -> [seq_len]
-            tokens_so_far = self.tokenizer.apply_chat_template(conversation=conversation_so_far,
-                                                               add_generation_prompt=False, # no generation prompt for intermediate turns
-                                                               tokenize=True,
-                                                               return_tensors='pt'
-                                                               )[0]
+            tokens_so_far, _ = self._encode_prompt(conversation_so_far, add_generation_prompt=False)
             new_len = len(tokens_so_far)
 
             if turn.get("role") == "assistant":
@@ -227,12 +245,9 @@ class PairedFeed(Dataset):
 
             current_len = new_len
 
-        # 2. Tokenize the full prompt with generation prompt for the final answer
-        prompt_ids = self.tokenizer.apply_chat_template(conversation=message,
-                                                        add_generation_prompt=True, # add generation prompt for final answer
-                                                        tokenize=True,
-                                                        return_tensors='pt'
-                                                        )[0]
+        # 2. Tokenize the full prompt with generation prompt for the final answer and
+        # add generation prompt for final answer
+        prompt_ids, multimodal_data = self._encode_prompt(message, add_generation_prompt=True)
         prompt_attn_mask = torch.ones_like(prompt_ids)
         prompt_len       = len(prompt_ids)
 
@@ -308,11 +323,13 @@ class PairedFeed(Dataset):
             raise ValueError(f"Sample {idx}:{message}: No training tokens left after masking "
                          f"Total length: {total_seq_len}.")
 
-        return {
-            "input_ids": seq_ids, # T
-            "attn_mask": seq_attn_mask, # T
-            "loss_mask": loss_mask, # T-1
-        }
+        # align per-token multimodal tensors (e.g. token_type_ids) to the full sequence
+        multimodal_data = self._align_mm(multimodal_data, prompt_len, len(seq_ids))
+        return {"input_ids": seq_ids,       # [T]
+                "attn_mask": seq_attn_mask, # [T]
+                "loss_mask": loss_mask,     # [T-1]
+                **multimodal_data,          # multimodal tensors (e.g. pixel_values)
+               }
 
     def __len__(self):
         return self.len_data
@@ -373,7 +390,7 @@ if __name__ == "__main__":
         print(d)
 
     from mixed_sampler import create_dataset_and_sampler
-    dataset, sampler = create_dataset_and_sampler(data_paths=["./promptonly.parquet"],
+    dataset, sampler, _ = create_dataset_and_sampler(data_paths=["./promptonly.parquet"],
                                                   prompt_key="prompt",
                                                   answer_key="answer",
                                                   max_seq_len=200,

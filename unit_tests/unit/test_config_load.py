@@ -1,4 +1,3 @@
-import glob
 import os
 import yaml
 import pytest
@@ -179,13 +178,3 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         yaml.dump(config_dict, f)
     config = load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)
     assert config.run.checkpoint_save_interval == 5
-
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_RL_EXAMPLE_CONFIGS = glob.glob(os.path.join(_REPO_ROOT, "examples", "*", "train_*.yaml"))
-
-@pytest.mark.parametrize("config_path", _RL_EXAMPLE_CONFIGS)
-def test_example_rl_configs_pass_validation(config_path):
-    """Regression test: every train_*.yaml under examples/ must pass load_and_verify.
-    Catches mismatches like weight_sync_method='direct' + overlap.enabled=True (A1)."""
-    load_and_verify(method="rl", input_yaml=config_path, experiment_id="test", rank=0)

@@ -178,3 +178,4 @@ def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
         yaml.dump(config_dict, f)
     config = load_and_verify(method="rl", input_yaml=str(config_file), experiment_id="e", rank=0)
     assert config.run.checkpoint_save_interval == 5
+    

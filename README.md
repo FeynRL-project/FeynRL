@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Algorithm-first post-training framework for large models.
+  Algorithm-first post-training framework for large language models (LLMs) and vision-language models (VLMs).
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
   <em>"What I cannot create, I do not understand."</em> — Richard Feynman
 </p>
 
-**FeynRL** (pronounced "FineRL") is an **algorithm-first** framework for **post-training and fine-tuning** large models. It supports supervised fine-tuning (SFT), preference learning (e.g., DPO), and reinforcement learning (e.g., PPO, GRPO, CISPO, P3O), and is built for researchers and engineers who want to understand, modify, and develop new methods without fighting the infrastructure.
+**FeynRL** (pronounced "FineRL") is an **algorithm-first** framework for **post-training and fine-tuning** large models. It works with both **text-only large language models (LLMs)** and **vision-language models (VLMs)**, and supports supervised fine-tuning (SFT), preference learning (e.g., DPO), and reinforcement learning (e.g., PPO, GRPO, CISPO, P3O) across both. It is built for researchers and engineers who want to understand, modify, and develop new methods without fighting the infrastructure.
 
 The main goal of FeynRL is simple: make new algorithms easy to implement, easy to debug, and still possible to train at scale. The codebase is designed so that **algorithmic logic stays local** and **systems logic stays explicit**, which makes the framework easier to reason about, easier to extend, and more reliable to debug.
 
@@ -31,7 +31,7 @@ FeynRL is a good fit if your goal is not only to run an existing recipe, but to 
 
 - **Clear separation of concerns** — Algorithm code stays algorithmic, and systems code stays systems. That keeps the codebase easier to understand, test, and extend.
 
-- **One framework across post-training** — SFT, DPO, and RL share the same workflow and configuration system, making comparisons easier and reducing duplicated infrastructure.
+- **One framework across post-training** — SFT, DPO, and RL share the same workflow and configuration system for both LLMs and VLMs, making comparisons easier and reducing duplicated infrastructure.
 
 - **Scales beyond toy settings** — Use the same framework for local single-GPU debugging or large multi-node distributed runs.
 
@@ -52,6 +52,7 @@ This is the first public release, so expect rough edges. We are open-sourcing Fe
 For a detailed breakdown of the architecture, see the **[Architecture Overview](docs/ARCHITECTURE.md)**.
 
 - 🧪 **Training paradigms**: RL (PPO, GRPO, CISPO, P3O), preference-based learning (DPO), and supervised fine-tuning (SFT)
+- 🧠🖼️ **LLMs and VLMs**: train text-only language models or vision-language (image+text) models with the same recipes.
 - 🖥️ **Distributed training**: Multi-GPU and multi-node via DeepSpeed (ZeRO Stage 1/2/3)
 - 🎲 **Rollouts / inference**: vLLM-powered rollout engines with tensor parallelism
 - 🛰️ **Orchestration**: Ray for scheduling training and rollout workers across nodes

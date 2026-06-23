@@ -97,11 +97,27 @@ class DPO:
         # [B, 2, T-1] -> [2B, T-1]
         loss_mask = batch['loss_mask'].view(-1, batch['loss_mask'].shape[-1])
 
-        # if pos_ids is not provided, hf will add it automatically.
+        # if pos_ids is not provided, hf will add it automatically. For vlm this stays None
+        # so the model computes its own multimodal position ids.
         pos_ids = batch.get('position_ids', None)
         if pos_ids is not None:
             # [B, 2, T] -> [2B, T]
             pos_ids = pos_ids.view(-1, T).to(att_mask.device)
+
+        # vlm mm tensors (none for llm). Per-token tensors are paired [B, 2, T] -> flatten to
+        # [2B, T]; the image bag (pixel_values/image_grid_thw) is already row-aligned by the feed.
+        reserved_keys = ('input_ids', 'attn_mask', 'loss_mask', 'position_ids')
+        mm_kwargs = {}
+        for k, v in batch.items():
+            if k in reserved_keys:
+                continue
+            if torch.is_tensor(v) and v.dim() >= 3 and v.shape[0] == B and v.shape[1] == 2:
+                v = v.reshape(2 * B, *v.shape[2:])   # [B, 2, ...] -> [2B, ...]
+            mm_kwargs[k] = v
+        if mm_kwargs:
+            compute_dtype = self.model_engine.module.get_input_embeddings().weight.dtype
+            mm_kwargs = {k: (v.to(compute_dtype) if torch.is_floating_point(v) else v)
+                         for k, v in mm_kwargs.items()}
 
         # label would be input_ids shifted by one
         # [2B, T] -> [2B, T-1]
@@ -113,7 +129,8 @@ class DPO:
             ref_output = self.ref_model_engine(input_ids=input_ids,
                                                attention_mask=att_mask,
                                                position_ids=pos_ids,
-                                               use_cache=False)
+                                               use_cache=False,
+                                               **mm_kwargs)
 
             # [2B, T, vocab_size] --> [2B, T-1, vocab_size]
             ref_logits = ref_output.logits[:, :-1, :].contiguous()
@@ -128,7 +145,8 @@ class DPO:
         output = self.model_engine(input_ids=input_ids,
                                    attention_mask=att_mask,
                                    position_ids=pos_ids,
-                                   use_cache=False)
+                                   use_cache=False,
+                                   **mm_kwargs)
 
         # [2B, T, vocab_size] --> [2B, T-1, vocab_size]
         logits     = output.logits[:, :-1, :].contiguous()

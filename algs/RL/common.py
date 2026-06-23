@@ -1,10 +1,11 @@
 import os
+import re
 import json
 import random
 import torch
 import torch.distributed
 import numpy as np
-from transformers import AutoModelForCausalLM, AutoConfig
+from misc.model_loading import build_hf_model
 import deepspeed
 from peft import get_peft_model, LoraConfig
 from safetensors.torch import save_file
@@ -34,10 +35,11 @@ class COMMON:
         This class provides common functions for policy gradient algorithms.
         Only contains methods that are 100% identical across all PG algorithms.
     '''
-    def policy_forward(self, input_ids, att_mask, pos_ids):
+    def policy_forward(self, input_ids, att_mask, pos_ids, mm_kwargs=None):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
+            mm_kwargs: multimodal vision tensors (e.g. pixel_values, image_grid_thw). Empty {} for llm.
             Returns:
                 logits is [B, T-1, vocab_size]
                 entropies is [B, T-1]
@@ -51,7 +53,8 @@ class COMMON:
         output = self.policy_engine(input_ids=input_ids,
                                    attention_mask=att_mask,
                                    position_ids=pos_ids,
-                                   use_cache=False)
+                                   use_cache=False,
+                                   **(mm_kwargs or {}))
 
         # [B, T, V] -> [B, T-1, V]
         logits = output.logits[:, :-1, :].contiguous()
@@ -80,10 +83,11 @@ class COMMON:
 
         return logprobs, entropies, target_ids
 
-    def ref_forward(self, input_ids, att_mask, pos_ids):
+    def ref_forward(self, input_ids, att_mask, pos_ids, mm_kwargs=None):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
+            mm_kwargs: multimodal vision tensors (e.g. pixel_values, image_grid_thw). Empty {} for llm.
             Returns:
                 ref_logprobs is [B, T-1]
         '''
@@ -96,7 +100,8 @@ class COMMON:
             output = self.ref_model_engine(input_ids=input_ids,
                                            attention_mask=att_mask,
                                            position_ids=pos_ids,
-                                           use_cache=False)
+                                           use_cache=False,
+                                           **(mm_kwargs or {}))
 
             # [B, T, V] -> [B, T-1, V]
             logits = output.logits[:, :-1, :].contiguous()
@@ -132,6 +137,62 @@ class COMMON:
         ratio_inv = torch.exp(exponent)
         kl_dist = log_ratio + ratio_inv - 1
         return kl_dist
+
+    def extract_mm_kwargs(self, micro_batch, device):
+        '''
+            Pull the multimodal vision tensors out of a training micro-batch and
+            move/cast them.
+            Args:
+                micro_batch: dict from ReplayBuffer.collate_fn. Always has the TEXT tensors
+                             (input_ids, attn_mask, mask, rewards, done, zscore, old_logprobs:
+                             each [B, T]; plus scalar batch_action_tokens / action_token_weight).
+                             For VLM it ALSO carries the image bag tensors (concatenated across
+                             the batch), e.g. for Qwen2-VL:
+                                 pixel_values   [sum_patches, 1176]  (cpu, float32)
+                                 image_grid_thw [num_images, 3]      (cpu, int64)
+                device:      target cuda device for the forward.
+            Returns:
+                dict[str, Tensor] of ONLY the non-text tensors, with floating
+                tensors (pixel_values) cast to self.model_dtype and int tensors
+                (image_grid_thw) left as int64. {} for text-only (llm) batches -> the forward
+                then behaves exactly as before.
+
+            Example (B=2 prompts, each with one 224x224 image; T=128, model_dtype=bf16):
+                # every per-token tensor is [B, T] here (collate pads them all to the same T);
+                # train_step later slices the pred-aligned ones to [B, T-1] via [:, :-1].
+                micro_batch = {"input_ids": [2,128], "attn_mask": [2,128], "mask": [2,128],
+                               "rewards": [2,128], ..., "batch_action_tokens": 73,
+                               "pixel_values": cpu f32 [512, 1176],   # 256 patches/image * 2 imgs
+                               "image_grid_thw": cpu i64 [2, 3]}      # [[1,16,16],[1,16,16]]
+                # image_grid_thw[i] = (grid_t, grid_h, grid_w) PATCH grid of image i; [2,3] = 2 images.
+                # shapes worked out:
+                # original image [3, 224, 224] -> patch size 14 -> 224/14 = 16 patches per side ->
+                # 16×16 = 256 patches per image. With 2 images -> 512 patches. Each patch is flattened
+                # to 3*2*14*14 = 1176, where 3 = RGB channels, 14×14 = the patch's pixels, and
+                # 2 = temporal_patch_size (the still image is duplicated to 2 frames packed into one
+                # patch. This is done since Qwen2-VL's vision encoder is built for video and it always patches
+                # time in blocks of temporal_patch_size = 2 frames.  A still image has only 1 frame, which isn't divisible by 2,
+                # so it's padded by duplication to 2 frames So pixel_values = [512, 1176].
+                returns ->   {"pixel_values":   cuda bf16 [512, 1176],
+                              "image_grid_thw": cuda i64  [2, 3]}
+                # tokens: 256 patches/image merge 2x2 (merge_size=2) -> 256/4 = 64 image tokens
+                # per sequence, i.e. 64 <|image_pad|> placeholders in each row's input_ids (128
+                # image tokens total over the 2 rows).
+                # sequence length: T = image tokens + text tokens. Here T=128 = 64 image + 64 text
+                # (prompt text + response + special tokens). Bigger images -> more image tokens ->
+                # larger T; max_image_pixels bounds the image-token count to keep T <= max_seq_len.
+        '''
+        reply_data_fields = ('input_ids', 'attn_mask', 'old_logprobs', 'mask', 'rewards', 'done',
+                             'zscore', 'batch_action_tokens', 'action_token_weight')
+        mm_kwargs = {}
+        for k, v in micro_batch.items():
+            if k in reply_data_fields or not torch.is_tensor(v):
+                continue
+            v = v.to(device, non_blocking=True)
+            if torch.is_floating_point(v):
+                v = v.to(self.model_dtype)
+            mm_kwargs[k] = v
+        return mm_kwargs
 
     def sanitize_logprobs(self, logprobs, engine_id, step, num_micro):
         '''
@@ -234,12 +295,17 @@ class COMMON:
             input_ids = micro_batch['input_ids'].to(device, non_blocking=True)
             att_mask  = micro_batch['attn_mask'].to(device, non_blocking=True)
             pos_ids   = micro_batch.get('position_ids', None)
+
+            # Extarct multi modal data such as (pixel_values, image_grid_thw) for vlm. empty for llm
+            mm_kwargs = self.extract_mm_kwargs(micro_batch, device)
             with torch.no_grad():
                 # curr_logprobs is [B, T-1], shift happoens inside policy_forward
                 curr_logprobs, _, _ = self.policy_forward(input_ids=input_ids,
                                                           att_mask=att_mask,
-                                                          pos_ids=pos_ids)
+                                                          pos_ids=pos_ids,
+                                                          mm_kwargs=mm_kwargs)
                 curr_logprobs, prox_nan_mask = self.sanitize_logprobs(logprobs=curr_logprobs, engine_id=engine_id, step=step, num_micro=len(micro_batches))
+
             nan_masks.append(prox_nan_mask)
             logprobs_prox.append(curr_logprobs.detach())
         return logprobs_prox, nan_masks
@@ -389,18 +455,14 @@ class COMMON:
         '''
             Helper to load a single model from HuggingFace.
         '''
-        assert dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-        assert self.attn_impl is None or self.attn_impl == '' or self.attn_impl in ['eager', 'flash_attention_2'], \
-            "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
+        # Load the bare HF model to select the text-only vs multi-modal model class
+        # (AutoModelForCausalLM vs AutoModelForImageTextToText)
+        model = build_hf_model(model_path=model_path,
+                               model_dtype=dtype,
+                               model_class=self.model_class,
+                               trust_remote_code=self.trust_remote_code,
+                               attn_impl=self.attn_impl)
 
-        config = AutoConfig.from_pretrained(model_path)
-        model  = AutoModelForCausalLM.from_pretrained(
-                                model_path,
-                                dtype=dtype,
-                                trust_remote_code=self.trust_remote_code,
-                                config=config,
-                                attn_implementation=None if self.attn_impl == '' else self.attn_impl
-                            )
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
         # apply PEFT module to both policy and value
@@ -923,6 +985,24 @@ class COMMON:
                 ok = False
                 print(f"[Alg:{self.alg_name}][Rank {rank}] Error merging PEFT state_dict: {e}")
 
+        # Since transformers nests the VLM submodules under a shared outer .model, so remap vlm's key to make
+        # them compatible with vllm.
+        if rank == 0 and ok and getattr(self, "model_class", "llm") == "vlm":
+            state_dict = self.remap_vlm_keys_for_vllm(state_dict)
+
+        # NaN/Inf guard on the gathered weights (rank 0). Covers BOTH direct and nccl sync
+        # since both gather via this method so never push corrupted weights into the rollout
+        # engines. ok=False makes barrier_with_error_check abort all ranks instead of
+        # silently syncing NaN/Inf into vLLM.
+        if rank == 0 and ok:
+            bad = [name for name, p in state_dict.items()
+                   if p.numel() > 0 and not torch.isfinite(p).all()]
+            if bad:
+                ok = False
+                print(f"[Alg:{self.alg_name}][Rank {rank}] NaN/Inf in {len(bad)} gathered "
+                      f"params (sample: {bad[:10]}). Aborting weight sync to avoid "
+                      f"corrupting rollout engines.")
+
         # Synchronize to ensure no rank continues until Rank 0 finishes cpu processing.
         # Use barrier_with_error_check so any merge failure on rank 0 propagates
         # immediately instead of hanging other ranks at a plain barrier.
@@ -932,6 +1012,67 @@ class COMMON:
             print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (peft={self.peft_config.use_peft})!")
 
         return state_dict
+
+    def get_checkpoint_conversion_mapping(self):
+        '''
+            Return the HF model's `_checkpoint_conversion_mapping` (a dict of
+            {checkpoint_name_regex: live_module_name}) or {} if there isn't one.
+
+            Newer transformers nests VLM submodules under a shared outer `.model`, so the
+            live param names (named_parameters) differ from the on-disk checkpoint names.
+            transformers records that remap per architecture in this class attribute and
+            uses it (reversed) in save_pretrained to write the checkpoint. We reuse it to
+            produce the same names for direct/NCCL sync. Empty for LLMs and for VLMs that
+            don't nest -> the remap becomes a no-op.
+
+            self.policy_engine.module is the DeepSpeed-wrapped HF model (engine.module is
+            the original nn.Module). For PEFT the HF model sits under .base_model.model.
+        '''
+        module = self.policy_engine.module
+        for obj in (module, getattr(getattr(module, "base_model", None), "model", None)):
+            mapping = getattr(obj, "_checkpoint_conversion_mapping", None)
+            if mapping:
+                return mapping
+        return {}
+
+    def remap_vlm_keys_for_vllm(self, state_dict):
+        '''
+            Remap VLM parameter names from the (newer) transformers live module layout to
+            the on-disk checkpoint layout that vllm's load_weights (via its WeightsMapper)
+            expects, so direct/NCCL weight sync actually matches and loads instead of
+            failing the sanity check in WeightSyncExtension.update_weights_from_state and
+            falling back to disk every epoch.
+
+            This mirrors transformers' own save_pretrained logic exactly: invert
+            _checkpoint_conversion_mapping ({checkpoint_regex: live_name}) to {live_name:
+            checkpoint_regex}, then for each param name substitute live->checkpoint. That
+            makes it architecture-agnostic:
+                Qwen2/2.5-VL: model.visual.* -> visual.*,  model.language_model.* -> model.*
+                Gemma-3:      model.language_model.* -> language_model.model.*,
+                              model.vision_tower.* -> vision_tower.*,
+                              model.multi_modal_projector.* -> multi_modal_projector.*,
+                              lm_head.* -> language_model.lm_head.*
+            LLMs (and non-nesting VLMs) have an empty mapping -> returned unchanged.
+        '''
+        mapping = self.get_checkpoint_conversion_mapping()
+        if not mapping:
+            return state_dict
+
+        # {live_module_name: checkpoint_name_regex} -> apply live->checkpoint, same as
+        # transformers PreTrainedModel.save_pretrained.
+        reverse_key_mapping = {v: k for k, v in mapping.items()}
+        remapped = {}
+        for name, tensor in state_dict.items():
+            for pattern, replacement in reverse_key_mapping.items():
+                # drop anchor
+                replacement = replacement.lstrip("^")
+                # drop regex groups e.g. (?!...)
+                replacement = re.sub(r"\(.*\)", "", replacement)
+                name, n_replace = re.subn(pattern, replacement, name)
+                if n_replace > 0:
+                    break
+            remapped[name] = tensor
+        return remapped
 
     def init_weight_nccl_group(self, master_addr, master_port, rank, world_size, group_name, timeout_seconds, backend):
         '''

@@ -39,6 +39,8 @@ class VLLMRolloutEngine(Base):
                  engine_id: int = 0,
                  batch_invariant: bool = False,
                  quantization: Optional[str] = None,
+                 model_class: str = "llm",
+                 max_images_per_prompt: int | None = None,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -83,6 +85,9 @@ class VLLMRolloutEngine(Base):
         # vllm engine config
         self.model_path = model_path
         self.model_dtype = model_dtype
+        self.model_class = model_class
+        # vlm only: cap on images per prompt for vLLM's limit_mm_per_prompt. Default 1.
+        self.max_images_per_prompt = int(max_images_per_prompt) if max_images_per_prompt is not None else 1
         self.loaded_version = -1
         self.trust_remote_code = trust_remote_code
         # Online quantization for vllm and only "fp8" is supported.
@@ -186,6 +191,12 @@ class VLLMRolloutEngine(Base):
 
         if self.quantization is not None:
             llm_kwargs["quantization"] = self.quantization
+
+        if self.model_class == "vlm":
+            # vLLM auto-detects the VLM architecture; cap images per prompt so the scheduler
+            # sizes multimodal buffers. Driven by rollout.max_images_per_prompt (default 1) so
+            # multi-image datasets work. Images arrive via each prompt's "multi_modal_data".
+            llm_kwargs["limit_mm_per_prompt"] = {"image": self.max_images_per_prompt}
 
         self.vllm_engine = LLM(**llm_kwargs)
         self.log(f"Successfully loaded vllm model from {self.model_path}")
@@ -363,6 +374,11 @@ class VLLMRolloutEngine(Base):
                     if prompt_len == 0:
                         raise ValueError(f"No prompt token ids found in generated output: {data}")
 
+                    # For VLM, carry the prompt's raw image(s) onto each sample so the
+                    # training engine can reprocess them to pixel_values and recompute
+                    # logprobs over the image tokens. None for text-only.
+                    prompt_mm = prompt_data.get("multi_modal_data") if isinstance(prompt_data, dict) else None
+
                     # process generated responses
                     for response in data.outputs:
                         response_ids = list(response.token_ids)
@@ -468,6 +484,9 @@ class VLLMRolloutEngine(Base):
                                                 "response_len": response_len,
                                                 "truncated": 1 if finish_reason == "length" else 0,
                                                 "seq_truncated": 1 if (prompt_len + response_len) > self.max_seq_len else 0,
+                                                # raw image(s) for VLM; None for text-only. Used by the
+                                                # training engine to recompute logprobs with pixel_values.
+                                                "multi_modal_data": prompt_mm,
                                                     })
                     self.normalize_rewards(samples=group_samples,
                                            stats=group_stats,

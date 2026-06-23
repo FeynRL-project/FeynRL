@@ -53,7 +53,7 @@ def build_hf_model(model_path, model_dtype, model_class, trust_remote_code, attn
     return model
 
 
-def load_tokenizer_or_processor(model_path, model_class="llm", trust_remote_code=False):
+def load_tokenizer_or_processor(model_path, model_class, trust_remote_code=False):
     '''
         Load the text tokenizer for a model_class, plus the multi-modal processor
         when applicable.

@@ -19,6 +19,7 @@ class ReplayBuffer(Dataset):
                 pad_token_id: int,
                 max_seq_len: int,
                 max_size: Optional[int] = None,
+                processor=None,
                 ):
 
         if max_size is not None:
@@ -30,6 +31,10 @@ class ReplayBuffer(Dataset):
         self.max_size = max_size
         self.pad_token_id = int(pad_token_id)
         self.max_seq_len  = int(max_seq_len)
+        # VLM only: multimodal processor. When set, collate_fn reprocesses each item's
+        # stored raw image(s) into the model's vision tensors (pixel_values, image_grid_thw)
+        # so the training forward can recompute logprobs over the image tokens. None for llm.
+        self.processor = processor
         # this shows the total number of action tokens which are not masked which
         # can be used for token-weighted scaling later.
         self.total_action_tokens = 0
@@ -83,6 +88,7 @@ class ReplayBuffer(Dataset):
                      dones=sample["pred_dones"],
                      old_logprobs=sample["pred_old_logprobs"],
                      policy_version=sample["policy_version"],
+                     images=sample.get("multi_modal_data"),
                      )
 
         if truncated_count > 0:
@@ -98,10 +104,15 @@ class ReplayBuffer(Dataset):
             dones: torch.Tensor,
             old_logprobs: torch.Tensor,
             policy_version: int,
+            images=None,
             )-> None:
         '''
             input_ids, rewards, zscores, mask, done, old_logprobs
             are all prediction aligned and [T].
+            images: VLM only: the sample's multi_modal_data ({"image": [PIL, ...]}) or None.
+                    Stored raw and reprocessed to pixel_values in collate_fn. VLM items are
+                    never truncated here (add_batch_seqs drops over-length seqs first), so the
+                    stored input_ids keep their full image-token span aligned with the image.
         '''
         input_ids = ensure_1d(input_ids, "input_ids")
         rewards   = ensure_1d(rewards, "rewards")
@@ -139,6 +150,7 @@ class ReplayBuffer(Dataset):
                             "dones": dones.detach().cpu(),
                             "zscores": zscores.detach().cpu(),
                             "policy_version": int(policy_version),
+                            "images": images,  # VLM raw image(s) or None; reprocessed in collate_fn
                          })
 
         # Count only tokens we will ever train on
@@ -192,8 +204,7 @@ class ReplayBuffer(Dataset):
         # this is per rank, this is not global. Should be revised outised this class.
         action_token_weight = float(batch_action_tokens) / float(total_action_tokens)
 
-        return {
-                "input_ids": input_ids, # [B, T]
+        out = { "input_ids": input_ids, # [B, T]
                 "attn_mask": attn_masks, # [B, T]
                 "old_logprobs": old_logps, # [B, T]
                 "mask": masks, # [B, T]
@@ -203,6 +214,43 @@ class ReplayBuffer(Dataset):
                 "batch_action_tokens": batch_action_tokens, # scalar int
                 "action_token_weight": action_token_weight, # scalar float
                 }
+
+        # For vlm, we reprocess each item's raw image(s) into the model's vision tensors and
+        # concatenate the image bag along dim 0 (pixel_values, image_grid_thw, ...),
+        # exactly like ImagePairedFeed.collate_fn. image_grid_thw tells the model how to
+        # slice the flat pixel_values back per image. Items without images contribute
+        # nothing, so a mixed (some-image) batch still aligns with input_ids.
+        if self.processor is not None:
+            mm_bags: Dict[str, List[torch.Tensor]] = {}
+            for x in batch:
+                mm   = x.get("images")
+                imgs = mm.get("image") if isinstance(mm, dict) else None
+                if not imgs:
+                    continue
+                # image_processor returns just the image tensors (no input_ids/text).
+                # For example, Qwen2-VL:
+                #     enc["pixel_values"]   -> float32, shape (256, 1176)
+                #     enc["image_grid_thw"] -> int64,   shape (1, 3) = [[1, 16, 16]]
+                # Reading those numbers:
+                #     256  = #patches (a 16x16 grid of 14x14 patches)
+                #     1176 = 3*2*14*14 (the flattened features of one patch)
+                #     [1,16,16] = (temporal=1, height=16, width=16) patch grid
+                # The model then merges each 2x2 patch block into 1 image token:
+                #     256 patches / 4 = 64 image tokens
+                # and 64 is exactly how many image placeholder tokens this item's input_ids
+                # already hold -> trainer and rollout see the same layout (logprobs line up).
+                # Note, different model families return different keys (e.g. LLaVA/Gemma:
+                # pixel_values shaped [n_images, 3, H, W], sometimes image_sizes), so the loop
+                # below bags whatever keys come back rather than hardcoding names.
+                # pixel_values is float32; the trainer casts it to the model's compute dtype
+                # (e.g. bf16) at forward. image_grid_thw must stay int64.
+                enc = self.processor.image_processor(images=imgs, return_tensors="pt")
+                for k, v in enc.items():
+                    mm_bags.setdefault(k, []).append(v)
+            for k, vals in mm_bags.items():
+                out[k] = torch.cat(vals, dim=0)
+
+        return out
 
     def __getitem__(self, idx) -> Dict[str, Any]:
         return self.items[idx]

@@ -135,6 +135,7 @@ rollout:
   max_model_len: null
   # Sync engine only and only "fp8".
   quantization: null
+  max_images_per_prompt: null
 
 model:
   name: "google/gemma-3-1b-it"
@@ -168,6 +169,9 @@ data:
   answer_key: "answer"
   # Ground truth for reward calculation.
   solution_key: null
+  # vlm only (ignored when model.model_class is "llm")
+  image_key: null
+  max_image_pixels: null
 
 deepspeed:
   zero_optimization:

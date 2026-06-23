@@ -8,6 +8,8 @@ All experiments are configured via YAML files validated by Pydantic schemas in `
 3. **Contrastive Learning (CL)**: `cl_args.yaml` — Direct Preference Optimization (DPO)
 4. **Evaluation**: `eval_args.yaml` — inference and scoring
 
+**Vision-language (VLM) variants:** any RL config runs an image+text VLM by setting `model.model_class: vlm` and the `data.image_key` / `data.max_image_pixels` / `rollout.max_images_per_prompt` fields documented below. Ready-to-run examples (Qwen2-VL): `rl_args_vlm.yaml` (sync GRPO), `rl_args_vlm_ppo.yaml` (sync PPO), `rl_args_vlm_async.yaml` (overlap GRPO), `rl_args_vlm_async_ppo.yaml` (overlap PPO).
+
 ## Command-Line Arguments
 
 All `main_*.py` entry points accept the following arguments:
@@ -148,8 +150,8 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | `value_model` | Value model path (PPO only) | String \| `null` | `"google/gemma-3-1b-it"` |
 | `ref_model_offload_to_cpu` | Offload ref model to CPU | Boolean (default: `false`) | `true` |
 | `trust_remote_code` | Allow HF remote code | Boolean | `false` |
-| `model_class` | Model class identifier | String \| `null` | `"llm"` |
-| `attn_implementation` | Attention backend | `"flash_attention_2"` \| `"eager"` \| `null` | `"flash_attention_2"` |
+| `model_class` | Model class: `"llm"` (text-only causal LM) or `"vlm"` (vision-language) | `"llm"` \| `"vlm"` | `"llm"` |
+| `attn_implementation` | Attention backend (use `"eager"` for VLMs unless flash-attn supports the vision tower) | `"flash_attention_2"` \| `"eager"` \| `null` | `"flash_attention_2"` |
 | `gradient_checkpointing` | Enable gradient checkpointing | Boolean \| `null` | `true` |
 
 ---
@@ -167,6 +169,8 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | `prompt_key` | Prompt column name in Parquet | String | `"prompt"` |
 | `answer_key` | Answer column name (SFT target) | String | `"answer"` |
 | `solution_key` | Ground truth column for RL reward calculation | String \| `null` | `"solution"` |
+| `image_key` | **VLM only** — Parquet column holding the image(s) per row (PIL, raw bytes, file path, HF `{bytes,path}` dict, or a list of these). Ignored for `llm`. | String \| `null` | `"image_bytes"` |
+| `max_image_pixels` | **VLM only** — cap on `width*height`; larger images are downscaled before processing. Bounds the image-token count so prompts stay under `max_seq_len`. `null` = no cap. | Integer \| `null` | `65536` |
 
 ---
 
@@ -190,6 +194,7 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | `prompt_logprobs` | Return prompt token logprobs (memory intensive) | Boolean | `false` |
 | `batch_invariant` | Force batch-invariant kernels (See [vLLM Reproducibility Doc](https://docs.vllm.ai/en/stable/examples/offline_inference/reproducibility/)) | Boolean | `false` |
 | `max_model_len` | Override maximum context length for vLLM. Useful for models with complex RoPE scaling (e.g. YaRN) where vLLM fails to infer it. Otherwise, leave `null`. | Integer \| `null` | `8192`, `null` |
+| `max_images_per_prompt` | **VLM only** — forwarded to vLLM's `limit_mm_per_prompt={"image": N}`; must be ≥ the largest image count any sample carries. `null` = default to 1. Ignored for `llm`. | Integer \| `null` | `1`, `null` |
 
 ---
 

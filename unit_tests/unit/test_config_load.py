@@ -114,9 +114,11 @@ def test_load_and_verify_invalid_method():
         load_and_verify(method="invalid", input_yaml="dummy", experiment_id="e", rank=0)
 
 def test_ppo_direct_sync_requires_checkpoint_save_interval_1(tmp_path):
-    """PPO value model only persists via disk checkpoints.
-    With direct weight sync and checkpoint_save_interval > 1,
-    a crash between saves would lose the value model."""
+    '''
+        PPO value model only persists via disk checkpoints.
+        With direct weight sync and checkpoint_save_interval > 1,
+        a crash between saves would lose the value model.
+    '''
     config_dict = {
         "run": {
             "experiment_id": "test", "seed": 42, "project_name": "p",
@@ -236,6 +238,41 @@ def test_config_rl_vlm_validates(tmp_path):
     assert config.model.model_class == "vlm"
     assert config.data.image_key == "image_bytes"
     assert config.rollout.max_images_per_prompt == 1
+
+def test_config_gemma3_vlm_batch_invariant_raises(tmp_path):
+    '''
+        Gemma-3 VLM + batch_invariant=True must fail fast in config validation: it would
+        force vLLM's FLASH_ATTN backend, which Gemma-3's bidirectional multimodal attention
+        rejects, crashing the rollout engine at init.
+    '''
+    cfg = _vlm_rl_config(tmp_path)
+    cfg["model"]["name"] = "google/gemma-3-4b-it"
+    cfg["rollout"]["batch_invariant"] = True
+    with pytest.raises(ValueError, match="batch_invariant.*Gemma-3|Gemma-3.*batch_invariant"):
+        load_and_verify(method="rl", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)
+
+
+def test_config_gemma3_vlm_without_batch_invariant_ok(tmp_path):
+    '''
+        Same Gemma-3 VLM is fine once batch_invariant is off (the default).
+    '''
+    cfg = _vlm_rl_config(tmp_path)
+    cfg["model"]["name"] = "google/gemma-3-4b-it"
+    cfg["rollout"]["batch_invariant"] = False
+    config = load_and_verify(method="rl", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)
+    assert config.model.model_class == "vlm"
+
+
+def test_config_qwen_vlm_batch_invariant_ok(tmp_path):
+    '''
+        The guard is Gemma-3-specific: Qwen2-VL + batch_invariant=True stays valid
+        (Qwen works with FLASH_ATTN).
+    '''
+    cfg = _vlm_rl_config(tmp_path)  # model is Qwen/Qwen2-VL-2B-Instruct
+    cfg["rollout"]["batch_invariant"] = True
+    config = load_and_verify(method="rl", input_yaml=_write(tmp_path, cfg), experiment_id="e", rank=0)
+    assert config.rollout.batch_invariant is True
+
 
 def test_config_max_images_per_prompt_defaults_none():
     '''New rollout field is optional and defaults to None (engine -> 1).'''

@@ -825,6 +825,19 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:
+            # Gemma-3 VLMs use bidirectional/full attention over image-token spans, which
+            # vllm's flash attention backend does not support ("partial multimodal token full
+            # attention not supported"). batch_invariant forces attention_backend=flash_attention
+            # in the rollout engine (see rollouts/vllm_engine.py), so the vllm engine core
+            # crashes at init. Fail fast here with an actionable message instead.
+            model_name = (config.model.name or "").lower() if config.model else ""
+            is_gemma3 = "gemma-3" in model_name or "gemma3" in model_name
+            if config.model and config.model.model_class == "vlm" and is_gemma3:
+                raise ValueError(f"rollout.batch_invariant=True is incompatible with the Gemma-3 VLM "
+                                 f"('{config.model.name}'): batch_invariant forces vLLM's FLASH_ATTN backend, "
+                                 f"which does not support Gemma-3's bidirectional multimodal attention and the rollout "
+                                 f"engine crashes at init. Set rollout.batch_invariant=false for this model.")
+
             try:
                 if torch.cuda.is_available():
                     supported = False

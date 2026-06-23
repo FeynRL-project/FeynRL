@@ -1,10 +1,11 @@
 import os
+import re
 import json
 import random
 import torch
 import torch.distributed
 import numpy as np
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoConfig
+from misc.model_loading import build_hf_model
 import deepspeed
 from peft import get_peft_model, LoraConfig
 from safetensors.torch import save_file
@@ -454,23 +455,13 @@ class COMMON:
         '''
             Helper to load a single model from HuggingFace.
         '''
-        assert dtype != 'auto', "dtype must not be auto to avoid any precision issues"
-        assert self.attn_impl is None or self.attn_impl == '' or self.attn_impl in ['eager', 'flash_attention_2'], \
-            "attn_impl must be one of None, '', 'eager', 'flash_attention_2'"
-
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)
-        # Select the model class the same way misc.model_loading.build_hf_model does:
-        # vlm -> AutoModelForImageTextToText (vision + projector + LM), llm -> AutoModelForCausalLM.
-        if self.model_class == "vlm":
-            model_cls = AutoModelForImageTextToText
-        else:
-            model_cls = AutoModelForCausalLM
-
-        model  = model_cls.from_pretrained(model_path,
-                                           dtype=dtype,
-                                           trust_remote_code=self.trust_remote_code,
-                                           config=config,
-                                           attn_implementation=None if self.attn_impl == '' else self.attn_impl)
+        # Load the bare HF model to select the text-only vs multi-modal model class
+        # (AutoModelForCausalLM vs AutoModelForImageTextToText)
+        model = build_hf_model(model_path=model_path,
+                               model_dtype=dtype,
+                               model_class=self.model_class,
+                               trust_remote_code=self.trust_remote_code,
+                               attn_impl=self.attn_impl)
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -994,6 +985,11 @@ class COMMON:
                 ok = False
                 print(f"[Alg:{self.alg_name}][Rank {rank}] Error merging PEFT state_dict: {e}")
 
+        # Since transformers nests the VLM submodules under a shared outer .model, so remap vlm's key to make
+        # them compatible with vllm.
+        if rank == 0 and ok and getattr(self, "model_class", "llm") == "vlm":
+            state_dict = self.remap_vlm_keys_for_vllm(state_dict)
+
         # NaN/Inf guard on the gathered weights (rank 0). Covers BOTH direct and nccl sync
         # since both gather via this method so never push corrupted weights into the rollout
         # engines. ok=False makes barrier_with_error_check abort all ranks instead of
@@ -1016,6 +1012,67 @@ class COMMON:
             print(f"[Alg:{self.alg_name}][Rank {rank}] Gathered state_dict (peft={self.peft_config.use_peft})!")
 
         return state_dict
+
+    def get_checkpoint_conversion_mapping(self):
+        '''
+            Return the HF model's `_checkpoint_conversion_mapping` (a dict of
+            {checkpoint_name_regex: live_module_name}) or {} if there isn't one.
+
+            Newer transformers nests VLM submodules under a shared outer `.model`, so the
+            live param names (named_parameters) differ from the on-disk checkpoint names.
+            transformers records that remap per architecture in this class attribute and
+            uses it (reversed) in save_pretrained to write the checkpoint. We reuse it to
+            produce the same names for direct/NCCL sync. Empty for LLMs and for VLMs that
+            don't nest -> the remap becomes a no-op.
+
+            self.policy_engine.module is the DeepSpeed-wrapped HF model (engine.module is
+            the original nn.Module). For PEFT the HF model sits under .base_model.model.
+        '''
+        module = self.policy_engine.module
+        for obj in (module, getattr(getattr(module, "base_model", None), "model", None)):
+            mapping = getattr(obj, "_checkpoint_conversion_mapping", None)
+            if mapping:
+                return mapping
+        return {}
+
+    def remap_vlm_keys_for_vllm(self, state_dict):
+        '''
+            Remap VLM parameter names from the (newer) transformers live module layout to
+            the on-disk checkpoint layout that vllm's load_weights (via its WeightsMapper)
+            expects, so direct/NCCL weight sync actually matches and loads instead of
+            failing the sanity check in WeightSyncExtension.update_weights_from_state and
+            falling back to disk every epoch.
+
+            This mirrors transformers' own save_pretrained logic exactly: invert
+            _checkpoint_conversion_mapping ({checkpoint_regex: live_name}) to {live_name:
+            checkpoint_regex}, then for each param name substitute live->checkpoint. That
+            makes it architecture-agnostic:
+                Qwen2/2.5-VL: model.visual.* -> visual.*,  model.language_model.* -> model.*
+                Gemma-3:      model.language_model.* -> language_model.model.*,
+                              model.vision_tower.* -> vision_tower.*,
+                              model.multi_modal_projector.* -> multi_modal_projector.*,
+                              lm_head.* -> language_model.lm_head.*
+            LLMs (and non-nesting VLMs) have an empty mapping -> returned unchanged.
+        '''
+        mapping = self.get_checkpoint_conversion_mapping()
+        if not mapping:
+            return state_dict
+
+        # {live_module_name: checkpoint_name_regex} -> apply live->checkpoint, same as
+        # transformers PreTrainedModel.save_pretrained.
+        reverse_key_mapping = {v: k for k, v in mapping.items()}
+        remapped = {}
+        for name, tensor in state_dict.items():
+            for pattern, replacement in reverse_key_mapping.items():
+                # drop anchor
+                replacement = replacement.lstrip("^")
+                # drop regex groups e.g. (?!...)
+                replacement = re.sub(r"\(.*\)", "", replacement)
+                name, n_replace = re.subn(pattern, replacement, name)
+                if n_replace > 0:
+                    break
+            remapped[name] = tensor
+        return remapped
 
     def init_weight_nccl_group(self, master_addr, master_port, rank, world_size, group_name, timeout_seconds, backend):
         '''

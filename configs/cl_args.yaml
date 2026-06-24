@@ -89,6 +89,9 @@ data:
   prompt_key: "prompt"
   # for rejected answer in preference.py, it would automatically add "rejected_" prefix to answer_key
   answer_key: "answer"
+  # vlm only (ignored when model.model_class is "llm")
+  image_key: null
+  max_image_pixels: null
 
 deepspeed:
   zero_optimization:

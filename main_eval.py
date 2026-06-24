@@ -14,8 +14,10 @@ from tqdm import tqdm
 # imports local methods, classes, etc.
 import configs.load as cfg # all config arguments
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
+from data_feeds.image_prompts import ImagePromptsFeed # vlm variant
 from rollouts.vllm_engine import VLLMRolloutEngine
 from misc.utils import set_random_seeds, ray_get_with_timeout, get_determinism_env_vars
+from misc.model_loading import load_tokenizer_or_processor, ensure_pad_token
 from misc.logging import setup_logging, setup_tracker
 from rollouts.replay_buffer import ReplayBuffer
 
@@ -59,18 +61,29 @@ def load_tokenizer(model_name, trust_remote_code=False, rank=0):
 
     return tokenizer
 
-def create_rollout_dataloader(params, tokenizer, num_rollout_engines):
+def create_rollout_dataloader(params, tokenizer, num_rollout_engines, processor=None):
     '''
-       This dataloader is used for rollout generation which 
+       This dataloader is used for rollout generation which
        would be used to train the policy.
+       processor is the multimodal AutoProcessor (only used when model_class == "vlm").
     '''
-    # 1. Initialize our custom datasets
-    prompt_ds = PromptsFeed(prompt_key=params.data.prompt_key,
-                            max_seq_len=params.data.max_seq_len,
-                            tokenizer=tokenizer,
-                            data_path=params.data.test_files_path,
-                            solution_key=params.data.solution_key,
-                            )
+    # 1. Initialize our custom datasets (text vs multimodal prompt feed)
+    if params.model.model_class == "vlm":
+        prompt_ds = ImagePromptsFeed(prompt_key=params.data.prompt_key,
+                                     max_seq_len=params.data.max_seq_len,
+                                     data_path=params.data.test_files_path,
+                                     processor=processor,
+                                     image_key=params.data.image_key,
+                                     max_image_pixels=params.data.max_image_pixels,
+                                     solution_key=params.data.solution_key,
+                                     )
+    else:
+        prompt_ds = PromptsFeed(prompt_key=params.data.prompt_key,
+                                max_seq_len=params.data.max_seq_len,
+                                tokenizer=tokenizer,
+                                data_path=params.data.test_files_path,
+                                solution_key=params.data.solution_key,
+                                )
 
     # since we split the data across the rollout engines
     bsz = num_rollout_engines * params.rollout.rollout_batch_size_per_gpu
@@ -95,6 +108,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
     kwargs = { # model related arguments
               "model_path":params.model.name,
               "trust_remote_code":params.model.trust_remote_code,
+              "model_class":params.model.model_class,
 
               # experiment setup related arguments
               "seed":params.run.seed,
@@ -116,6 +130,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "model_dtype":params.model.dtype,
               "max_seq_len":params.data.max_seq_len,
               "max_model_len":params.rollout.max_model_len,
+              "max_images_per_prompt":params.rollout.max_images_per_prompt,
 
               # reward related arguments
               "reward_func":reward_fnc,
@@ -369,10 +384,12 @@ if __name__ == "__main__":
     ########
     # 5. load tokenizer
     ########
-    logger.info(f"Loading tokenizer from {config.model.name}")
-    tokenizer = load_tokenizer(model_name=config.model.name,
-                               trust_remote_code=config.model.trust_remote_code,
-                               rank=rank)
+    logger.info(f"Loading tokenizer/processor from {config.model.name} (model_class={config.model.model_class})")
+    # processor is None for llm; for vlm it builds the image-expanded prompts in ImagePromptsFeed.
+    tokenizer, processor = load_tokenizer_or_processor(model_path=config.model.name,
+                                                       model_class=config.model.model_class,
+                                                       trust_remote_code=config.model.trust_remote_code)
+    ensure_pad_token(tokenizer)
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
 
     ########
@@ -401,7 +418,8 @@ if __name__ == "__main__":
     logger.info(f"Loading rollout dataloader from {config.data.test_files_path}")
     rollout_dataloader = create_rollout_dataloader(params=config,
                                                   tokenizer=tokenizer,
-                                                  num_rollout_engines=num_rollout_engines)
+                                                  num_rollout_engines=num_rollout_engines,
+                                                  processor=processor)
     logger.info(f"Rollout dataloader ready. Total batches per epoch: {len(rollout_dataloader)}")
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,

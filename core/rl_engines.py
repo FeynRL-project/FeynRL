@@ -7,6 +7,7 @@ import time
 
 # imports local methods, classes, etc.
 from data_feeds.prompts import PromptsFeed # our custom pytorch dataset
+from data_feeds.image_prompts import ImagePromptsFeed
 from data_feeds.mixed_sampler import create_prompt_dataset_and_sampler
 from misc.utils import safe_string_to_torch_dtype, ray_get_with_timeout, set_random_seeds, get_determinism_env_vars
 from misc.nccl_env import nccl_watchdog_env_vars
@@ -32,6 +33,7 @@ def create_training_engines(params, alg, world_size, master_addr, master_port):
                'model_dtype':safe_string_to_torch_dtype(params.model.dtype),
                'trust_remote_code':params.model.trust_remote_code,
                'attn_impl':params.model.attn_implementation,
+               'model_class':params.model.model_class,
                'seed':params.run.seed,
 
                # training related arguments
@@ -135,6 +137,8 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "model_dtype":params.model.dtype,
               "max_seq_len":params.data.max_seq_len,
               "max_model_len":params.rollout.max_model_len,
+              "model_class":params.model.model_class,
+              "max_images_per_prompt":params.rollout.max_images_per_prompt,
 
               # reward related arguments
               "reward_func":reward_fnc,
@@ -172,7 +176,7 @@ def create_rollout_engines(params, reward_fnc, eos_id):
                                                          ).remote(**kwargs))
 
         else:
-            # quantization is for sync-only mode.
+            # quantization is sync-engine-only (the async engine doesn't accept it).
             sync_kwargs = {**kwargs, "quantization": params.rollout.quantization}
             engines.append(VLLMRolloutEngine.options(num_gpus=tp,
                                                     runtime_env={"env_vars": rollout_env_vars}
@@ -180,11 +184,12 @@ def create_rollout_engines(params, reward_fnc, eos_id):
 
     return engines
 
-def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch):
+def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_per_epoch, processor=None):
     '''
        This dataloader is used for rollout generation which
        would be used to train the policy.
        Uses MixedDatasetSampler for mixed sampling across datasets.
+       processor: multimodal AutoProcessor, required when model_class == "vlm".
     '''
     if samples_per_epoch <= 0:
         raise ValueError(f"samples_per_epoch must be > 0, got {samples_per_epoch}")
@@ -194,20 +199,32 @@ def create_rollout_dataloader(params, tokenizer, num_rollout_engines, samples_pe
     # Calculate number of batches from total samples
     num_batches = (samples_per_epoch + bsz - 1) // bsz
 
-    dataset, sampler, collate_fn = create_prompt_dataset_and_sampler(
-                                                data_paths=params.data.train_files_path,
-                                                prompt_key=params.data.prompt_key,
-                                                solution_key=params.data.solution_key,
-                                                max_seq_len=params.data.max_seq_len,
-                                                tokenizer=tokenizer,
-                                                train_ratios=params.data.train_ratios,
-                                                seed=params.run.seed,
-                                                local_batch_size=bsz,
-                                                dataset_cls=PromptsFeed,
-                                                steps_per_epoch=num_batches,
-                                                shuffle_within_batch=True,
-                                                dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
-                                                )
+    # Select the text vs multimodal prompt feed. The VLM feed takes a processor and
+    # emits text prompts + raw images (expansion deferred to vLLM); the text feed
+    # tokenizes to prompt_token_ids.
+    if params.model.model_class == "vlm":
+        assert processor is not None, "create_rollout_dataloader requires a processor for model_class='vlm'"
+        feed_cls = ImagePromptsFeed
+        dataset_kwargs = {"processor": processor,
+                          "image_key": params.data.image_key,
+                          "max_image_pixels": params.data.max_image_pixels}
+    else:
+        feed_cls = PromptsFeed
+        dataset_kwargs = {}
+
+    dataset, sampler, collate_fn = create_prompt_dataset_and_sampler(data_paths=params.data.train_files_path,
+                                                                     prompt_key=params.data.prompt_key,
+                                                                     solution_key=params.data.solution_key,
+                                                                     max_seq_len=params.data.max_seq_len,
+                                                                     tokenizer=tokenizer,
+                                                                     train_ratios=params.data.train_ratios,
+                                                                     seed=params.run.seed,
+                                                                     local_batch_size=bsz,
+                                                                     dataset_cls=feed_cls,
+                                                                     steps_per_epoch=num_batches,
+                                                                     shuffle_within_batch=True,
+                                                                     dynamic_ratio_every_step=params.train.dynamic_ratio_every_step,
+                                                                     dataset_kwargs=dataset_kwargs)
     # Seed each DataLoader worker deterministically so any randomness
     # inside __getitem__ / collate_fn is reproducible across runs.
     # This DataLoader runs on the driver only, single process, no rank.

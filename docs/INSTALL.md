@@ -20,10 +20,10 @@ You should see a table showing your GPU model, driver version, and a CUDA versio
 
 ## Step 1: Create and Activate the Conda Environment
 
-We recommend **Python 3.13.1** for better compatibility with packages used in FeynRL. However, other versions of Python 3.13 should also work.
+We recommend **Python 3.12** for better compatibility with packages used in FeynRL. Any Python version in the `>=3.10, <=3.12` range should also work.
 
 ```bash
-conda create -n feynrl-env python=3.13.1 -y
+conda create -n feynrl-env python=3.12 -y
 conda activate feynrl-env
 ```
 

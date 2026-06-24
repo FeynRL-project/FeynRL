@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
 import yaml
 import sys
@@ -140,6 +140,10 @@ class Data(BaseModel):
     prompt_key: str
     answer_key: str
     solution_key: str | None = None
+    # vlm only: parquet column holding the image(s) and an optional cap on
+    # image pixels (width*height) to bound the image-token count. Ignored for llm.
+    image_key: str | None = None
+    max_image_pixels: int | None = None
 
 class Model(BaseModel):
     '''
@@ -152,8 +156,11 @@ class Model(BaseModel):
     value_model: str = None  # PPO value model path if alg_name is ppo
     ref_model_offload_to_cpu: bool = False
     trust_remote_code: bool
-    model_class: str = None
-    attn_implementation: str = None
+    # "llm" = text-only causal LM, "vlm" = vision-language model. Other families added later.
+    model_class: Literal["llm", "vlm"] = "llm"
+    # A single value applies to the whole model. For vlm, a dict maps sub-model configs to
+    # different impls, e.g. {"text_config": "flash_attention_2", "vision_config": "eager"}.
+    attn_implementation: Literal["", "eager", "flash_attention_2"] | Dict[str, str] | None = None
     gradient_checkpointing: bool = None
 
 class Peft(BaseModel):
@@ -270,6 +277,10 @@ class Rollout(BaseModel):
     max_model_len: int | None = None
     # Online quantization for the rollout engine. Only the sync engine supports this and only "fp8".
     quantization: str | None = None
+    # vlm only: max images per prompt, forwarded to vLLM's limit_mm_per_prompt={"image": N}.
+    # Must be >= the largest image count any sample carries, or vLLM rejects the prompt.
+    # None means default to 1. Ignored for llm.
+    max_images_per_prompt: int | None = None
 
 class Config(BaseModel):
     '''
@@ -562,8 +573,17 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                     f"'auto' is not allowed to avoid precision ambiguity."
                 )
 
-            if config.model.attn_implementation is not None and config.model.attn_implementation not in ("", "eager", "flash_attention_2"):
-                raise ValueError(f"model.attn_implementation must be '', 'eager', or 'flash_attention_2', got '{config.model.attn_implementation}'")
+            # A dict attn_implementation only makes sense for vlm (per module), and its
+            # values must still be valid impls. The plain-string case is covered by the Literal.
+            if isinstance(config.model.attn_implementation, dict):
+                if config.model.model_class != "vlm":
+                    raise ValueError("model.attn_implementation as a dict is only valid for model_class='vlm'")
+
+                allowed_attn = {"eager", "flash_attention_2"}
+                bad_attn = {k: v for k, v in config.model.attn_implementation.items() if v not in allowed_attn}
+                if bad_attn:
+                    raise ValueError(f"model.attn_implementation dict values must be one of {sorted(allowed_attn)}, "
+                                     f"got {bad_attn}")
 
             # Training loop checks
             if config.train.total_number_of_epochs < 1:
@@ -762,13 +782,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             if not config.reward or not config.reward.reward_func:
                 raise ValueError("reward.reward_func must be specified for RL training")
 
-            # TP must evenly divide rollout GPUs
-            tp = config.rollout.tensor_parallel_size
-            rg = config.run.rollout_gpus
-            if tp and rg and rg % tp != 0:
-                raise ValueError(f"rollout_gpus ({rg}) must be divisible by tensor_parallel_size ({tp}). "
-                                 f"Currently {rg} % {tp} = {rg % tp}.")
-
             # Ray port
             if config.run.ray_master_port is None:
                 raise ValueError("run.ray_master_port must be specified for RL training")
@@ -802,8 +815,29 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
                     raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")
 
+        elif method == "eval":
+            if not config.run.checkpoint_dir or config.run.checkpoint_dir.strip() == "":
+                raise ValueError("run.checkpoint_dir must be specified for eval "
+                                 "(used to save rollout_stats.json and experiment_config.yaml)")
+
+            if config.run.rollout_gpus is None or config.run.rollout_gpus < 1:
+                raise ValueError(f"run.rollout_gpus must be >= 1 for eval, got {config.run.rollout_gpus}")
+
         # Validate batch_invariant GPU requirements (applies to RL and eval)
         if config.rollout and config.rollout.batch_invariant:
+            # Gemma-3 VLMs use bidirectional/full attention over image-token spans, which
+            # vllm's flash attention backend does not support ("partial multimodal token full
+            # attention not supported"). batch_invariant forces attention_backend=flash_attention
+            # in the rollout engine (see rollouts/vllm_engine.py), so the vllm engine core
+            # crashes at init. Fail fast here with an actionable message instead.
+            model_name = (config.model.name or "").lower() if config.model else ""
+            is_gemma3 = "gemma-3" in model_name or "gemma3" in model_name
+            if config.model and config.model.model_class == "vlm" and is_gemma3:
+                raise ValueError(f"rollout.batch_invariant=True is incompatible with the Gemma-3 VLM "
+                                 f"('{config.model.name}'): batch_invariant forces vLLM's FLASH_ATTN backend, "
+                                 f"which does not support Gemma-3's bidirectional multimodal attention and the rollout "
+                                 f"engine crashes at init. Set rollout.batch_invariant=false for this model.")
+
             try:
                 if torch.cuda.is_available():
                     supported = False
@@ -831,13 +865,19 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
             # Sync AFTER updating world_size
             config.sync_deepspeed_config(world_size)
 
-        # Validate rollout engine resources
-        if method == "rl" and config.rollout:
+        # Validate rollout engine resources. Both rl and eval launch the same
+        # vLLM rollout engines (num_engines = max(1, rollout_gpus // tp)), so the
+        # tp/rollout_gpus constraints are shared.
+        if method in ("rl", "eval") and config.rollout:
             tp = config.rollout.tensor_parallel_size
             rg = config.run.rollout_gpus
             if tp and rg and tp > rg:
                 raise ValueError(f"tensor_parallel_size ({tp}) cannot be greater than rollout_gpus ({rg}). "
                                 f"Please increase rollout_gpus or decrease tensor_parallel_size.")
+
+            if tp and rg and rg % tp != 0:
+                raise ValueError(f"rollout_gpus ({rg}) must be divisible by tensor_parallel_size ({tp}). "
+                                 f"Currently {rg} % {tp} = {rg % tp}.")
 
         if rank == 0:
             print( "\n" + 20*"=" + "Config" + 20*"=")

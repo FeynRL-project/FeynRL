@@ -83,6 +83,9 @@ data:
   max_seq_len: 512
   prompt_key: "prompt"
   answer_key: "answer"
+  # vlm only (ignored when model.model_class is "llm")
+  image_key: null
+  max_image_pixels: null
 
 deepspeed:
   zero_optimization:

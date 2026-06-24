@@ -76,6 +76,34 @@ class PreferenceFeed(Dataset):
 
         return answer_ids, answer_attn_mask
 
+    def _encode_prompt(self, message, add_generation_prompt=True):
+        '''
+           Tokenize the prompt and return (prompt_ids[1D LongTensor], mm_dict).
+           The text-only base returns an empty mm_dict. Multimodal subclasses override this
+           to encode via a processor and return image tensors (e.g. pixel_values) in mm_dict.
+        '''
+        prompt_ids = self.tokenizer.apply_chat_template(conversation=message,
+                                                        add_generation_prompt=add_generation_prompt,
+                                                        tokenize=True,
+                                                        return_tensors='pt')[0]
+        return prompt_ids, {}
+
+    def _align_mm(self, multimodal_data, prompt_len, seq_len):
+        '''
+           Hook to align per-token multimodal tensors to the full padded sequence length.
+           The text-only base has no such tensors, so this is a no-op; multimodal subclasses override.
+        '''
+        return multimodal_data
+
+    def _pair_mm(self, multimodal_data, prompt_len, seq_len):
+        '''
+           Hook to arrange the shared prompt's multimodal tensors for the paired [2, T]
+           chosen/rejected structure. The text-only base returns {} (no mm tensors); multimodal
+           subclasses stack per-token tensors to [2, T] and duplicate the image bag for
+           chosen + rejected so it aligns with the DPO forward's [B, 2, T] -> [2B, T] flatten.
+        '''
+        return {}
+
     def __getitem__(self, idx):
         '''
           Each example has the following format:
@@ -126,14 +154,10 @@ class PreferenceFeed(Dataset):
         '''
            Handles a single turn of the conversation.
         '''
-        # 1. Tokenize the prompt
-        # When tokenize=True and return_tensors='pt', it returns shape [1, seq_len]
-        # [0]: [1, seq_len] -> [seq_len]
-        prompt_ids = self.tokenizer.apply_chat_template(conversation=message,
-                                                        add_generation_prompt=True,
-                                                        tokenize=True,
-                                                        return_tensors='pt'
-                                                        )[0]
+        # 1. Tokenize the (shared) prompt via the encode hook. Text-only base returns no mm
+        # tensors; multimodal subclasses return image tensors in multimodal_data. chosen and
+        # rejected share the same prompt (and image), so it is encoded once.
+        prompt_ids, multimodal_data = self._encode_prompt(message, add_generation_prompt=True)
         prompt_attn_mask = torch.ones_like(prompt_ids)
         prompt_len = len(prompt_ids)
 
@@ -191,10 +215,17 @@ class PreferenceFeed(Dataset):
         # [2, T-1]
         all_loss_mask = torch.stack([chosen_loss_mask, rejected_loss_mask], dim=0) # [T-1
 
+        # Arrange the (shared, prompt-only) multimodal tensors for the paired [2, T] structure.
+        # Text-only base returns {}; multimodal subclasses align/duplicate the tensors for
+        # chosen+rejected. seq_len is the padded length both chosen and rejected share
+        # (both are padded/truncated to max_seq_len in _check_seq).
+        multimodal_data = self._pair_mm(multimodal_data, prompt_len, all_input_ids.shape[-1])
+
         return {
             "input_ids": all_input_ids, # [2, T]
             "attn_mask": all_attn_mask, # [2, T]
             "loss_mask": all_loss_mask, # [2, T-1]
+            **multimodal_data,          # multimodal tensors (e.g. pixel_values); empty for llm
         }
 
     def _check_seq(self, message, prompt_len, total_seq_len, seq_ids, seq_attn_mask):
@@ -299,7 +330,7 @@ if __name__ == "__main__":
         print(d)
 
     from mixed_sampler import create_dataset_and_sampler
-    dataset, sampler = create_dataset_and_sampler(data_paths=["./promptonly.parquet"],
+    dataset, sampler,_ = create_dataset_and_sampler(data_paths=["./promptonly.parquet"],
                                                   prompt_key="prompt",
                                                   answer_key="answer",
                                                   max_seq_len=200,

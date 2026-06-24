@@ -34,11 +34,13 @@ rollout:
   # https://docs.vllm.ai/en/stable/examples/offline_inference/reproducibility/
   batch_invariant: False
   max_model_len: null
+  max_images_per_prompt: null
 
 model:
   name: "google/gemma-3-1b-it"
   dtype: "bfloat16"
   trust_remote_code: False
+  model_class: "llm"
 
 data:
   test_files_path: "./dummy_test.parquet"
@@ -47,4 +49,6 @@ data:
   prompt_key: "prompt"
   answer_key: "answer"
   solution_key: "solution"
- 
+  # vlm only (ignored when model.model_class is "llm")
+  image_key: null
+  max_image_pixels: null

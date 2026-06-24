@@ -30,6 +30,13 @@ _df_prompts.PromptsFeed = MagicMock()
 sys.modules.setdefault("data_feeds", types.ModuleType("data_feeds"))
 sys.modules.setdefault("data_feeds.prompts", _df_prompts)
 
+# data_feeds.image_prompts → exposes ImagePromptsFeed (VLM rollout feed; core.rl_engines
+# imports it). The stub `data_feeds` above is a plain module (no __path__), so every
+# data_feeds submodule core.rl_engines imports must be stubbed explicitly.
+_df_image = types.ModuleType("data_feeds.image_prompts")
+_df_image.ImagePromptsFeed = MagicMock()
+sys.modules.setdefault("data_feeds.image_prompts", _df_image)
+
 # data_feeds.mixed_sampler → exposes create_prompt_dataset_and_sampler
 _df_mixed = types.ModuleType("data_feeds.mixed_sampler")
 _df_mixed.create_prompt_dataset_and_sampler = MagicMock()

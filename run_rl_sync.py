@@ -11,6 +11,7 @@ from misc.utils import load_algorithm, ray_get_with_timeout, set_random_seeds
 from rollouts.replay_buffer import ReplayBuffer
 from misc.logging import setup_logging, setup_tracker
 from misc.setup_rl import load_tokenizer, save_checkpoint, load_checkpoint_for_resume, setup_ray
+from misc.model_loading import load_tokenizer_or_processor, ensure_pad_token
 from core.rl_engines import (Algorithm_Registry,
                             create_training_engines,
                             create_rollout_engines,
@@ -176,6 +177,17 @@ def main(args, config):
                                rank=rank)
     logger.info(f"Tokenizer loaded. Vocab size: {tokenizer.vocab_size}, Pad token ID: {tokenizer.pad_token_id}")
 
+    # For VLM rollouts we also need the multimodal processor  which is used by ImagePromptsFeed to
+    # build text prompts + raw images).
+    processor = None
+    if config.model.model_class == "vlm":
+        _, processor = load_tokenizer_or_processor(model_path=config.model.name,
+                                                   model_class="vlm",
+                                                   trust_remote_code=config.model.trust_remote_code)
+        # ImagePromptsFeed validates via processor.tokenizer, which needs a pad token.
+        ensure_pad_token(processor.tokenizer)
+        logger.info("Loaded VLM processor for rollout image prompts")
+
     ########
     # 5. Initialize rollout engines
     ########
@@ -216,7 +228,8 @@ def main(args, config):
     rollout_dataloader = create_rollout_dataloader(params=config,
                                                   tokenizer=tokenizer,
                                                   num_rollout_engines=num_rollout_engines,
-                                                  samples_per_epoch=config.rollout.rollout_samples_per_epoch)
+                                                  samples_per_epoch=config.rollout.rollout_samples_per_epoch,
+                                                  processor=processor)
 
     logger.info(f"Rollout dataloader with {len(rollout_dataloader)} batches/machine, "
                 f"n_samples={config.rollout.n_samples} per prompt")
@@ -224,6 +237,7 @@ def main(args, config):
     # replay buffer size = rollout_samples_per_epoch (prompts) * n_samples (completions per prompt)
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
+                                 processor=processor,
                                  )
     logger.info(f"Replay buffer initialized (max_seq_len={config.data.max_seq_len})")
 
@@ -442,6 +456,7 @@ def main(args, config):
                                          logger=logger,
                                          save_timeout=save_timeout,
                                          save_optimizer_state=config.run.save_optimizer_state)
+                                         processor=processor)
             logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
 
         # Disk-based rollout refresh

@@ -67,6 +67,33 @@ def test_grpo_init_and_engine():
         grpo.policy_engine.gradient_accumulation_steps = MagicMock(return_value=1)
         
         metrics = grpo.train_step(engine_id=0, micro_batches=micro_batches)
-        
+
         assert 'pi_loss' in metrics
         assert grpo.policy_engine.backward.called
+        # model_class defaults to "llm" when not supplied (back-compat).
+        assert grpo.model_class == "llm"
+
+
+def test_grpo_init_accepts_model_class_vlm():
+    '''GRPO (like all algs) must accept and store model_class="vlm" so the shared
+    create_training_engines kwargs don't break, and load_single_model can pick the
+    VLM model class.'''
+    deepspeed_config = MagicMock()
+    deepspeed_config.model_dump.return_value = {}
+
+    with patch.object(GRPO, 'load_model') as mock_load:
+        policy_model = MagicMock(spec=torch.nn.Module)
+        policy_model.parameters.return_value = [torch.nn.Parameter(torch.randn(1), requires_grad=True)]
+        mock_load.return_value = {"policy_model": policy_model, "ref_model": None}
+
+        import deepspeed
+        deepspeed.initialize.return_value = (MagicMock(), MagicMock(), None, None)
+
+        grpo = GRPO(
+            model_path="mock/model", model_dtype=torch.float32, trust_remote_code=True,
+            attn_impl="eager", kl_coeff=0.0, clip_low=0.2, clip_high=0.2, entropy_coeff=0.0,
+            micro_batch_size_per_gpu=1, update_after_full_replay=True, normalize_loss=False,
+            deepspeed_config=deepspeed_config, gradient_checkpointing=False, seed=42,
+            train_steps_per_epoch=1, model_class="vlm",
+        )
+        assert grpo.model_class == "vlm"

@@ -72,3 +72,43 @@ def test_dpo_gradient_flow():
 
     assert logits.grad is not None
     assert not torch.isnan(logits.grad).any()
+
+def test_dpo_forward_threads_multimodal_tensors():
+    '''
+        forward must flatten the paired per-token mm tensors ([B,2,T]->[2B,T])
+        like input_ids, pass the image 'bag' (pixel_values/image_grid_thw) straight through,
+        cast floating mm tensors to the compute dtype, and feed all of it to BOTH the policy
+        and ref engines. Mirrors algs/SFT/sft.py's mm handling.
+    '''
+    from types import SimpleNamespace
+
+    model_engine = MagicMock()
+    ref_model_engine = MagicMock()
+    # compute dtype used to cast floating mm tensors (pixel_values)
+    model_engine.module.get_input_embeddings.return_value.weight.dtype = torch.float32
+
+    B, T, V = 1, 3, 4
+    model_engine.return_value = SimpleNamespace(logits=torch.randn(2 * B, T, V))
+    ref_model_engine.return_value = SimpleNamespace(logits=torch.randn(2 * B, T, V))
+
+    dpo = DPO(model_engine, ref_model_engine, MagicMock(), beta=0.1)
+
+    batch = {'input_ids': torch.zeros(B, 2, T, dtype=torch.long),
+             'attn_mask': torch.ones(B, 2, T, dtype=torch.long),
+             'loss_mask': torch.ones(B, 2, T - 1),
+             # per-token (seq-aligned) mm tensor, paired [B, 2, T] -> must flatten to [2B, T]
+             'token_type_ids': torch.zeros(B, 2, T, dtype=torch.long),
+             # image 'bag', already concatenated in [chosen0, rejected0, ...] order -> pass through
+             'pixel_values': torch.zeros(4, 8, dtype=torch.float32),
+             'image_grid_thw': torch.tensor([[1, 2, 2], [1, 2, 2]], dtype=torch.long),
+            }
+
+    dpo.forward(batch)
+
+    for eng in (model_engine, ref_model_engine):
+        kw = eng.call_args.kwargs
+        assert kw['input_ids'].shape == (2 * B, T)        # [B,2,T] -> [2B,T]
+        assert kw['token_type_ids'].shape == (2 * B, T)   # paired per-token tensor flattened
+        assert kw['pixel_values'].shape == (4, 8)         # image bag passed through unchanged
+        assert kw['image_grid_thw'].shape == (2, 3)
+        assert kw['pixel_values'].dtype == torch.float32  # floating mm cast to compute dtype

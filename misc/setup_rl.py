@@ -141,7 +141,7 @@ def save_checkpoint(epoch,
                     rank,
                     logger,
                     save_timeout,
-                    save_optimizer_state=True):
+                    save_optimizer_state=True,
                     processor=None):
     '''
        Save model checkpoint. This must run on all ranks for ZeRO-3.

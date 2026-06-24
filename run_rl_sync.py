@@ -455,7 +455,7 @@ def main(args, config):
                                          rank=rank,
                                          logger=logger,
                                          save_timeout=save_timeout,
-                                         save_optimizer_state=config.run.save_optimizer_state)
+                                         save_optimizer_state=config.run.save_optimizer_state,
                                          processor=processor)
             logger.info(f"[Epoch {epoch+1}] Saved disk checkpoint at {model_path}")
 

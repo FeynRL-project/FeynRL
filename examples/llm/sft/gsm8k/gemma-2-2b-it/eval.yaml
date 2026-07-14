@@ -1,0 +1,45 @@
+run:
+  project_name: "feynrl_gemma_2_2b_it_gsm8k_eval"
+  logger_type: "mlflow"
+  tracking_uri: ""
+  checkpoint_dir: "./ckps/gemma_2_2b_it_eval"
+  rollout_gpus: 8
+  ray_address: null
+  ray_master_port: 29500
+  seed: 42
+  rollout_timeout: 3600
+  init_timeout: 3600
+
+reward:
+  broadcast: False
+  reward_func: math_verify_reward_func
+
+rollout:
+  temperature: 1.0
+  max_tokens: 3072
+  n_samples: 8
+  top_p: 1.0
+  top_k: -1
+  ignore_eos: False
+  stop: ""
+  gpu_memory_utilization: 0.8
+  stop_token_ids: []
+  prompt_logprobs: False
+  force_strict_on_policy: False
+  tensor_parallel_size: 1
+  rollout_batch_size_per_gpu: 8
+  batch_invariant: False
+  max_model_len: 8192
+
+model:
+  name: "./ckps/gemma_2_2b_it/iter000002"
+  dtype: "bfloat16"
+  trust_remote_code: False
+
+data:
+  test_files_path: "./data/gsm8k_test.parquet"
+  num_workers: 4
+  max_seq_len: 4096
+  prompt_key: "prompt"
+  answer_key: "answer"
+  solution_key: "solution"

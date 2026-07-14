@@ -1,0 +1,105 @@
+run:
+  project_name: "feynrl_gemma_2_2b_it_gsm8k"
+  logger_type : "mlflow"
+  tracking_uri: ""
+  checkpoint_dir: "./ckps/gemma_2_2b_it"
+  ray_address: null
+  ray_master_port: 29500
+  seed: 42
+
+  weight_sync_method: "direct"
+  checkpoint_save_interval: 1
+
+  nccl_socket_ifname: null
+  nccl_ib_hca: null
+  nccl_sync_port: null
+  nccl_sync_backend: "nccl"
+
+  init_timeout: 3600
+  rollout_timeout: 3600
+  train_step_timeout: 1800
+  save_timeout: 1800
+  sync_timeout: 900
+
+train:
+  alg_name: "sft"
+  optimizer_name: "adamw"
+  lr: 1e-5
+  adam_epsilon: 1e-8
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.1
+  clip_grad_norm: 1.0
+  lr_scheduler: "WarmupCosineLR"
+
+  total_number_of_epochs: 2
+  micro_batches_per_epoch: 416
+  dynamic_ratio_every_step: False
+
+  train_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 16
+  val_batch_size_per_gpu: 2
+
+  normalize_loss: True
+
+model:
+  name: "google/gemma-2-2b-it"
+  dtype: "bfloat16"
+  trust_remote_code: False
+  model_class: "llm"
+  gradient_checkpointing: True
+  attn_implementation: "flash_attention_2"
+
+peft:
+  use_peft: False
+  peft_type: "lora"
+  task_type: "CAUSAL_LM"
+  lora_rank: 0
+  lora_alpha: 0
+  lora_dropout: 0
+  lora_target_modules: null
+
+data:
+  train_ratios: {"gsm8k_train": 1.0}
+  train_files_path: ["./data/gsm8k_train.parquet"]
+  val_files_path: ["./data/gsm8k_val.parquet"]
+  num_workers: 4
+  max_seq_len: 4096
+  prompt_key: "prompt"
+  answer_key: "answer"
+
+deepspeed:
+  zero_optimization:
+    stage: 3
+    stage3_param_persistence_threshold: "auto"
+    stage3_prefetch_bucket_size: "auto"
+    stage3_max_live_parameters: "auto"
+    stage3_max_reuse_distance: "auto"
+    sub_group_size: "auto"
+    offload_optimizer:
+      device: "none"
+      pin_memory: true
+    offload_param:
+      device: "none"
+      pin_memory: true
+    contiguous_gradients: true
+    overlap_comm: true
+    reduce_scatter: true
+    reduce_bucket_size: "auto"
+    allgather_bucket_size: "auto"
+    stage3_gather_16bit_weights_on_model_save: true
+
+  prescale_gradients: false
+
+  data_types:
+    grad_accum_dtype: "fp32"
+
+  steps_per_print: 100
+  wall_clock_breakdown: false
+  flops_profiler:
+    enabled: false
+    profile_step: 10
+    module_depth: -1
+    top_modules: 1
+    detailed: true
+    output_file: null

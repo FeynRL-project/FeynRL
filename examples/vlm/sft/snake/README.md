@@ -105,13 +105,13 @@ python examples/vlm/sft/snake/prepare_data.py \
 Train:
 
 ```bash
-python main_sft.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml
 ```
 
 Evaluate:
 
 ```bash
-python examples/vlm/sft/snake/smolvlm2-500m-video-instruct/rollout.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python examples/vlm/sft/snake/smolvlm2-500m-video-instruct/rollout.py \
     --checkpoint_dir ./ckps/snake-sft/smolvlm2-500m/iter000050 \
     --output_dir     ./rollouts/snake \
     --num_games      5 \

@@ -2,11 +2,16 @@
 
 A curated set of FeynRL experiments organized by model type, algorithm, and dataset. Each experiment includes training configs, evaluation configs, and reproduction instructions.
 
+> **Note:** Commands below pass `--experiment_id EXPNAME` — replace `EXPNAME` with your own experiment name/ID. It's used to name the output directory for logs, checkpoints, and metrics.
+
 ## Directory Structure
 
 ```text
 examples/
 ├── llm/                                              # Text-only language models
+│   ├── sft/
+│   │   └── gsm8k/
+│   │       └── gemma-2-2b-it/                       # SFT on GSM8K
 │   └── rl/
 │       └── gsm8k/
 │           ├── qwen2.5-1.5b-instruct/               # GRPO on GSM8K
@@ -28,7 +33,22 @@ examples/
 
 ## LLM — Mathematical Reasoning
 
-Text-only models trained with GRPO on math reasoning datasets. See [`llm/README.md`](llm/README.md) for full details and reproduction instructions.
+Text-only models fine-tuned on math reasoning datasets with SFT and GRPO. See [`llm/README.md`](llm/README.md) for full details and reproduction instructions.
+
+### SFT
+
+| Model         | Dataset | GSM8K pass@1 (base → FeynRL) |
+| ------------- | ------- | ------------------------------: |
+| Gemma-2-2B-it | GSM8K   |            21.81% → **32.59%** |
+
+**Quick start:**
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml --experiment_id EXPNAME
+```
+
+### RL (GRPO)
 
 | Model                   | Dataset    | Avg pass@1 (base → FeynRL) | Avg pass@16 (base → FeynRL) |
 | ----------------------- | ---------- | -------------------------: | --------------------------: |
@@ -38,8 +58,8 @@ Text-only models trained with GRPO on math reasoning datasets. See [`llm/README.
 **Quick start:**
 
 ```bash
-python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml
-python main_eval.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/eval.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/eval.yaml --experiment_id EXPNAME
 ```
 
 ---
@@ -57,8 +77,8 @@ Vision-language models fine-tuned on math reasoning and game control. See [`vlm/
 | GRPO   | **34.0%** | **34.1%** | **62.0%** |
 
 ```bash
-python main_rl.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml
-python main_eval.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/eval.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/eval.yaml --experiment_id EXPNAME
 ```
 
 ### Snake Game (SmolVLM2-500M-Video-Instruct)
@@ -72,7 +92,7 @@ A 500 M VLM learns to play Snake from pixel observations via supervised imitatio
 ```bash
 python examples/vlm/sft/snake/prepare_data.py \
     --output_dir ./data/vla-games/snake_sft
-python main_sft.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/vlm/sft/snake/smolvlm2-500m-video-instruct/train.yaml --experiment_id EXPNAME
 ```
 
 See the [experiment README](vlm/sft/snake/README.md) for the training progression, rollout instructions, and the interactive UI.
@@ -82,7 +102,7 @@ See the [experiment README](vlm/sft/snake/README.md) for the training progressio
 ## Reproducing Any Experiment
 
 1. **Prepare data** — run the dataset-specific prep script or download a pre-built parquet
-2. **Train** — `python main_rl.py --config <train_config>` (RL) or `python main_sft.py --config <train_config>` (SFT)
+2. **Train** — `python main_rl.py --config <train_config>` (RL) or `python main_sl.py --config <train_config>` (SFT)
 3. **Evaluate** — `python main_eval.py --config <eval_config>` (math benchmarks) or the rollout script (game tasks)
 
 Update `model.name`, `run.checkpoint_dir`, and `data.*_files_path` in the configs to point at your local paths before running.

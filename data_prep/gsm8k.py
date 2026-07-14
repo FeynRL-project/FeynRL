@@ -10,16 +10,16 @@ def create_prompt(question, system_prompt):
     '''
     if system_prompt:
         message = [
-                    {"role": "system", "content": system_prompt}, 
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": question}
-                  ]
+                    ]
 
     else:
-        message = [ 
+        message = [
                     {"role": "user", "content": question}
                   ]
 
-    return message     
+    return message
 
 def extract_solution(solution_str):
     '''

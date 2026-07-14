@@ -1,11 +1,16 @@
 # LLM Experiments
 
-Text-only language model experiments using FeynRL's RL (GRPO) pipeline on mathematical reasoning datasets.
+Text-only language model experiments using FeynRL's SFT and RL (GRPO) pipelines on mathematical reasoning datasets.
+
+> **Note:** Commands below pass `--experiment_id EXPNAME` — replace `EXPNAME` with your own experiment name/ID. It's used to name the output directory for logs, checkpoints, and metrics.
 
 ## Directory Layout
 
 ```text
 llm/
+├── sft/
+│   └── gsm8k/
+│       └── gemma-2-2b-it/              # SFT on GSM8K with Gemma-2-2B-it
 ├── rl/
 │   └── gsm8k/
 │       ├── qwen2.5-1.5b-instruct/      # GRPO on GSM8K with Qwen2.5-1.5B-Instruct
@@ -15,13 +20,79 @@ llm/
 
 ---
 
-## Shared Setup
+## Gemma-2-2B-it — GSM8K (SFT)
+
+| Item              | Value                                                                                   |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| Model              | `google/gemma-2-2b-it`                                                                  |
+| Training dataset   | [GSM8K](https://huggingface.co/datasets/openai/gsm8k)                                  |
+| Algorithm          | SFT (supervised fine-tuning)                                                             |
+| DeepSpeed          | ZeRO stage 3, bf16                                                                       |
+| Training config    | [`sft/gsm8k/gemma-2-2b-it/train.yaml`](sft/gsm8k/gemma-2-2b-it/train.yaml)             |
+| Evaluation config  | [`sft/gsm8k/gemma-2-2b-it/eval.yaml`](sft/gsm8k/gemma-2-2b-it/eval.yaml)               |
+
+### Data Preparation
+
+```bash
+python data_prep/gsm8k.py --local_dir ./data --system_prompt ""
+```
+
+The script writes `gsm8k_processed_{run_id}_ns_train.parquet`, `..._val.parquet`, and `..._test.parquet` under `./data/`. Update `data.train_files_path`, `data.val_files_path` (training config), and `data.test_files_path` (evaluation config) to match. Also rename the `data.train_ratios` key to match the new parquet filename stem (e.g. `gsm8k_processed_{run_id}_ns_train`) — it must match the training file's basename exactly, or startup fails with `Dataset/ratio key mismatch`.
+
+### Training
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 main_sl.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/train.yaml --experiment_id EXPNAME
+```
+
+![FeynRL loss curve](sft/gsm8k/gemma-2-2b-it/feynrl_loss_curve.png)
+
+### Evaluation Results
+
+Evaluated on the GSM8K test set with `n_samples=8`, temperature `1.0`.
+
+| Model  | GSM8K pass@1 |
+| ------ | -----------: |
+| Base   |       21.81% |
+| FeynRL |   **32.59%** |
+
+SFT improves pass@1 by **+10.78 pp** over the base model.
+
+### Key Training Settings
+
+| Parameter             | Value                       |
+| ---------------------- | --------------------------- |
+| Model                  | google/gemma-2-2b-it        |
+| Dataset                | GSM8K                       |
+| Learning rate          | 1e-5                        |
+| LR scheduler           | WarmupCosineLR (10% warmup) |
+| Train batch per GPU    | 1                           |
+| Gradient accumulation  | 16                          |
+| Micro batches / epoch  | 416                         |
+| Max sequence length    | 4096                        |
+| DeepSpeed              | ZeRO stage 3, bf16          |
+| LoRA                   | disabled (full fine-tune)   |
+| Total epochs           | 2                           |
+
+### Reproducing Evaluation
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/sft/gsm8k/gemma-2-2b-it/eval.yaml --experiment_id EXPNAME
+```
+
+Replace `model.name` with your checkpoint path and `data.test_files_path` with your target benchmark parquet.
+
+---
+
+## RL Shared Setup
+
+The following applies to the RL (GRPO) experiments below.
 
 - **Algorithm:** GRPO
 - **DeepSpeed:** ZeRO stage 2/3, bf16
 - **Hardware:** 8×H100 GPUs with CUDA v12.4
-- **Training:** `python main_rl.py --config examples/llm/rl/<dataset>/<model>/train_sync.yaml`
-- **Evaluation:** `python main_eval.py --config examples/llm/rl/<dataset>/<model>/eval.yaml`
+- **Training:** `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/<dataset>/<model>/train_sync.yaml --experiment_id EXPNAME`
+- **Evaluation:** `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/rl/<dataset>/<model>/eval.yaml --experiment_id EXPNAME`
 
 ### Shared Evaluation Protocol
 
@@ -54,16 +125,16 @@ Downstream evaluation reports pass@1 and pass@16 across 10 mathematical reasonin
 python data_prep/gsm8k.py --local_dir ./data --system_prompt ""
 ```
 
-The script writes `gsm8k_processed_{run_id}_ns_train.parquet` and `gsm8k_processed_{run_id}_ns_val.parquet` under `./data/`. Update `data.train_files_path` and `data.val_files_path` in the training config to match.
+The script writes `gsm8k_processed_{run_id}_ns_train.parquet` and `gsm8k_processed_{run_id}_ns_val.parquet` under `./data/`. Update `data.train_files_path` and `data.val_files_path` in the training config to match. Also rename the `data.train_ratios` key to match the new parquet filename stem (e.g. `gsm8k_processed_{run_id}_ns_train`) — it must match the training file's basename exactly, or startup fails with `Dataset/ratio key mismatch`.
 
 ### Training
 
 ```bash
 # Synchronous (no overlap)
-python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml --experiment_id EXPNAME
 
 # Asynchronous (with overlap)
-python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_async.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_async.yaml --experiment_id EXPNAME
 ```
 
 The reward curves below overlay the sync and async runs over the first hour of wall-clock training time.
@@ -117,10 +188,10 @@ At 1 hour, the sync run reaches **0.894** reward and the async run reaches **0.8
 
 ```bash
 # Synchronous (no overlap)
-python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_sync.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_sync.yaml --experiment_id EXPNAME
 
 # Asynchronous (with overlap)
-python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_async.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_async.yaml --experiment_id EXPNAME
 ```
 
 The reward curves below overlay the sync and async runs over the first 8 hours of wall-clock training time.

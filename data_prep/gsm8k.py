@@ -12,7 +12,7 @@ def create_prompt(question, system_prompt):
         message = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": question}
-                    ]
+                  ]
 
     else:
         message = [

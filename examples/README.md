@@ -59,7 +59,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/s
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/train_sync.yaml --experiment_id EXPNAME
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_eval.py --config examples/llm/rl/gsm8k/qwen2.5-1.5b-instruct/eval.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./examples/llm/eval/run_shared_eval.sh --model ./ckps/qwen2.5-1.5b-instruct/checkpoint --experiment_id EXPNAME
 ```
 
 ---

@@ -127,3 +127,4 @@ wandb/
 configs/murdock_configs/
 scripts/
 .clean_git.sh
+data/

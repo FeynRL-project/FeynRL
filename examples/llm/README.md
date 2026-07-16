@@ -42,15 +42,15 @@ Downstream evaluation reports pass@1 and pass@16 across 10 mathematical reasonin
 python data_prep/shared_eval_benchmarks.py --local_dir ./data
 ```
 
-Downloads each of the 10 benchmarks above directly from its HuggingFace dataset card and packs it into a separate `./data/{benchmark}_test.parquet` file. These files are for shared-protocol evaluation only, not training. In particular, GSM8K here uses only the HuggingFace `test` split, while [`data_prep/gsm8k.py`](../../data_prep/gsm8k.py) uses only the HuggingFace `train` split and derives `train`/`val` from it. Pass `--system_prompt "..."` to prepend a shared system prompt, or `--benchmarks gsm8k aime_2024 ...` to pack a subset instead of all 10.
+Downloads each of the 10 benchmarks above directly from its HuggingFace dataset card and packs it into a separate `./data/{benchmark}_processed_{run_id}_{ns|wsp}_test.parquet` file. These files are for shared-protocol evaluation only, not training. In particular, GSM8K here uses only the HuggingFace `test` split, while [`data_prep/gsm8k.py`](../../data_prep/gsm8k.py) uses only the HuggingFace `train` split and derives `train`/`val` from it. Pass `--run_id ID` to control the output filenames, `--system_prompt "..."` to switch from `ns` to `wsp`, or `--benchmarks gsm8k aime_2024 ...` to pack a subset instead of all 10.
 
 ### Running the Protocol
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./examples/llm/eval/run_shared_eval.sh --model <path_or_hf_id> --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./examples/llm/eval/run_shared_eval.sh --model <path_or_hf_id> --experiment_id EXPNAME --data_run_id 123245 --data_variant ns
 ```
 
-Runs `main_eval.py` once per benchmark in sequence against [`eval/eval_shared_base.yaml`](eval/eval_shared_base.yaml) — a single base config (n_samples=16, temperature=1.0, matching the protocol above) shared across all 10 runs, with only the model, test file, and checkpoint dir swapped per benchmark. Each benchmark's `rollout_stats.json` (containing pass@1..pass@16) lands under `./ckps/eval/EXPNAME/{benchmark}/`. Requires `./data/{benchmark}_test.parquet` for each benchmark (see Data Preparation above).
+Runs `main_eval.py` once per benchmark in sequence against [`eval/eval_shared_base.yaml`](eval/eval_shared_base.yaml) — a single base config (n_samples=16, temperature=1.0, matching the protocol above) shared across all 10 runs, with only the model, test file, and checkpoint dir swapped per benchmark. Each benchmark's `rollout_stats.json` (containing pass@1..pass@16) lands under `./ckps/eval/EXPNAME/{benchmark}/`. Requires `./data/{benchmark}_processed_{run_id}_{ns|wsp}_test.parquet` for each benchmark (see Data Preparation above), matched via `--data_run_id` and `--data_variant`.
 
 A slurm equivalent is available at [`scripts/slurm/launch_shared_eval.sh`](../../scripts/slurm/launch_shared_eval.sh): `sbatch scripts/slurm/launch_shared_eval.sh --model <path_or_hf_id> --experiment_id EXPNAME`.
 

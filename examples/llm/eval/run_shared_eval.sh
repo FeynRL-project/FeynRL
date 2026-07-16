@@ -3,8 +3,8 @@
 # in sequence, reusing one base config (eval/eval_shared_base.yaml) for model/rollout
 # params and swapping in each benchmark's test file and checkpoint dir.
 #
-# Prereq: python data_prep/shared_eval_benchmarks.py --local_dir ./data
-#         (produces ./data/<benchmark>_test.parquet -- see README's Data Preparation section)
+# Prereq: python data_prep/shared_eval_benchmarks.py --local_dir ./data [--run_id ...] [--system_prompt "..."]
+#         (produces ./data/<benchmark>_processed_<run_id>_{ns|wsp}_test.parquet -- see README's Data Preparation section)
 #
 # Usage (run from the repo root):
 #   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./examples/llm/eval/run_shared_eval.sh \
@@ -25,10 +25,12 @@ MODEL=""
 EXPERIMENT_ID="shared_eval"
 ROLLOUT_GPUS=1
 DATA_DIR="./data"
+DATA_RUN_ID="123245"
+DATA_VARIANT="ns"
 CHECKPOINT_ROOT="./ckps/eval"
 
 usage() {
-    echo "Usage: $0 --model <path_or_hf_id> [--experiment_id NAME] [--rollout_gpus N] [--data_dir DIR] [--checkpoint_root DIR]"
+    echo "Usage: $0 --model <path_or_hf_id> [--experiment_id NAME] [--rollout_gpus N] [--data_dir DIR] [--data_run_id ID] [--data_variant ns|wsp] [--checkpoint_root DIR]"
     exit 1
 }
 
@@ -38,6 +40,8 @@ while [[ $# -gt 0 ]]; do
         --experiment_id) EXPERIMENT_ID="$2"; shift 2 ;;
         --rollout_gpus) ROLLOUT_GPUS="$2"; shift 2 ;;
         --data_dir) DATA_DIR="$2"; shift 2 ;;
+        --data_run_id) DATA_RUN_ID="$2"; shift 2 ;;
+        --data_variant) DATA_VARIANT="$2"; shift 2 ;;
         --checkpoint_root) CHECKPOINT_ROOT="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "Unknown argument: $1"; usage ;;
@@ -45,6 +49,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$MODEL" ]] && usage
+[[ "$DATA_VARIANT" != "ns" && "$DATA_VARIANT" != "wsp" ]] && usage
 
 cd "$REPO_ROOT"
 
@@ -52,7 +57,7 @@ TMP_CONFIG_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_CONFIG_DIR"' EXIT
 
 for benchmark in "${BENCHMARKS[@]}"; do
-    test_file="${DATA_DIR}/${benchmark}_test.parquet"
+    test_file="${DATA_DIR}/${benchmark}_processed_${DATA_RUN_ID}_${DATA_VARIANT}_test.parquet"
     if [[ ! -f "$test_file" ]]; then
         echo "[SKIP] $benchmark: missing $test_file (run data_prep/shared_eval_benchmarks.py first)" >&2
         continue

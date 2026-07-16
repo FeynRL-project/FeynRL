@@ -135,8 +135,12 @@ def get_benchmarks():
     return list(get_loaders().keys())
 
 
-def create_file_name(benchmark):
-    return f"{benchmark}_test.parquet"
+def create_file_name(params, benchmark):
+    '''
+       This function creates file name based on the params.
+    '''
+    fpart = 'wsp' if params.system_prompt else 'ns'
+    return f"{benchmark}_processed_{params.run_id}_{fpart}_test.parquet"
 
 
 if __name__ == "__main__":
@@ -146,7 +150,8 @@ if __name__ == "__main__":
                                                   "Protocol benchmarks (examples/llm/README.md) "
                                                   "directly from HuggingFace into --local_dir.")
     parser.add_argument("--local_dir", default="./data",
-                        help="Output directory for the packed {benchmark}_test.parquet files.")
+                        help="Output directory for the packed {benchmark}_processed_{run_id}_{ns|wsp}_test.parquet files.")
+    parser.add_argument("--run_id", default="123245")
     parser.add_argument("--system_prompt", default="",
                         help="Optional system prompt prepended to every packed prompt.")
     parser.add_argument("--benchmarks", nargs="+", default=benchmarks, choices=benchmarks,
@@ -167,7 +172,7 @@ if __name__ == "__main__":
         if out_df["prompt"].isnull().any() or out_df["solution"].isnull().any():
             raise ValueError(f"{benchmark}: null values in 'prompt' or 'solution'")
 
-        out_path = os.path.join(args.local_dir, create_file_name(benchmark))
+        out_path = os.path.join(args.local_dir, create_file_name(args, benchmark))
         out_df.to_parquet(out_path)
 
         # round-trip check to catch any parquet-write/schema bug

@@ -41,7 +41,7 @@ Downstream evaluation reports pass@1 and pass@16 across 10 mathematical reasonin
 python data_prep/shared_eval_benchmarks.py --local_dir ./data
 ```
 
-Downloads each of the 10 benchmarks above directly from its HuggingFace dataset card and packs it into a separate `./data/{benchmark}_test.parquet` file. Pass `--variant wsp` to prepend a shared system prompt instead of the default no-system-prompt (`ns`) variant, or `--benchmarks gsm8k aime_2024 ...` to pack a subset instead of all 10.
+Downloads each of the 10 benchmarks above directly from its HuggingFace dataset card and packs it into a separate `./data/{benchmark}_test.parquet` file. These files are for shared-protocol evaluation only, not training. In particular, GSM8K here uses only the HuggingFace `test` split, while [`data_prep/gsm8k.py`](../../data_prep/gsm8k.py) uses only the HuggingFace `train` split and derives `train`/`val` from it. Pass `--system_prompt "..."` to prepend a shared system prompt, or `--benchmarks gsm8k aime_2024 ...` to pack a subset instead of all 10.
 
 ### Running the Protocol
 
@@ -63,7 +63,7 @@ A slurm equivalent is available at [`scripts/slurm/launch_shared_eval.sh`](../..
 python data_prep/gsm8k.py --local_dir ./data --system_prompt ""
 ```
 
-Downloads [GSM8K](https://huggingface.co/datasets/openai/gsm8k) and writes `gsm8k_processed_{run_id}_ns_{train,val,test}.parquet` under `./data/`. Used by both the SFT and RL GSM8K experiments below — point each config's `data.train_files_path` / `data.val_files_path` / `data.test_files_path` at the matching file. Also rename the `data.train_ratios` key in the training config to match the new train file's basename exactly (e.g. `gsm8k_processed_{run_id}_ns_train`), or startup fails with `Dataset/ratio key mismatch`.
+Downloads the HuggingFace [GSM8K](https://huggingface.co/datasets/openai/gsm8k) `train` split and writes `gsm8k_processed_{run_id}_ns_{train,val}.parquet` under `./data/`, deriving `val` from `train` via `--val_ratio`. Used by both the SFT and RL GSM8K experiments below — point each config's `data.train_files_path` / `data.val_files_path` at the matching file. Also rename the `data.train_ratios` key in the training config to match the new train file's basename exactly (e.g. `gsm8k_processed_{run_id}_ns_train`), or startup fails with `Dataset/ratio key mismatch`. For evaluation-only GSM8K test data, use [`data_prep/shared_eval_benchmarks.py`](#data-preparation).
 
 ### DeepScaleR
 

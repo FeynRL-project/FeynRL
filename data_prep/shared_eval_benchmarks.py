@@ -20,10 +20,6 @@ BENCHMARKS = [
     "olympiad",
 ]
 
-DEFAULT_SYSTEM_PROMPT = ("You are a helpful math assistant. Solve the problem step by step, "
-                          "then give your final answer as a number")
-
-
 def create_prompt(question, system_prompt):
     '''
        This creates general message with or without system prompt.
@@ -74,6 +70,8 @@ def finalize(problems, solutions):
 
 
 def load_gsm8k():
+    # Shared eval uses only the held-out HF test shard so it stays disjoint from
+    # data_prep/gsm8k.py, which now derives train/val only from the HF train shard.
     df = datasets.load_dataset("openai/gsm8k", "main")["test"].to_pandas()
     solutions = [extract_gsm8k_solution(a) for a in df["answer"]]
     return finalize(df["question"], solutions)
@@ -146,34 +144,37 @@ LOADERS = {
 }
 
 
+def create_file_name(benchmark):
+    return f"{benchmark}_test.parquet"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Downloads and packs the 10 Shared Evaluation "
                                                   "Protocol benchmarks (examples/llm/README.md) "
                                                   "directly from HuggingFace into --local_dir.")
     parser.add_argument("--local_dir", default="./data",
                         help="Output directory for the packed {benchmark}_test.parquet files.")
-    parser.add_argument("--variant", choices=["ns", "wsp"], default="ns",
-                        help="ns = no system prompt, wsp = with system prompt.")
+    parser.add_argument("--system_prompt", default="",
+                        help="Optional system prompt prepended to every packed prompt.")
     parser.add_argument("--benchmarks", nargs="+", default=BENCHMARKS, choices=BENCHMARKS,
                         help="Subset of benchmarks to pack (default: all 10).")
     args = parser.parse_args()
 
-    system_prompt = DEFAULT_SYSTEM_PROMPT if args.variant == "wsp" else ""
     os.makedirs(args.local_dir, exist_ok=True)
 
     print(f"Downloading and packing {len(args.benchmarks)} benchmark(s) into {args.local_dir} "
-          f"(variant={args.variant})\n")
+          f"(system_prompt={'set' if args.system_prompt else 'empty'})\n")
 
     results = []
     for benchmark in args.benchmarks:
         df = LOADERS[benchmark]()
-        df["prompt"] = [create_prompt(q, system_prompt) for q in df["problem"]]
+        df["prompt"] = [create_prompt(q, args.system_prompt) for q in df["problem"]]
         out_df = df[["prompt", "answer", "solution", "split", "index"]]
 
         if out_df["prompt"].isnull().any() or out_df["solution"].isnull().any():
             raise ValueError(f"{benchmark}: null values in 'prompt' or 'solution'")
 
-        out_path = os.path.join(args.local_dir, f"{benchmark}_test.parquet")
+        out_path = os.path.join(args.local_dir, create_file_name(benchmark))
         out_df.to_parquet(out_path)
 
         # round-trip check to catch any parquet-write/schema bug

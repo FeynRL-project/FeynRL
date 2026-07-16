@@ -76,31 +76,26 @@ if __name__ == "__main__":
     # load dataset from huggingface
     ########
     dataset = datasets.load_dataset(args.data_source, "main")
-    # split train into train and val
+    # Keep training prep isolated to the HF train shard. The Shared Evaluation
+    # Protocol consumes the HF test shard separately via shared_eval_benchmarks.py.
     train_val_split = dataset["train"].train_test_split(test_size=args.val_ratio, seed=args.seed)
     train_dataset = train_val_split["train"]
     val_dataset   = train_val_split["test"]
-    # load test dataset
-    test_dataset  = dataset["test"]
 
     ########
     # map dataset
     ########
     train_dataset = train_dataset.map(function=make_map_fn("train", params=args), with_indices=True, num_proc=args.num_proc)
     val_dataset = val_dataset.map(function=make_map_fn("val", params=args), with_indices=True, num_proc=args.num_proc)
-    test_dataset = test_dataset.map(function=make_map_fn("test", params=args), with_indices=True, num_proc=args.num_proc)
 
     ########
     # save dataset
     ########
     train_file_name = os.path.join(args.local_dir, create_file_name(args, "train"))
     val_file_name   = os.path.join(args.local_dir, create_file_name(args, "val"))
-    test_file_name  = os.path.join(args.local_dir, create_file_name(args, "test"))
     train_dataset.to_parquet(train_file_name)
     val_dataset.to_parquet(val_file_name)
-    test_dataset.to_parquet(test_file_name)
 
     print("\n")
     print(f"Train file: {train_file_name} with {len(train_dataset)} examples.")
     print(f"Val file: {val_file_name} with {len(val_dataset)} examples.")
-    print(f"Test file: {test_file_name} with {len(test_dataset)} examples.")

@@ -1,10 +1,15 @@
+# Base config for the Shared Evaluation Protocol (see README.md).
+# run_shared_eval.sh renders one of these per benchmark, substituting the
+# __TOKENS__ below, and passes the result to main_eval.py --config_file.
+# Not meant to be used directly with main_eval.py.
+
 run:
-  experiment_id: "framework_comparison_feynrl_{benchmark}"
+  experiment_id: "__EXPERIMENT_ID__"
   project_name: "feynrl-eval"
   logger_type: "mlflow"
   tracking_uri: ""
-  checkpoint_dir: "./ckps/eval/{benchmark}"
-  rollout_gpus: 8
+  checkpoint_dir: "__CHECKPOINT_DIR__"
+  rollout_gpus: __ROLLOUT_GPUS__
   seed: 42
   ray_address: null
 
@@ -14,7 +19,7 @@ reward:
 
 rollout:
   temperature: 1.0
-  max_tokens: 4069
+  max_tokens: 4096
   n_samples: 16
   top_p: 0.95
   top_k: -1
@@ -30,12 +35,12 @@ rollout:
   max_model_len: 8192
 
 model:
-  name: "./ckps/qwen2.5-1.5b-instruct/checkpoint"
+  name: "__MODEL_NAME__"
   dtype: "bfloat16"
   trust_remote_code: False
 
 data:
-  test_files_path: "./data/{benchmark}_test.parquet"
+  test_files_path: "__TEST_FILE__"
   num_workers: 8
   max_seq_len: 8192
   prompt_key: "prompt"

@@ -1,0 +1,48 @@
+# Base config for the Shared Evaluation Protocol (see README.md).
+# run_shared_eval.sh renders one of these per benchmark, substituting the
+# __TOKENS__ below, and passes the result to main_eval.py --config_file.
+# Not meant to be used directly with main_eval.py.
+
+run:
+  experiment_id: "__EXPERIMENT_ID__"
+  project_name: "feynrl-eval"
+  logger_type: "mlflow"
+  tracking_uri: ""
+  checkpoint_dir: "__CHECKPOINT_DIR__"
+  rollout_gpus: __ROLLOUT_GPUS__
+  seed: 42
+  ray_address: null
+
+reward:
+  broadcast: False
+  reward_func: math_verify_reward_func
+
+rollout:
+  temperature: 1.0
+  max_tokens: 4096
+  n_samples: 16
+  top_p: 0.95
+  top_k: -1
+  ignore_eos: False
+  stop: ""
+  gpu_memory_utilization: 0.9
+  stop_token_ids: []
+  prompt_logprobs: False
+  force_strict_on_policy: False
+  tensor_parallel_size: 1
+  rollout_batch_size_per_gpu: 16
+  batch_invariant: True
+  max_model_len: 8192
+
+model:
+  name: "__MODEL_NAME__"
+  dtype: "bfloat16"
+  trust_remote_code: False
+
+data:
+  test_files_path: "__TEST_FILE__"
+  num_workers: 8
+  max_seq_len: 8192
+  prompt_key: "prompt"
+  answer_key: "answer"
+  solution_key: "solution"

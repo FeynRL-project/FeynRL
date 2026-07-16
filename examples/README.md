@@ -13,9 +13,10 @@ examples/
 │   │   └── gsm8k/
 │   │       └── gemma-2-2b-it/                       # SFT on GSM8K
 │   └── rl/
+│       ├── deepscaler/
+│       │   └── qwen3-4b-thinking-2507/              # GRPO on DeepScaler
 │       └── gsm8k/
-│           ├── qwen2.5-1.5b-instruct/               # GRPO on GSM8K
-│           └── qwen3-4b-thinking-2507/              # GRPO on DeepScaler
+│           └── qwen2.5-1.5b-instruct/               # GRPO on GSM8K
 ├── vlm/                                             # Visual language models (image + text)
 │   ├── sft/
 │   │   ├── mm_math/

@@ -77,8 +77,7 @@ def load_aime_2026():
 
 
 def load_amc():
-    # AI-MO/aimo-validation-amc no longer carries 2024 problems; rawsh/2024_AMC12
-    # is the 2024 AMC 12A+12B set the "amc" benchmark actually targets.
+    # Shared eval uses the 2024 AMC 12A+12B benchmark from this dataset card.
     df = datasets.load_dataset("rawsh/2024_AMC12")["train"].to_pandas()
     return finalize(df["problem"], [clean_answer(a) for a in df["answer"]])
 

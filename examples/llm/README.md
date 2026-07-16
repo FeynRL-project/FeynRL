@@ -15,9 +15,10 @@ llm/
 │   └── gsm8k/
 │       └── gemma-2-2b-it/              # SFT on GSM8K with Gemma-2-2B-it
 ├── rl/
+│   ├── deepscaler/
+│   │   └── qwen3-4b-thinking-2507/     # GRPO on DeepScaler with Qwen3-4B-Thinking-2507
 │   └── gsm8k/
-│       ├── qwen2.5-1.5b-instruct/      # GRPO on GSM8K with Qwen2.5-1.5B-Instruct
-│       └── qwen3-4b-thinking-2507/     # GRPO on DeepScaler with Qwen3-4B-Thinking-2507
+│       └── qwen2.5-1.5b-instruct/      # GRPO on GSM8K with Qwen2.5-1.5B-Instruct
 └── README.md
 ```
 
@@ -210,8 +211,8 @@ At 1 hour, the sync run reaches **0.894** reward and the async run reaches **0.8
 | Model                   | `Qwen/Qwen3-4B-Thinking-2507`                                                                              |
 | Training dataset        | [DeepScaler](https://huggingface.co/datasets/agentica-org/DeepScaleR-Preview-Dataset)                      |
 | GPU split               | 4 training GPUs / 4 rollout GPUs                                                                           |
-| Sync training config    | [`rl/gsm8k/qwen3-4b-thinking-2507/train_sync.yaml`](rl/gsm8k/qwen3-4b-thinking-2507/train_sync.yaml)     |
-| Async training config   | [`rl/gsm8k/qwen3-4b-thinking-2507/train_async.yaml`](rl/gsm8k/qwen3-4b-thinking-2507/train_async.yaml)   |
+| Sync training config    | [`rl/deepscaler/qwen3-4b-thinking-2507/train_sync.yaml`](rl/deepscaler/qwen3-4b-thinking-2507/train_sync.yaml) |
+| Async training config   | [`rl/deepscaler/qwen3-4b-thinking-2507/train_async.yaml`](rl/deepscaler/qwen3-4b-thinking-2507/train_async.yaml) |
 
 Data: prepared via [`data_prep/deepscaler.py`](#deepscaler) above.
 
@@ -219,15 +220,15 @@ Data: prepared via [`data_prep/deepscaler.py`](#deepscaler) above.
 
 ```bash
 # Synchronous (no overlap)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_sync.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/deepscaler/qwen3-4b-thinking-2507/train_sync.yaml --experiment_id EXPNAME
 
 # Asynchronous (with overlap)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/gsm8k/qwen3-4b-thinking-2507/train_async.yaml --experiment_id EXPNAME
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python main_rl.py --config examples/llm/rl/deepscaler/qwen3-4b-thinking-2507/train_async.yaml --experiment_id EXPNAME
 ```
 
 The reward curves below overlay the sync and async runs over the first 8 hours of wall-clock training time.
 
-![FeynRL Qwen3 reward curve](rl/gsm8k/qwen3-4b-thinking-2507/feynrl_reward_curve_qwen3.png)
+![FeynRL Qwen3 reward curve](rl/deepscaler/qwen3-4b-thinking-2507/feynrl_reward_curve_qwen3.png)
 
 At 8 hours, the sync run is at **0.526** reward and the async run is at **0.584**.
 

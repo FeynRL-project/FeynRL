@@ -4,22 +4,6 @@ import re
 import datasets
 import pandas as pd
 
-# Keys match the "Shared Evaluation Protocol" table in examples/llm/README.md.
-# Each benchmark has a fixed HuggingFace source, so it's hard-coded in the
-# LOADERS table below rather than taken as a CLI argument.
-BENCHMARKS = [
-    "gsm8k",
-    "aime_2024",
-    "aime_2025",
-    "aime_2026",
-    "amc",
-    "amo_bench",
-    "brumo_2025",
-    "hmmt_feb_25",
-    "hmmt_nov_25",
-    "olympiad",
-]
-
 def create_prompt(question, system_prompt):
     '''
        This creates general message with or without system prompt.
@@ -130,18 +114,26 @@ def load_olympiad():
     return finalize(df["question"], solutions)
 
 
-LOADERS = {
-    "gsm8k": load_gsm8k,
-    "aime_2024": load_aime_2024,
-    "aime_2025": load_aime_2025,
-    "aime_2026": load_aime_2026,
-    "amc": load_amc,
-    "amo_bench": load_amo_bench,
-    "brumo_2025": load_brumo_2025,
-    "hmmt_feb_25": load_hmmt_feb_25,
-    "hmmt_nov_25": load_hmmt_nov_25,
-    "olympiad": load_olympiad,
-}
+def get_loaders():
+    # Keys match the "Shared Evaluation Protocol" table in examples/llm/README.md.
+    # Each benchmark has a fixed HuggingFace source, so the mapping is kept here
+    # rather than exposed as a free-form CLI argument.
+    return {
+        "gsm8k": load_gsm8k,
+        "aime_2024": load_aime_2024,
+        "aime_2025": load_aime_2025,
+        "aime_2026": load_aime_2026,
+        "amc": load_amc,
+        "amo_bench": load_amo_bench,
+        "brumo_2025": load_brumo_2025,
+        "hmmt_feb_25": load_hmmt_feb_25,
+        "hmmt_nov_25": load_hmmt_nov_25,
+        "olympiad": load_olympiad,
+    }
+
+
+def get_benchmarks():
+    return list(get_loaders().keys())
 
 
 def create_file_name(benchmark):
@@ -149,6 +141,8 @@ def create_file_name(benchmark):
 
 
 if __name__ == "__main__":
+    benchmarks = get_benchmarks()
+    loaders = get_loaders()
     parser = argparse.ArgumentParser(description="Downloads and packs the 10 Shared Evaluation "
                                                   "Protocol benchmarks (examples/llm/README.md) "
                                                   "directly from HuggingFace into --local_dir.")
@@ -156,7 +150,7 @@ if __name__ == "__main__":
                         help="Output directory for the packed {benchmark}_test.parquet files.")
     parser.add_argument("--system_prompt", default="",
                         help="Optional system prompt prepended to every packed prompt.")
-    parser.add_argument("--benchmarks", nargs="+", default=BENCHMARKS, choices=BENCHMARKS,
+    parser.add_argument("--benchmarks", nargs="+", default=benchmarks, choices=benchmarks,
                         help="Subset of benchmarks to pack (default: all 10).")
     args = parser.parse_args()
 
@@ -167,7 +161,7 @@ if __name__ == "__main__":
 
     results = []
     for benchmark in args.benchmarks:
-        df = LOADERS[benchmark]()
+        df = loaders[benchmark]()
         df["prompt"] = [create_prompt(q, args.system_prompt) for q in df["problem"]]
         out_df = df[["prompt", "answer", "solution", "split", "index"]]
 

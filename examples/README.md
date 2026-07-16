@@ -9,6 +9,9 @@ A curated set of FeynRL experiments organized by model type, algorithm, and data
 ```text
 examples/
 ├── llm/                                              # Text-only language models
+│   ├── eval/
+│   │   ├── eval_shared_base.yaml                    # Shared LLM evaluation config
+│   │   └── run_shared_eval.sh                       # Shared LLM evaluation runner
 │   ├── sft/
 │   │   └── gsm8k/
 │   │       └── gemma-2-2b-it/                       # SFT on GSM8K

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs the Shared Evaluation Protocol (see README.md) across all 10 benchmarks
-# in sequence, reusing one base config (eval/eval_shared_base.yaml) for model/rollout
-# params and swapping in each benchmark's test file and checkpoint dir.
+# by default, or across a caller-provided subset via --benchmarks, reusing one
+# base config (eval/eval_shared_base.yaml) for model/rollout params and
+# swapping in each benchmark's test file and checkpoint dir.
 #
 # Prereq: python data_prep/shared_eval_benchmarks.py --local_dir ./data [--run_id ...] [--system_prompt "..."]
 #         (produces ./data/<benchmark>_processed_<run_id>_{ns|wsp}_test.parquet -- see README's Data Preparation section)
@@ -10,6 +11,12 @@
 #   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./examples/llm/eval/run_shared_eval.sh \
 #       --model ./ckps/qwen2.5-1.5b-instruct/checkpoint \
 #       --experiment_id my_run
+#
+# To run only a subset:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./examples/llm/eval/run_shared_eval.sh \
+#       --model ./ckps/qwen2.5-1.5b-instruct/checkpoint \
+#       --experiment_id my_run \
+#       --benchmarks gsm8k aime_2024 olympiad
 #
 # Results land under ./ckps/eval/<experiment_id>/<benchmark>/rollout_stats.json
 

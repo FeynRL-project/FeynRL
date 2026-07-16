@@ -50,7 +50,7 @@ Downloads each of the 10 benchmarks above directly from its HuggingFace dataset 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./examples/llm/eval/run_shared_eval.sh --model <path_or_hf_id> --experiment_id EXPNAME --data_run_id 123245 --data_variant ns
 ```
 
-Runs `main_eval.py` once per benchmark in sequence against [`eval/eval_shared_base.yaml`](eval/eval_shared_base.yaml) — a single base config (n_samples=16, temperature=1.0, matching the protocol above) shared across all 10 runs, with only the model, test file, and checkpoint dir swapped per benchmark. Each benchmark's `rollout_stats.json` (containing pass@1..pass@16) lands under `./ckps/eval/EXPNAME/{benchmark}/`. Requires `./data/{benchmark}_processed_{run_id}_{ns|wsp}_test.parquet` for each benchmark (see Data Preparation above), matched via `--data_run_id` and `--data_variant`.
+Runs `main_eval.py` once per benchmark in sequence against [`eval/eval_shared_base.yaml`](eval/eval_shared_base.yaml) — a single base config (n_samples=16, temperature=1.0, matching the protocol above) shared across all 10 runs, with only the model, test file, and checkpoint dir swapped per benchmark. Each benchmark's `rollout_stats.json` (containing pass@1..pass@16) lands under `./ckps/eval/EXPNAME/{benchmark}/`. Requires `./data/{benchmark}_processed_{run_id}_{ns|wsp}_test.parquet` for each benchmark (see Data Preparation above), matched via `--data_run_id` and `--data_variant`. Pass `--benchmarks gsm8k aime_2024 ...` to evaluate only a subset instead of all 10.
 
 A slurm equivalent is available at [`scripts/slurm/launch_shared_eval.sh`](../../scripts/slurm/launch_shared_eval.sh): `sbatch scripts/slurm/launch_shared_eval.sh --model <path_or_hf_id> --experiment_id EXPNAME`.
 

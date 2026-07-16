@@ -30,9 +30,22 @@ DATA_VARIANT="ns"
 CHECKPOINT_ROOT="./ckps/eval"
 
 usage() {
-    echo "Usage: $0 --model <path_or_hf_id> [--experiment_id NAME] [--rollout_gpus N] [--data_dir DIR] [--data_run_id ID] [--data_variant ns|wsp] [--checkpoint_root DIR]"
+    echo "Usage: $0 --model <path_or_hf_id> [--experiment_id NAME] [--rollout_gpus N] [--data_dir DIR] [--data_run_id ID] [--data_variant ns|wsp] [--checkpoint_root DIR] [--benchmarks BENCHMARK [BENCHMARK ...]]"
     exit 1
 }
+
+is_valid_benchmark() {
+    local candidate="$1"
+    local benchmark
+    for benchmark in "${BENCHMARKS[@]}"; do
+        if [[ "$benchmark" == "$candidate" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+SELECTED_BENCHMARKS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,6 +56,17 @@ while [[ $# -gt 0 ]]; do
         --data_run_id) DATA_RUN_ID="$2"; shift 2 ;;
         --data_variant) DATA_VARIANT="$2"; shift 2 ;;
         --checkpoint_root) CHECKPOINT_ROOT="$2"; shift 2 ;;
+        --benchmarks)
+            shift
+            while [[ $# -gt 0 && "$1" != --* ]]; do
+                is_valid_benchmark "$1" || {
+                    echo "Unknown benchmark: $1" >&2
+                    usage
+                }
+                SELECTED_BENCHMARKS+=("$1")
+                shift
+            done
+            ;;
         -h|--help) usage ;;
         *) echo "Unknown argument: $1"; usage ;;
     esac
@@ -50,13 +74,14 @@ done
 
 [[ -z "$MODEL" ]] && usage
 [[ "$DATA_VARIANT" != "ns" && "$DATA_VARIANT" != "wsp" ]] && usage
+[[ ${#SELECTED_BENCHMARKS[@]} -eq 0 ]] && SELECTED_BENCHMARKS=("${BENCHMARKS[@]}")
 
 cd "$REPO_ROOT"
 
 TMP_CONFIG_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_CONFIG_DIR"' EXIT
 
-for benchmark in "${BENCHMARKS[@]}"; do
+for benchmark in "${SELECTED_BENCHMARKS[@]}"; do
     test_file="${DATA_DIR}/${benchmark}_processed_${DATA_RUN_ID}_${DATA_VARIANT}_test.parquet"
     if [[ ! -f "$test_file" ]]; then
         echo "[SKIP] $benchmark: missing $test_file (run data_prep/shared_eval_benchmarks.py first)" >&2

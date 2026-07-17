@@ -87,13 +87,24 @@ python -m pip install vllm==0.19.1
 
 ---
 
-## Step 6: Verify the Environment
+## Step 6: Install `flash-attn`
+
+Install the matching wheel explicitly:
+
+```bash
+python -m pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+```
+
+---
+
+## Step 7: Verify the Environment
 
 Verify the final stack:
 
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
 python -c "import vllm; print(vllm.__version__)"
+python -c "import flash_attn; print(flash_attn.__version__)"
 python -c "import transformers; print(transformers.__version__)"
 python -c "import deepspeed; print(deepspeed.__version__)"
 python -c "import peft; print(peft.__version__)"
@@ -117,7 +128,7 @@ python -c "import algs.RL.common; print('algs.RL.common import OK')"
 
 ---
 
-## Step 7: Authenticate with Hugging Face and Weights & Biases
+## Step 8: Authenticate with Hugging Face and Weights & Biases
 
 Many models (e.g. Llama, Gemma) require accepting a license on the Hugging Face Hub before you can download them. Log in so you can access gated models for training and evaluation:
 

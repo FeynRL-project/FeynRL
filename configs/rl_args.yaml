@@ -52,7 +52,7 @@ train:
   ###############
   # optimizer related arguments
   ###############
-  alg_name: "grpo" # options: grpo, cispo, ppo
+  alg_name: "grpo" # options: grpo, dapo, cispo, p3o, ppo
 
   # The optimizer related arguments will be automatically copied to deepspeed config or others
   # distributed training frameworks. this way make it easier to handle them in one place and avoid any duplication.
@@ -107,6 +107,8 @@ train:
   normalize_loss: True
 
 reward:
+  # If True, every response token receives the sequence-level (group-relative) advantage.
+  # Required True for alg_name=dapo: its token-level loss needs the advantage on all tokens.
   broadcast: False
   reward_func: dummy_reward_func
 
@@ -139,6 +141,13 @@ rollout:
   # Sync engine only and only "fp8".
   quantization: null
   max_images_per_prompt: null
+
+  # DAPO dynamic sampling drops samples from prompt-groups
+  # whose completions all received the same reward (zero advantage for every token)
+  dynamic_sampling: null
+  # DAPO soft overlong punishment
+  overlong_buffer_tokens: 0
+  overlong_penalty_factor: 1.0
 
 model:
   name: "google/gemma-3-1b-it"

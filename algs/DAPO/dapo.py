@@ -11,7 +11,7 @@ import random
 from algs.RL.common import COMMON
 
 @ray.remote
-class GRPO(COMMON):
+class DAPO(COMMON):
     def __init__(self,
                  model_path: str,
                  model_dtype: torch.dtype,

@@ -17,6 +17,7 @@ import misc.rollout_stats as rollout_stats
 
 Algorithm_Registry = {# supported algorithms
                       'grpo':  ('algs.GRPO.grpo', 'GRPO'),
+                      'dapo':  ('algs.DAPO.dapo', 'DAPO'),
                       'cispo': ('algs.CISPO.cispo', 'CISPO'),
                       'p3o':   ('algs.P3O.p3o', 'P3O'),
                       'ppo':   ('algs.PPO.ppo', 'PPO'),

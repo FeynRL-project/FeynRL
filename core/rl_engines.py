@@ -177,8 +177,12 @@ def create_rollout_engines(params, reward_fnc, eos_id):
                                                          ).remote(**kwargs))
 
         else:
-            # quantization is sync-engine-only (the async engine doesn't accept it).
-            sync_kwargs = {**kwargs, "quantization": params.rollout.quantization}
+            # quantization and the DAPO overlong penalty are sync-engine-only
+            # (the async engine doesn't accept them).
+            sync_kwargs = {**kwargs,
+                           "quantization": params.rollout.quantization,
+                           "overlong_buffer_tokens": params.rollout.overlong_buffer_tokens,
+                           "overlong_penalty_factor": params.rollout.overlong_penalty_factor}
             engines.append(VLLMRolloutEngine.options(num_gpus=tp,
                                                     runtime_env={"env_vars": rollout_env_vars}
                                                     ).remote(**sync_kwargs))
@@ -402,6 +406,17 @@ def collect_rollouts(dataloader,
 
         # 5. now add them to replay buffer
         replay_buffer.add_batch_seqs(rollout_merged)
+
+    # DAPO dynamic sampling fallback: if every prompt-group of this epoch was
+    # degenerate (all completions got the same reward), everything was dropped
+    # and the buffer is empty. Restore the dropped samples (gradient ~0) so
+    # training can continue instead of crashing below.
+    if len(replay_buffer) == 0 and getattr(replay_buffer, 'drop_zero_advantage_groups', False):
+        restored = replay_buffer.restore_zero_advantage_spill()
+        if restored > 0:
+            logger.warning(f"[dynamic_sampling] replay buffer was empty after dropping "
+                           f"{replay_buffer.zero_adv_dropped} zero-advantage samples; "
+                           f"restored {restored} of them to keep training alive")
 
     if len(replay_buffer) == 0:
         raise ValueError("Replay buffer is empty")

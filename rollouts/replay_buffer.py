@@ -20,6 +20,7 @@ class ReplayBuffer(Dataset):
                 max_seq_len: int,
                 max_size: Optional[int] = None,
                 processor=None,
+                drop_zero_advantage_groups: bool = False,
                 ):
 
         if max_size is not None:
@@ -31,6 +32,16 @@ class ReplayBuffer(Dataset):
         self.max_size = max_size
         self.pad_token_id = int(pad_token_id)
         self.max_seq_len  = int(max_seq_len)
+        # DAPO dynamic sampling: when True,
+        # samples whose prompt-group got the same reward on every completion
+        # are not added. They carry no policy-gradient signal but would still dilute the
+        # global token denominator when normalize_loss=True.
+        self.drop_zero_advantage_groups = bool(drop_zero_advantage_groups)
+        # per-epoch counters (cleared in reset) and a spill of the dropped samples,
+        # kept only while the buffer is empty (see restore_zero_advantage_spill).
+        self.zero_adv_dropped = 0
+        self.zero_adv_restored = 0
+        self.zero_adv_spill: List[Dict[str, Any]] = []
         # VLM only: multimodal processor. When set, collate_fn reprocesses each item's
         # stored raw image(s) into the model's vision tensors (pixel_values, image_grid_thw)
         # so the training forward can recompute logprobs over the image tokens. None for llm.
@@ -74,6 +85,15 @@ class ReplayBuffer(Dataset):
             if sample["response_len"] == 0:
                 continue
 
+            # DAPO dynamic sampling: skip degenerate prompt-groups (flagged in
+            # Base.normalize_rewards when every completion of a prompt got the
+            # same reward). Default False: samples that never went through
+            # normalize_rewards must not be silently dropped.
+            if self.drop_zero_advantage_groups and sample.get("degenerate_prompt_groups", False):
+                self.zero_adv_dropped += 1
+                self.zero_adv_spill.append(sample)
+                continue
+
             seq_len = sample["input_ids"].numel()
             # samples which are longer than max_seq_len are truncated,
             # otherwise there would be issuues with done, reward, mask, etc.
@@ -95,6 +115,36 @@ class ReplayBuffer(Dataset):
             print(f"[ReplayBuffer] {truncated_count}/{len(samples)} sequences truncated "
                   f"from prompt+response to max_seq_len={self.max_seq_len}. "
                   f"Consider reducing rollout max_tokens in rollouts or increasing max_seq_len in data configs.")
+
+        # The spill only exists as a fallback against an all-degenerate epoch;
+        # once the buffer holds real samples it can be discarded to bound memory.
+        if self.zero_adv_spill and len(self) > 0:
+            self.zero_adv_spill = []
+
+    def restore_zero_advantage_spill(self) -> int:
+        '''
+            Fallback for DAPO dynamic sampling: if every group of an epoch was
+            degenerate, the buffer would be empty and the training step would
+            crash. Re-add the dropped samples instead (their gradient is ~0).
+            Returns the number of restored samples.
+        '''
+        spill = self.zero_adv_spill
+        self.zero_adv_spill = []
+        if not spill:
+            return 0
+
+        before = len(self)
+        self.drop_zero_advantage_groups = False
+        try:
+            self.add_batch_seqs(spill)
+
+        finally:
+            self.drop_zero_advantage_groups = True
+
+        # add_batch_seqs may still skip over-length sequences, so count what
+        # actually landed in the buffer rather than assuming len(spill).
+        self.zero_adv_restored = len(self) - before
+        return self.zero_adv_restored
 
     def add(self,
             input_ids: torch.Tensor,
@@ -268,6 +318,9 @@ class ReplayBuffer(Dataset):
         else:
             self.items = []
         self.total_action_tokens = 0
+        self.zero_adv_dropped = 0
+        self.zero_adv_restored = 0
+        self.zero_adv_spill = []
 
     def evict_stale(self, min_version: int) -> int:
         '''

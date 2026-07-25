@@ -118,6 +118,19 @@ class Base:
 
         return self.sanitize_logprobs(token_logprobs=token_logprobs)
 
+    def compute_overlong_penalty(self, response_len: int) -> float:
+        '''
+            DAPO soft overlong punishment (https://arxiv.org/abs/2503.14476):
+            0 for response_len <= max_tokens - overlong_buffer_tokens, then a
+            linear penalty reaching -overlong_penalty_factor at response_len ==
+            max_tokens (which is also what truncated responses receive).
+        '''
+        exceed = response_len - (self.max_tokens - self.overlong_buffer_tokens)
+        if exceed <= 0:
+            return 0.0
+
+        return -self.overlong_penalty_factor * min(exceed / self.overlong_buffer_tokens, 1.0)
+
     def normalize_rewards(self,
                           samples: List[Dict[str, Any]],
                           stats: Dict[str, List[int]],
@@ -128,9 +141,19 @@ class Base:
             samples: list of different responses for a given prompt e.g., [{"prompt_ids": [...], "response_ids": [...],...}, ...]
             stats: {"reward": [...], "length": [...]} or {"reward": [...], "length": [...], "reward": [...], "length": [...]} if reward_broadcast is True
          '''
+        # DAPO soft overlong punishment. Applied to the training signal only
+        # (token_rewards/pred_rewards and the zscores derived below); the raw
+        # stats['rewards'] list is left untouched so pass@k metrics keep
+        # reflecting verifier correctness.
+        penalties = [0.0] * len(samples)
+        if self.overlong_buffer_tokens > 0:
+            penalties = [self.compute_overlong_penalty(length) for length in stats['lengths']]
+
+        rewards_for_norm = [r + p for r, p in zip(stats['rewards'], penalties)]
+
         denom = len(samples) # number of samples in the group
         if len(samples) > 1:
-            rewards_array = np.array(stats['rewards'])
+            rewards_array = np.array(rewards_for_norm)
             mean_scores = rewards_array.sum() / denom
             # Bessel's correction (n-1) for unbiased sample std with small n_samples
             std_scores  = np.sqrt(((rewards_array - mean_scores)**2).sum() / max(denom - 1, 1))
@@ -144,10 +167,24 @@ class Base:
         if is_per_token:
             raise ValueError("per token rewards are not supported yet as normalization is done assuming per response rewards")
 
+        rewards_set = set()
         # now update the rewards in the samples
         for i, sample in enumerate(samples):
+            # Fold the overlong penalty into the stored training rewards so the
+            # zscore below and any reward-consuming trainer see the shaped signal.
+            # The last valid pred-aligned position is seq_len - 2 (it predicts the final response token).
+            # The penalty is also stamped on the sample so consumers that need verifier correctness 
+            # can subtract it back out.
+            if penalties[i] != 0.0:
+                sample['token_rewards'][-1] += penalties[i]
+                sample['pred_rewards'][-2]  += penalties[i]
+                sample['overlong_penalty']   = float(penalties[i])
+
             # sample['reward']: [T] where prompt tokens would get 0
             # sample['reward'][-1]: means the last token reward
+            # .item() is required: 0-dim tensors hash by object id, not value,
+            # so a set of tensors would never collapse equal rewards into one entry.
+            rewards_set.add(sample['token_rewards'][-1].item())
             zscore = torch.zeros_like(sample['token_rewards'], dtype=torch.float)
             zscore[-1] = (sample['token_rewards'][-1] - mean_scores) / (std_scores + 1e-8)
             sample["token_zscores"] = zscore
@@ -161,6 +198,15 @@ class Base:
             pred_end   = len(sample['token_zscores']) - 1
             pred_zscores[pred_start:pred_end] = sample["token_zscores"][prompt_len:]
             sample["pred_zscores"] = pred_zscores
+
+        # if all rewards are same, set a flag
+        if len(samples) > 1 and len(rewards_set) == 1:
+            for sample in samples:
+                sample["degenerate_prompt_groups"] = True
+
+        else:
+            for sample in samples:
+                sample["degenerate_prompt_groups"] = False
 
     def score_response(self, prompt: Dict[str, Any], response: Any) -> torch.Tensor:
         '''

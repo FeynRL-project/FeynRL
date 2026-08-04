@@ -46,6 +46,29 @@ def run_epoch_sync(epoch, training_engines, rollout_engines, rollout_dataloader,
                                        logger=logger,
                                        rollout_timeout=rollout_timeout)
 
+    # 2b. DAPO dynamic sampling bookkeeping. The drop itself happens inside the
+    # replay buffer's add_batch_seqs; the all-degenerate-epoch fallback (restore
+    # the dropped samples instead of crashing on an empty buffer) happens inside
+    # collect_rollouts, BEFORE its empty-buffer check. Here we only report.
+    if replay_buffer.drop_zero_advantage_groups:
+        dropped  = replay_buffer.zero_adv_dropped
+        restored = replay_buffer.zero_adv_restored
+        # non-degenerate samples kept (restored ones are back in the buffer but
+        # carry ~0 gradient, so they don't count as useful signal)
+        kept = len(replay_buffer) - restored
+        if restored > 0:
+            logger.warning(f"[dynamic_sampling] all {dropped} samples this epoch came from zero-advantage "
+                           f"groups; {restored} were restored to avoid an empty replay buffer (gradient will be ~0)")
+
+        else:
+            logger.info(f"[dynamic_sampling] dropped {dropped} samples from zero-advantage groups, kept {kept}")
+
+        rollout_metrics['dynamic_sampling_dropped']   = dropped
+        rollout_metrics['dynamic_sampling_restored']  = restored
+        rollout_metrics['dynamic_sampling_kept']      = kept
+        rollout_metrics['dynamic_sampling_drop_rate'] = dropped / max(dropped + kept, 1)
+
+
     # 3. Prepare training batches
     logger.info(f"[Epoch {epoch+1}] Replay buffer has {len(replay_buffer)} samples")
     train_start_time = time.time()
@@ -234,10 +257,22 @@ def main(args, config):
     logger.info(f"Rollout dataloader with {len(rollout_dataloader)} batches/machine, "
                 f"n_samples={config.rollout.n_samples} per prompt")
 
+    # DAPO dynamic sampling: the replay buffer drops samples from prompt-groups
+    # whose completions all received the same reward (zero advantage).
+    dynamic_sampling = config.rollout.dynamic_sampling
+    if dynamic_sampling is None:
+        dynamic_sampling = (config.train.alg_name.lower() == 'dapo')
+
+    if dynamic_sampling:
+        logger.info(f"[dynamic_sampling] Enabled: zero-advantage prompt-groups are dropped "
+                    f"by the replay buffer (n_samples={config.rollout.n_samples})")
+
+
     # replay buffer size = rollout_samples_per_epoch (prompts) * n_samples (completions per prompt)
     replay_buffer = ReplayBuffer(pad_token_id=tokenizer.pad_token_id,
                                  max_seq_len=config.data.max_seq_len,
                                  processor=processor,
+                                 drop_zero_advantage_groups=dynamic_sampling,
                                  )
     logger.info(f"Replay buffer initialized (max_seq_len={config.data.max_seq_len})")
 
@@ -383,6 +418,16 @@ def main(args, config):
                     f"mean_logprob={rollout_metrics['mean_logprob']:.4f}, "
                     f"unique_response_ratio={rollout_metrics['unique_response_ratio']:.4f}, "
                     f"{time_str}, tps={rollout_metrics['tokens_per_sec']:.2f}")
+
+        # DAPO overlong punishment interaction: samples with prompt+response > max_seq_len
+        # are dropped by the replay buffer, so a truncated-at-max_tokens response gets its
+        # penalty folded into the group baseline but never receives the negative gradient
+        # itself. Warn loudly, since these are exactly the samples the penalty targets.
+        if config.rollout.overlong_buffer_tokens > 0 and rollout_metrics.get('seq_truncated_ratio', 0.0) > 0.0:
+            logger.warning(f"[Epoch {epoch+1}] [overlong_penalty] {rollout_metrics['seq_truncated_ratio']:.2%} of "
+                           f"samples exceed data.max_seq_len and are dropped before training; their overlong "
+                           f"penalty only shifts the group baseline. Increase data.max_seq_len "
+                           f"(>= longest prompt + rollout.max_tokens) or reduce rollout.max_tokens.")
 
         if tracker:
             rollout_log = {"rollout/" + k: v for k, v in rollout_metrics.items()}

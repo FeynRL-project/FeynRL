@@ -41,6 +41,8 @@ class VLLMRolloutEngine(Base):
                  quantization: Optional[str] = None,
                  model_class: str = "llm",
                  max_images_per_prompt: int | None = None,
+                 overlong_buffer_tokens: int = 0,
+                 overlong_penalty_factor: float = 1.0,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -98,6 +100,10 @@ class VLLMRolloutEngine(Base):
 
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
+
+        # DAPO soft overlong punishment (0 = disabled); see Base.compute_overlong_penalty.
+        self.overlong_buffer_tokens  = int(overlong_buffer_tokens)
+        self.overlong_penalty_factor = float(overlong_penalty_factor)
 
     def log(self, msg: str) -> None:
         '''

@@ -285,6 +285,15 @@ class Rollout(BaseModel):
     # Must be >= the largest image count any sample carries, or vLLM rejects the prompt.
     # None means default to 1. Ignored for llm.
     max_images_per_prompt: int | None = None
+    # DAPO dynamic sampling drops samples from prompt-groups whose completions
+    # all received the same reward (zero advantage for every token).
+    # None = auto: enabled when train.alg_name is dapo, disabled otherwise.
+    dynamic_sampling: bool | None = None
+    # DAPO soft overlong punishment: linear reward penalty on responses that enter
+    # the last overlong_buffer_tokens of the generation budget (max_tokens),
+    # reaching -overlong_penalty_factor at max_tokens. 0 = disabled.
+    overlong_buffer_tokens: int = 0
+    overlong_penalty_factor: float = 1.0
 
 class Config(BaseModel):
     '''
@@ -819,6 +828,63 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                 if config.train.alg_name != "p3o" and config.overlap.behave_imp_weight_cap is not None and config.overlap.behave_imp_weight_cap <= 1.0:
                     raise ValueError(f"overlap.behave_imp_weight_cap must be > 1.0 when set, got {config.overlap.behave_imp_weight_cap}")
 
+            # DAPO validation
+            if config.train.alg_name.lower() == "dapo":
+                if config.overlap and config.overlap.enabled:
+                    raise ValueError("DAPO is only supported on the sync engine for now: "
+                                     "set overlap.enabled=False when alg_name='dapo'")
+
+                if not config.train.normalize_loss:
+                    raise ValueError("DAPO uses a token-level policy-gradient loss: "
+                                     "train.normalize_loss must be True when alg_name='dapo'")
+
+                if not config.reward.broadcast:
+                    raise ValueError("DAPO assigns the group-relative advantage to EVERY response "
+                                     "token (token-level loss). With reward.broadcast=False only the "
+                                     "terminal prediction position carries advantage and all other "
+                                     "tokens contribute zero gradient while still diluting the token "
+                                     "denominator. Set reward.broadcast=True when alg_name='dapo'")
+
+            # Resolve dynamic sampling the same way run_rl_sync does (None = auto:
+            # enabled for dapo, which the check above guarantees runs on the sync
+            # engine) so auto-enabling is validated too.
+            dynamic_sampling = config.rollout.dynamic_sampling
+            if dynamic_sampling is None:
+                dynamic_sampling = (config.train.alg_name.lower() == "dapo")
+
+            if dynamic_sampling:
+                if config.overlap and config.overlap.enabled:
+                    raise ValueError("rollout.dynamic_sampling=True is only supported by the sync engine. "
+                                     "Set overlap.enabled=False or disable dynamic_sampling.")
+
+                if config.train.alg_name.lower() == "ppo":
+                    raise ValueError("rollout.dynamic_sampling drops prompt-groups with zero reward std, "
+                                     "which only makes sense for group-relative advantages (grpo/dapo/cispo/p3o). "
+                                     "PPO derives advantages from GAE with a value model, so such groups still "
+                                     "carry gradient signal; disable dynamic_sampling for ppo.")
+
+                if config.rollout.n_samples < 2:
+                    raise ValueError(f"rollout.dynamic_sampling requires rollout.n_samples > 1 "
+                                     f"(a single completion per prompt always has zero group std and "
+                                     f"every sample would be dropped), got {config.rollout.n_samples}")
+
+            if config.rollout.overlong_buffer_tokens < 0:
+                raise ValueError(f"rollout.overlong_buffer_tokens must be >= 0, "
+                                 f"got {config.rollout.overlong_buffer_tokens}")
+
+            if config.rollout.overlong_buffer_tokens > 0:
+                if config.overlap and config.overlap.enabled:
+                    raise ValueError("rollout.overlong_buffer_tokens > 0 is only supported by the "
+                                     "sync engine (the async engine ignores it). Set overlap.enabled=False "
+                                     "or overlong_buffer_tokens=0.")
+
+                if config.rollout.overlong_buffer_tokens >= config.rollout.max_tokens:
+                    raise ValueError(f"rollout.overlong_buffer_tokens ({config.rollout.overlong_buffer_tokens}) "
+                                     f"must be < rollout.max_tokens ({config.rollout.max_tokens})")
+
+                if config.rollout.overlong_penalty_factor <= 0.0:
+                    raise ValueError(f"rollout.overlong_penalty_factor must be > 0 when "
+                                     f"overlong_buffer_tokens > 0, got {config.rollout.overlong_penalty_factor}")
         elif method == "eval":
             if not config.run.checkpoint_dir or config.run.checkpoint_dir.strip() == "":
                 raise ValueError("run.checkpoint_dir must be specified for eval "

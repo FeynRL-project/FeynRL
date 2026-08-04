@@ -97,6 +97,11 @@ class VLLMRolloutEngineAsync(Base):
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
 
+        # DAPO soft overlong punishment is sync-engine-only for now; Base.normalize_rewards
+        # reads these attributes, so they must exist (0 = disabled) on the async engine too.
+        self.overlong_buffer_tokens  = 0
+        self.overlong_penalty_factor = 1.0
+
         # Async engine requires its own event loop running in a background thread.
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)

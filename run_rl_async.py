@@ -1302,6 +1302,16 @@ def main(args, config):
                     f"unique_response_ratio={rollout_metrics['unique_response_ratio']:.4f}, "
                     f"{time_str}, tps={rollout_metrics['tokens_per_sec']:.2f}")
 
+        # DAPO overlong punishment interaction (same as run_rl_sync): samples with
+        # prompt+response > max_seq_len are dropped by the replay buffer, so a
+        # truncated-at-max_tokens response gets its penalty folded into the group
+        # baseline but never receives the negative gradient itself.
+        if config.rollout.overlong_buffer_tokens > 0 and rollout_metrics.get('seq_truncated_ratio', 0.0) > 0.0:
+            logger.warning(f"[Epoch {epoch+1}] [overlong_penalty] {rollout_metrics['seq_truncated_ratio']:.2%} of "
+                           f"samples exceed data.max_seq_len and are dropped before training; their overlong "
+                           f"penalty only shifts the group baseline. Increase data.max_seq_len "
+                           f"(>= longest prompt + rollout.max_tokens) or reduce rollout.max_tokens.")
+
         # Log training summary
         epoch_avg = {k: np.mean(v) for k, v in result['epoch_metrics'].items()}
 

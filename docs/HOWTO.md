@@ -1,11 +1,11 @@
 ## How to use
 
-After setting up the environment, the next step is preparing the data. See the scripts in [`data-prep/`](https://github.com/rasoolfa/FeynRL/tree/main/data_prep) for reference implementations—you can adapt them to your own datasets.
+After setting up the environment, the next step is preparing the data. See the scripts in [`data_prep/`](../data_prep/) for reference implementations—you can adapt them to your own datasets.
 
-**Data format requirement:** your final processed data must match the **exact** format produced by these scripts (the original/raw format does not matter). You need to write your own scripts simailr to the following scripts to prepare your data in the required format.
+**Data format requirement:** your final processed data must match the **exact** format produced by these scripts (the original/raw format does not matter). You need to write your own scripts similar to the following scripts to prepare your data in the required format.
 
-* [`data-prep/gsm8k.py`](https://github.com/rasoolfa/FeynRL/blob/main/data_prep/gsm8k.py) prepares **GSM8K** in a format suitable for **SFT** and **RL** training, and can also be used for evaluation.
-* [`data-prep/hh_rlhf.py`](https://github.com/rasoolfa/FeynRL/blob/main/data_prep/hh_rlhf.py) prepares a **preference/contrastive** dataset suitable for **DPO**-style contrastive learning.
+* [`data_prep/gsm8k.py`](../data_prep/gsm8k.py) prepares **GSM8K** in a format suitable for **SFT** and **RL** training, and can also be used for evaluation.
+* [`data_prep/hh_rlhf.py`](../data_prep/hh_rlhf.py) prepares a **preference/contrastive** dataset suitable for **DPO**-style contrastive learning.
 
 Once your data is prepared, update the **`data`** section in the relevant config file and run the corresponding entrypoint:
 
@@ -60,7 +60,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 torchrun --nproc_per_node=3 main_cl.py --config_file 
 
 RL runs are more involved because they use **Ray** to orchestrate DeepSpeed **training** and **rollout** engines.
 
-`main_rl.py` is the entry point for RL experiments (e.g., PPO, GRPO, CISPO, etc.).
+`main_rl.py` is the entry point for RL experiments (e.g., PPO, GRPO, DAPO, CISPO, etc.).
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4 python main_rl.py --config_file ./configs/rl_args.yaml --experiment_id exp3

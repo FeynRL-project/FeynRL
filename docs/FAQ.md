@@ -16,7 +16,7 @@ FeynRL is designed to be usable by anyone, students, researchers, and engineers 
 
 - **Algorithm researchers** can add new objectives, losses, or update rules without threading changes through rollout workers, orchestration, data pipelines, and weight sync. Most new algorithms are a single file.
 - **Systems researchers** can work on rollout engines, async scheduling, or weight synchronization without touching algorithm implementations.
-- **Practitioners** can run existing recipes (PPO, GRPO, CISPO, P3O, DPO, SFT) with a consistent config schema across sync and async execution modes.
+- **Practitioners** can run existing recipes (PPO, GRPO, DAPO, CISPO, P3O, DPO, SFT) with a consistent config schema across sync and async execution modes.
 
 The design goal is simple: work on one layer should not require rewriting the others.
 
@@ -58,7 +58,7 @@ In sync mode, training follows a strict *generate → train → sync → repeat*
 - You need strictly on-policy data (debugging, method development, algorithms sensitive to data freshness).
 - You want the `direct` → `disk` weight-sync fallback chain (sync-only). Overlap mode is NCCL-only at runtime, with no fallback to keep the logic simple.
 
-One thing worth noting: not every algorithm tolerates off-policy data equally. PPO, GRPO, and CISPO use a fixed clip range that does not self-adjust to staleness, so aggressive `max_lag` can dampen gradients via over-clipping. [P3O](../algs/P3O/README.md) derives its clip and trust-region KL from each batch's effective sample size, so it self-regulates as data ages, which makes it a natural fit for overlap mode with a larger staleness budget.
+One thing worth noting: not every algorithm tolerates off-policy data equally. PPO, GRPO, DAPO, and CISPO use a fixed clip range that does not self-adjust to staleness (DAPO's clip-higher raises the ceiling but is still fixed), so aggressive `max_lag` can dampen gradients via over-clipping. [P3O](../algs/P3O/README.md) derives its clip and trust-region KL from each batch's effective sample size, so it self-regulates as data ages, which makes it a natural fit for overlap mode with a larger staleness budget.
 
 For the full mechanics (producer/queue architecture, NCCL watchdog, staleness eviction, pipeline diagnostics), see the [Architecture Overview](./ARCHITECTURE.md#-trainingrollout-scheduling).
 

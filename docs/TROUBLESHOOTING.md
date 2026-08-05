@@ -121,7 +121,7 @@ vLLM is memory-intensive. If you encounter OOM:
 3. **Sync Check**: With `weight_sync_method: nccl` or `direct`, disk checkpoints are only written at the periodic save schedule (or final epoch); verify the sync logs show success between saves.
 
 ### Weight Synchronization Methods
-The `weight_sync_method` config knob selects how training rank 0 transfers updated weights to the rollout workers. The config validator at [`configs/load.py:680-686`](../configs/load.py#L680-L686) couples this knob tightly to `overlap.enabled`: **overlap (async) mode requires `nccl`, and sync mode forbids `nccl`** (because the non-async vLLM engine has no NCCL weight-sync path).
+The `weight_sync_method` config knob selects how training rank 0 transfers updated weights to the rollout workers. The config validator at [`configs/load.py:715-733`](../configs/load.py#L715-L733) couples this knob tightly to `overlap.enabled`: **overlap (async) mode requires `nccl`, and sync mode forbids `nccl`** (because the non-async vLLM engine has no NCCL weight-sync path).
 
 - **`nccl`** (overlap-only): Training rank 0 broadcasts weights directly to all rollout engine TP workers over a dedicated NCCL process group. Zero serialization, lowest latency. Async mode pairs this with the NCCL watchdog (`TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `NCCL_TIMEOUT=1800s`, set by [`misc/nccl_env.py`](../misc/nccl_env.py)) so wedged collectives abort cleanly instead of hanging the GPU stream.
 - **`direct`** (sync-only at runtime): Gathers weights to CPU via DeepSpeed, transfers them through Ray's shared-memory object store to rollout workers, and loads them into vLLM in-place. Async mode uses `direct` exactly once during `load_checkpoint_for_resume`, before the NCCL group is initialized.
@@ -154,7 +154,7 @@ In sync mode, if `direct` fails mid-run FeynRL falls back to `disk` (save + roll
 ### Loss is NaN or Inf
 **Possible causes:**
 - **Extreme importance ratios**: When the policy diverges significantly from the old policy (e.g., after too many gradient steps on the same replay data), `exp(logprobs - old_logprobs)` can overflow to `inf`. The clipping mechanism bounds the ratio in the loss, but the raw ratio may still cause issues in metrics or when padding is not properly masked.
-- **KL divergence overflow**: If the policy and reference model diverge significantly, `exp(ref_logprobs - logprobs)` in the KL computation can overflow. FeynRL clamps the exponent to $\pm 10$ in [`algs/RL/common.py:128`](../algs/RL/common.py#L128) before `torch.exp`, so a silent saturation there (rather than an `Inf` in the loss) is the tell-tale sign of this regime.
+- **KL divergence overflow**: If the policy and reference model diverge significantly, `exp(ref_logprobs - logprobs)` in the KL computation can overflow. FeynRL clamps the exponent to $\pm 10$ in [`algs/RL/common.py:133`](../algs/RL/common.py#L133) before `torch.exp`, so a silent saturation there (rather than an `Inf` in the loss) is the tell-tale sign of this regime.
 - **Learning rate too high**: A high learning rate combined with large batch sizes can cause gradient explosions.
 - **Mixed-precision issues**: bf16/fp16 training can cause underflow/overflow in log-probability computations. The code promotes certain operations to float32 for stability, but custom reward functions or model architectures may introduce their own precision issues.
 
@@ -167,14 +167,14 @@ In sync mode, if `direct` fails mid-run FeynRL falls back to `disk` (save + roll
 
 ### High `clipfrac` or policy collapse
 **Possible causes:**
-- **Stale replay data**: The replay buffer contains old-policy rollouts that are too far from the current policy, causing most importance ratios to be clipped (PPO/GRPO/CISPO) or pushing ESS toward 0 and zeroing out the gradient (P3O).
+- **Stale replay data**: The replay buffer contains old-policy rollouts that are too far from the current policy, causing most importance ratios to be clipped (PPO/GRPO/DAPO/CISPO) or pushing ESS toward 0 and zeroing out the gradient (P3O).
 - **Learning rate too high**: Large policy updates cause the ratio `π/π_old` to frequently fall outside the monitoring range `[1 - clip_low, 1 + clip_high]`.
 - **Too many `train_steps_per_epoch`**: Multiple passes over the same replay buffer compound policy shift.
 
 **How to diagnose:**
-1. **Watch `clipfrac`**: Note that for PPO/GRPO/CISPO this is the fraction of tokens where the symmetric clip is actually active, while for P3O it is a *monitoring-only* metric (P3O's actual clip is one-sided, `[0, ESS]`, derived from the data rather than from `clip_low/clip_high`). Persistently high values still indicate the policy is updating too aggressively relative to the replay data.
+1. **Watch `clipfrac`**: Note that for PPO/GRPO/DAPO/CISPO this is the fraction of tokens where the clip is actually active (symmetric for PPO/GRPO/CISPO; asymmetric clip-higher for DAPO), while for P3O it is a *monitoring-only* metric (P3O's actual clip is one-sided, `[0, ESS]`, derived from the data rather than from `clip_low/clip_high`). Persistently high values still indicate the policy is updating too aggressively relative to the replay data.
 2. **Watch `approx_kl`**: This measures the KL divergence between the current policy and the old policy used to collect the replay data. Large values suggest drift.
-3. **For P3O, watch `ess_factor` and `kl_behavioral`**: As ESS drops, the policy-gradient term is suppressed and the adaptive KL term `(1 − ESS) · KL(π ‖ π_old)` takes over to pull the policy back toward the behavior distribution. A persistently low ESS combined with a large `kl_behavioral` (the pre-weighting behavioral KL, logged under that name in [`algs/P3O/p3o.py:238`](../algs/P3O/p3o.py#L238)) signals that data is too stale (reduce `overlap.max_lag`) or that updates are too aggressive (reduce `lr`).
+3. **For P3O, watch `ess_factor` and `kl_behavioral`**: As ESS drops, the policy-gradient term is suppressed and the adaptive KL term `(1 − ESS) · KL(π ‖ π_old)` takes over to pull the policy back toward the behavior distribution. A persistently low ESS combined with a large `kl_behavioral` (the pre-weighting behavioral KL, logged under that name in [`algs/P3O/p3o.py:249`](../algs/P3O/p3o.py#L249)) signals that data is too stale (reduce `overlap.max_lag`) or that updates are too aggressive (reduce `lr`).
 4. **Reduce `train_steps_per_epoch`** or **reduce `lr`** to slow down policy updates.
 5. **Enable KL-to-reference penalty** (`kl_coeff > 0` with a reference model) to regularize the policy against long-term drift from the base distribution.
 

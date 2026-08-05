@@ -1,6 +1,6 @@
 # RL Common (`common.py`)
 
-The `COMMON` base class is the shared infrastructure for all policy-gradient RL algorithms in this repo (PPO, GRPO, CISPO, P3O). It keeps algorithm-specific files focused on **what each algorithm does differently in `compute_policy_loss`**, while everything that should be identical across algorithms: forward passes, KL estimation, numerical safeguards, loss normalization, health checks, model loading, distributed weight sync, and checkpointing; lives here.
+The `COMMON` base class is the shared infrastructure for all policy-gradient RL algorithms in this repo (PPO, GRPO, DAPO, CISPO, P3O). It keeps algorithm-specific files focused on **what each algorithm does differently in `compute_policy_loss`**, while everything that should be identical across algorithms: forward passes, KL estimation, numerical safeguards, loss normalization, health checks, model loading, distributed weight sync, and checkpointing; lives here.
 
 If you're implementing a new RL algorithm, you typically inherit from `COMMON` and only provide your own `compute_policy_loss(...)` and `train_step(...)`.
 
@@ -67,7 +67,7 @@ In SFT, sequence lengths are fixed by the dataset and only vary due to packing/p
 
 - **Rollout lengths vary across epochs.** Early in training the policy may produce short responses; later it may produce longer ones. Without global normalization, epochs with longer responses would have smaller per-token gradient magnitude (more tokens $\Rightarrow$ smaller mean), creating an implicit length-dependent learning rate.
 - **Replay buffer sharding is uneven.** `prepare_training_batches` pads the number of micro-batches across ranks, but the token counts within those micro-batches can differ significantly when prompts have different lengths or the policy generates variable-length completions.
-- **Group-based advantages (GRPO/CISPO/P3O) amplify the imbalance.** When `n_samples > 1`, some prompts produce many short responses and others produce fewer long ones. Without global normalization, short-response micro-batches get disproportionate gradient weight.
+- **Group-based advantages (GRPO/DAPO/CISPO/P3O) amplify the imbalance.** When `n_samples > 1`, some prompts produce many short responses and others produce fewer long ones. Without global normalization, short-response micro-batches get disproportionate gradient weight.
 
 ### What `compute_global_token_denom` does
 

@@ -12,9 +12,9 @@ The `value_forward` method returns `values [B, T-1]` (prediction-aligned, droppi
 
 #### Key implementation details
 
-- **Advantage normalization**: Unlike GRPO/CISPO which use pre-computed z-scored rewards from the replay buffer, PPO normalizes advantages **inside `calculate_gae`** to have mean=0 and std=1 across all valid (masked) positions globally across all ranks (see point 3 under GAE below).
+- **Advantage normalization**: Unlike GRPO/DAPO/CISPO which use pre-computed z-scored rewards from the replay buffer, PPO normalizes advantages **inside `calculate_gae`** to have mean=0 and std=1 across all valid (masked) positions globally across all ranks (see point 3 under GAE below).
 
-- **GAE**: Unlike GRPO/CISPO, which use group-normalized rewards directly as advantages and do not learn a value function, PPO computes advantages via **Generalized Advantage Estimation (GAE)** using a learned value function. For each valid position \(t\), the backward pass computes
+- **GAE**: Unlike GRPO/DAPO/CISPO, which use group-normalized rewards directly as advantages and do not learn a value function, PPO computes advantages via **Generalized Advantage Estimation (GAE)** using a learned value function. For each valid position \(t\), the backward pass computes
 
 $$
 \delta_t = r_t + \gamma \, V_\phi(s_{t+1}) \, (1 - d_t) - V_\phi(s_t)

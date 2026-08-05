@@ -3,12 +3,12 @@
 All experiments are configured via YAML files validated by Pydantic schemas in `load.py`. Template configs are provided for each experiment type.
 
 ## Experiment Types
-1. **Reinforcement Learning (RL)**: `rl_args.yaml` — supports GRPO, CISPO, PPO, P3O
+1. **Reinforcement Learning (RL)**: `rl_args.yaml` — supports GRPO, DAPO, CISPO, PPO, P3O
 2. **Supervised Learning (SL)**: `sl_args.yaml` — Supervised Fine-Tuning (SFT)
 3. **Contrastive Learning (CL)**: `cl_args.yaml` — Direct Preference Optimization (DPO)
 4. **Evaluation**: `eval_args.yaml` — inference and scoring
 
-**Vision-language (VLM) variants:** any RL config runs an image+text VLM by setting `model.model_class: vlm` and the `data.image_key` / `data.max_image_pixels` / `rollout.max_images_per_prompt` fields documented below. Ready-to-run examples (Qwen2-VL): `rl_args_vlm.yaml` (sync GRPO), `rl_args_vlm_ppo.yaml` (sync PPO), `rl_args_vlm_async.yaml` (overlap GRPO), `rl_args_vlm_async_ppo.yaml` (overlap PPO).
+**Vision-language (VLM) variants:** any RL config runs an image+text VLM by setting `model.model_class: vlm` and the `data.image_key` / `data.max_image_pixels` / `rollout.max_images_per_prompt` fields documented below. Ready-to-run examples (Qwen2.5-VL) live under [`examples/vlm/`](../examples/vlm/) — e.g. [`examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml`](../examples/vlm/rl/mm_math/qwen2.5-vl-3b-instruct/train.yaml) for RL and [`examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/train.yaml`](../examples/vlm/sft/mm_math/qwen2.5-vl-3b-instruct/train.yaml) for SFT.
 
 ## Command-Line Arguments
 
@@ -16,7 +16,7 @@ All `main_*.py` entry points accept the following arguments:
 
 | Argument | Description | Default |
 |:---|:---|:---|
-| `--config_file` | Path to the YAML config file | `"./config/myexp_rl.yaml"`|
+| `--config_file` | Path to the YAML config file. The built-in defaults (`"./config/rl_args.yaml"` for `main_rl.py`, `"./config/dummy.yaml"` for the others) point at a nonexistent directory, so always pass this explicitly. | — |
 | `--experiment_id` | Unique experiment identifier | `"run_1"` |
 | `--log_level` | Logging level | `"INFO"` |
 | `--resume_from` | Path to a checkpoint directory to resume training (not available in `main_eval.py`) | `None` |
@@ -81,7 +81,7 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 |:---|:---|:---|:---|
 | `enabled` | Enable the async overlap engine. When `True`, `run.weight_sync_method` must be `"nccl"`. | Boolean | `False`, `True` |
 | `max_lag` | Tolerated staleness, in policy versions. Bounds (1) the replay-buffer capacity (sized as `~max_lag` rounds of rollout output) and (2) the age-based eviction threshold applied after each round (items older than `current_version − max_lag` are dropped). The *effective* in-buffer lag can be smaller than `max_lag` when rollout is faster than training (FIFO eviction trims older items first); the `rollout/speed_ratio` metric reports the actual ratio of items produced per cycle vs. one theoretical round. | Integer ≥ 1 | `1`, `2`, `3` |
-| `behave_imp_weight_cap` | Cap on the behavioral importance weight in the decoupled-PPO loss path used by GRPO / PPO / CISPO. Clamps the IS correction to a finite range to prevent runaway weights on stale data. **No-op for P3O** (which uses an ESS-driven trust-region KL instead). The validator requires `> 1.0` for non-P3O algorithms. | Float > 1.0 \| `null` | `null`, `5.0` |
+| `behave_imp_weight_cap` | Cap on the behavioral importance weight in the decoupled-PPO loss path used by GRPO / DAPO / PPO / CISPO. Clamps the IS correction to a finite range to prevent runaway weights on stale data. **No-op for P3O** (which uses an ESS-driven trust-region KL instead). The validator requires `> 1.0` for non-P3O algorithms. | Float > 1.0 \| `null` | `null`, `5.0` |
 
 ---
 
@@ -98,13 +98,13 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | `weight_decay` | Weight decay | Float ≥ 0 | `0.01` |
 | `warmup_steps_ratio` | Fraction of total steps for warmup | 0<= Float <=1 | `0.1` |
 | `clip_grad_norm` | Max gradient norm | Float > 0 | `1.0` |
-| `lr_scheduler` | LR scheduler type | `"WarmupCosineLR"` | `"WarmupCosineLR"` |
+| `lr_scheduler` | LR scheduler type | `"WarmupCosineLR"` \| `"constant"` (fixed LR, no schedule) | `"WarmupCosineLR"` |
 
 ### Training Loop
 
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
-| `alg_name` | Algorithm name | RL: `"grpo"` \| `"cispo"` \| `"ppo"` \| `"p3o"`, SL: `"sft"`, CL: `"dpo"` | `"grpo"` |
+| `alg_name` | Algorithm name | RL: `"grpo"` \| `"dapo"` \| `"cispo"` \| `"ppo"` \| `"p3o"`, SL: `"sft"`, CL: `"dpo"` | `"grpo"` |
 | `total_number_of_epochs` | Total training epochs | Integer ≥ 1 | `30`, `100` |
 | `train_steps_per_epoch` | RL: optimizer steps per epoch | Integer ≥ 1 | `5`, `10` |
 | `micro_batches_per_epoch` | SL/CL: micro-batch iterations per epoch | Integer ≥ 1 | `1000` |
@@ -196,6 +196,10 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | `batch_invariant` | Force batch-invariant kernels (See [vLLM Reproducibility Doc](https://docs.vllm.ai/en/stable/examples/offline_inference/reproducibility/)) | Boolean | `false` |
 | `max_model_len` | Override maximum context length for vLLM. Useful for models with complex RoPE scaling (e.g. YaRN) where vLLM fails to infer it. Otherwise, leave `null`. | Integer \| `null` | `8192`, `null` |
 | `max_images_per_prompt` | **VLM only** — forwarded to vLLM's `limit_mm_per_prompt={"image": N}`; must be ≥ the largest image count any sample carries. `null` = default to 1. Ignored for `llm`. | Integer \| `null` | `1`, `null` |
+| `quantization` | Online quantization for the rollout engine. **Sync engine only**; only `"fp8"` is supported. | `"fp8"` \| `null` | `null` |
+| `dynamic_sampling` | **DAPO dynamic sampling** — drop samples from prompt-groups whose completions all received the same shaped reward (zero advantage on every token). `null` = auto: enabled for `alg_name: dapo` on the sync engine, disabled otherwise (stays off in overlap mode — see [why](../algs/DAPO/README.md#why-async-mode-does-not-need-dynamic-sampling)). **Sync engine only**: explicit `true` with `overlap.enabled: true` is rejected. Requires `n_samples > 1`; not allowed for `ppo`. | Boolean \| `null` | `null` |
+| `overlong_buffer_tokens` | **DAPO soft overlong punishment** — size of the penalty zone at the end of the generation budget: responses longer than `max_tokens − overlong_buffer_tokens` receive a linear reward penalty reaching `−overlong_penalty_factor` at `max_tokens`. `0` = disabled. Works on both engines; must be `< max_tokens`. The DAPO paper uses `max_tokens / 5`. | Integer ≥ 0 | `0`, `102` |
+| `overlong_penalty_factor` | Maximum overlong penalty magnitude (the paper's `c`). Must be `> 0` when `overlong_buffer_tokens > 0`; ignored otherwise. | Float | `1.0` |
 
 ---
 
@@ -204,7 +208,7 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | Parameter | Description | Type / Constraint | Examples |
 |:---|:---|:---|:---|
 | `reward_func` | Reward function name in `rewards/` module | String | `"gsm8k_reward_func"` |
-| `broadcast` | Broadcast scalar reward across response tokens | Boolean | `false` |
+| `broadcast` | Broadcast scalar reward across response tokens. **Required `true` for `alg_name: dapo`** (its token-level loss needs the group advantage on every response token; validator-enforced). | Boolean | `false` |
 
 ---
 

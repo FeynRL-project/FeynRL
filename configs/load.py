@@ -830,10 +830,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
 
             # DAPO validation
             if config.train.alg_name.lower() == "dapo":
-                if config.overlap and config.overlap.enabled:
-                    raise ValueError("DAPO is only supported on the sync engine for now: "
-                                     "set overlap.enabled=False when alg_name='dapo'")
-
                 if not config.train.normalize_loss:
                     raise ValueError("DAPO uses a token-level policy-gradient loss: "
                                      "train.normalize_loss must be True when alg_name='dapo'")
@@ -846,11 +842,13 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                                      "denominator. Set reward.broadcast=True when alg_name='dapo'")
 
             # Resolve dynamic sampling the same way run_rl_sync does (None = auto:
-            # enabled for dapo, which the check above guarantees runs on the sync
-            # engine) so auto-enabling is validated too.
+            # enabled for dapo on the sync engine only) so auto-enabling is
+            # validated too. The async engine runs dapo WITHOUT dynamic sampling:
+            # its replay buffer has no drop/restore wiring, so auto-enabling
+            # would be rejected by the sync-only check below.
             dynamic_sampling = config.rollout.dynamic_sampling
             if dynamic_sampling is None:
-                dynamic_sampling = (config.train.alg_name.lower() == "dapo")
+                dynamic_sampling = (config.train.alg_name.lower() == "dapo") and not overlap_enabled
 
             if dynamic_sampling:
                 if config.overlap and config.overlap.enabled:
@@ -873,11 +871,6 @@ def load_and_verify(method: str, input_yaml: str, experiment_id: str, rank: int,
                                  f"got {config.rollout.overlong_buffer_tokens}")
 
             if config.rollout.overlong_buffer_tokens > 0:
-                if config.overlap and config.overlap.enabled:
-                    raise ValueError("rollout.overlong_buffer_tokens > 0 is only supported by the "
-                                     "sync engine (the async engine ignores it). Set overlap.enabled=False "
-                                     "or overlong_buffer_tokens=0.")
-
                 if config.rollout.overlong_buffer_tokens >= config.rollout.max_tokens:
                     raise ValueError(f"rollout.overlong_buffer_tokens ({config.rollout.overlong_buffer_tokens}) "
                                      f"must be < rollout.max_tokens ({config.rollout.max_tokens})")

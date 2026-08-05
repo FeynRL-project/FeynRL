@@ -145,6 +145,11 @@ def create_rollout_engines(params, reward_fnc, eos_id):
               "reward_func":reward_fnc,
               "reward_broadcast":params.reward.broadcast,
               "batch_invariant":params.rollout.batch_invariant,
+
+              # DAPO soft overlong punishment (0 = disabled), applied by both
+              # engines in Base.normalize_rewards
+              "overlong_buffer_tokens":params.rollout.overlong_buffer_tokens,
+              "overlong_penalty_factor":params.rollout.overlong_penalty_factor,
             }
 
     # if model doesn't fit in one gpu, tp can be > 1
@@ -177,12 +182,8 @@ def create_rollout_engines(params, reward_fnc, eos_id):
                                                          ).remote(**kwargs))
 
         else:
-            # quantization and the DAPO overlong penalty are sync-engine-only
-            # (the async engine doesn't accept them).
-            sync_kwargs = {**kwargs,
-                           "quantization": params.rollout.quantization,
-                           "overlong_buffer_tokens": params.rollout.overlong_buffer_tokens,
-                           "overlong_penalty_factor": params.rollout.overlong_penalty_factor}
+            # quantization is sync-engine-only (the async engine doesn't accept it).
+            sync_kwargs = {**kwargs, "quantization": params.rollout.quantization}
             engines.append(VLLMRolloutEngine.options(num_gpus=tp,
                                                     runtime_env={"env_vars": rollout_env_vars}
                                                     ).remote(**sync_kwargs))

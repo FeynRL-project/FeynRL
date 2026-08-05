@@ -44,6 +44,8 @@ class VLLMRolloutEngineAsync(Base):
                  batch_invariant: bool = False,
                  model_class: str = "llm",
                  max_images_per_prompt: int | None = None,
+                 overlong_buffer_tokens: int = 0,
+                 overlong_penalty_factor: float = 1.0,
                  ):
         # This can reduce throughput depending on model size and batch composition
         # because it forces batch-invariant kernels.
@@ -97,10 +99,9 @@ class VLLMRolloutEngineAsync(Base):
         # If True, broadcast a single scalar reward across all tokens in the sequence.
         self.reward_broadcast = bool(reward_broadcast)
 
-        # DAPO soft overlong punishment is sync-engine-only for now; Base.normalize_rewards
-        # reads these attributes, so they must exist (0 = disabled) on the async engine too.
-        self.overlong_buffer_tokens  = 0
-        self.overlong_penalty_factor = 1.0
+        # DAPO soft overlong punishment (0 = disabled); see Base.compute_overlong_penalty.
+        self.overlong_buffer_tokens  = int(overlong_buffer_tokens)
+        self.overlong_penalty_factor = float(overlong_penalty_factor)
 
         # Async engine requires its own event loop running in a background thread.
         self._loop = asyncio.new_event_loop()

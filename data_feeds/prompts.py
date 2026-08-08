@@ -69,13 +69,19 @@ class PromptsFeed(Dataset):
         if not message or (isinstance(message, list) and len(message) == 0):
             raise ValueError(f"Sample {idx}:{sample}: Prompt cannot be empty")
 
-        # Tokenize prompt for vLLM rollout
-        prompt_ids = self.tokenizer.apply_chat_template(
+        # Render the chat template to text first, then tokenize explicitly.
+        # This is robust to tokenizer.apply_chat_template return-type changes.
+        prompt_text = self.tokenizer.apply_chat_template(
                                         conversation=message,
                                         add_generation_prompt=True,
-                                        tokenize=True,
+                                        tokenize=False,
                                         return_tensors=None,
+                                        skip_special_tokens=False,
                                         )
+        if not isinstance(prompt_text, str) or len(prompt_text) == 0:
+            raise ValueError(f"Sample {idx}:{sample}: chat template produced empty prompt_text")
+
+        prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         if not isinstance(prompt_ids, list) or len(prompt_ids) == 0:
             raise ValueError(f"Sample {idx}:{sample}: tokenization produced empty prompt_ids")
 
@@ -84,14 +90,6 @@ class PromptsFeed(Dataset):
             raise ValueError(f"Prompt in sample {idx}:{sample}: too long: "
                              f"prompt must be at most {self.max_seq_len} tokens (got {len(prompt_ids)})")
 
-        # Get the prompt text for debugging.
-        prompt_text = self.tokenizer.apply_chat_template(
-                                        conversation=message,
-                                        add_generation_prompt=True,
-                                        tokenize=False,
-                                        return_tensors=None,
-                                        skip_special_tokens=False,
-                                        )
         if self.solution_key:
             solution = sample[self.solution_key]
             return  {"prompt_token_ids": prompt_ids, "text": prompt_text, "solution": solution}

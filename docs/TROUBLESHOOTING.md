@@ -2,6 +2,50 @@
 
 This guide covers common issues encountered while running FeynRL, including multi-node scaling, memory management, and training stability.
 
+## Environment Setup Issues
+
+### DeepSpeed import fails because `nvcc` is missing
+
+Typical symptom:
+
+```text
+FileNotFoundError: [Errno 2] No such file or directory: '.../envs/<env>/bin/nvcc'
+```
+
+Cause: the PyTorch wheels alone do not place `nvcc` into the Conda env, but DeepSpeed may probe `ENV/bin/nvcc` during import or JIT extension builds.
+
+Fix:
+
+```bash
+conda install -c nvidia cuda-toolkit=12.2 -y
+which nvcc
+nvcc --version
+```
+
+This is part of the recommended install flow in [docs/INSTALL.md](./INSTALL.md).
+
+### DeepSpeed `FusedAdam` fails with `CXXABI_1.3.15 not found`
+
+Typical symptom:
+
+```text
+ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15' not found (required by .../torch_extensions/.../fused_adam.so)
+```
+
+Cause: on some compute nodes, the DeepSpeed JIT extension loads the system `libstdc++.so.6` instead of the newer one inside the Conda env.
+
+Fix:
+
+```bash
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+```
+
+If DeepSpeed already built a stale extension against the wrong runtime, clear the cache once and rerun:
+
+```bash
+rm -rf ~/.cache/torch_extensions/py312_cu128
+```
+
 ## Recommended defaults (auto-detect)
 
 These knobs can stay at their `null` defaults whenever Ray and NCCL auto-detection works: always for single-node, and typically for multi-node too on well-configured fabrics:

@@ -80,6 +80,8 @@ The repository is organized so that algorithmic changes usually stay local:
 
 **[Configuration Reference](configs/README.md)** — Full parameter guide for RL, SFT, DPO, and evaluation configs.
 
+**[How the Async Engine Works](docs/how_async_engine_works.md)** — An illustrated guide to the overlapped (async) RL engine.
+
 **[Troubleshooting](docs/TROUBLESHOOTING.md)** — Diagnose and fix common issues.
 
 ## 🤝 Contributing

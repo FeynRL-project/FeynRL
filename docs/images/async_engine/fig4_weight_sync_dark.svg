@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-16 -16 972 362" role="img" aria-label="Four-step weight sync: stop feeding prompts, drain in-flight generations while the trainer gathers its sharded weights, broadcast parameters GPU-to-GPU over NCCL with validation, then resume generation.">
+  <style>
+    .t  { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13.5px; fill: #E8EAED; }
+    .ts { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 11.5px; fill: #9AA4B0; }
+    .tb { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13.5px; font-weight: 600; fill: #E8EAED; }
+    .tw { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13px; font-weight: 600; fill: #FFFFFF; }
+    .tmono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; fill: #9AA4B0; }
+  </style>
+
+  <rect x="-16" y="-16" width="972" height="362" rx="10" fill="#1C2127" stroke="#333A43"/>
+    <defs>
+      <marker id="arr3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#9AA4B0"/>
+      </marker>
+    </defs>
+
+    <!-- Panel 1 -->
+    <rect x="16" y="30" width="208" height="210" rx="10" fill="#1C2127" stroke="#333A43"/>
+    <circle cx="44" cy="60" r="14" fill="#9AA4B0"/>
+    <text x="44" y="65" text-anchor="middle" class="tw">1</text>
+    <text x="68" y="65" class="tb">Stop the flow</text>
+    <text x="32" y="96" class="ts">Pause the prompt producer and</text>
+    <text x="32" y="112" class="ts">drain the prompt queue. Enqueue</text>
+    <text x="32" y="128" class="ts">one shutdown signal per rollout</text>
+    <text x="32" y="144" class="ts">engine so all of them wind down.</text>
+    <text x="32" y="176" class="ts" fill="#43BFA9">Un-served prompts are simply</text>
+    <text x="32" y="192" class="ts" fill="#43BFA9">re-issued later — no data lost.</text>
+
+    <line x1="224" y1="135" x2="248" y2="135" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr3)"/>
+
+    <!-- Panel 2 -->
+    <rect x="252" y="30" width="208" height="210" rx="10" fill="#1C2127" stroke="#333A43"/>
+    <circle cx="280" cy="60" r="14" fill="#9AA4B0"/>
+    <text x="280" y="65" text-anchor="middle" class="tw">2</text>
+    <text x="304" y="65" class="tb">Drain in-flight work</text>
+    <text x="268" y="96" class="ts">Rollout engines complete their</text>
+    <text x="268" y="112" class="ts">in-flight generations, and those</text>
+    <text x="268" y="128" class="ts">samples are collected into the</text>
+    <text x="268" y="144" class="ts">replay buffer — nothing is discarded.</text>
+    <text x="268" y="176" class="ts" fill="#43BFA9">Concurrently, the trainer gathers its</text>
+    <text x="268" y="192" class="ts" fill="#43BFA9">ZeRO-3–sharded weights (overlapped).</text>
+
+    <line x1="460" y1="135" x2="484" y2="135" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr3)"/>
+
+    <!-- Panel 3 -->
+    <rect x="488" y="30" width="208" height="210" rx="10" fill="#3A2F17" stroke="#E0A94A" stroke-width="1.5"/>
+    <circle cx="516" cy="60" r="14" fill="#E0A94A"/>
+    <text x="516" y="65" text-anchor="middle" class="tw">3</text>
+    <text x="540" y="65" class="tb">Broadcast</text>
+    <text x="504" y="96" class="ts">Training rank 0 broadcasts each</text>
+    <text x="504" y="112" class="ts">parameter tensor GPU-to-GPU over</text>
+    <text x="504" y="128" class="ts">NCCL to all rollout engines at once.</text>
+    <text x="504" y="160" class="ts">Validation: NaN/Inf tensors are</text>
+    <text x="504" y="176" class="ts">rejected; an engine that received an</text>
+    <text x="504" y="192" class="ts">incomplete parameter set refuses the</text>
+    <text x="504" y="208" class="ts">update rather than run corrupted.</text>
+
+    <line x1="696" y1="135" x2="720" y2="135" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr3)"/>
+
+    <!-- Panel 4 -->
+    <rect x="724" y="30" width="208" height="210" rx="10" fill="#1C2127" stroke="#333A43"/>
+    <circle cx="752" cy="60" r="14" fill="#9AA4B0"/>
+    <text x="752" y="65" text-anchor="middle" class="tw">4</text>
+    <text x="776" y="65" class="tb">Resume</text>
+    <text x="740" y="96" class="ts">Each rollout engine invalidates its</text>
+    <text x="740" y="112" class="ts">KV / prefix cache (so activations</text>
+    <text x="740" y="128" class="ts">from old weights never mix with</text>
+    <text x="740" y="144" class="ts">new ones), the policy version</text>
+    <text x="740" y="160" class="ts">increments, the prompt producer</text>
+    <text x="740" y="176" class="ts">restarts, and generation resumes</text>
+    <text x="740" y="192" class="ts">with the updated policy.</text>
+
+    <text x="470" y="292" text-anchor="middle" class="t">Total pause  ≈  slowest in-flight generation (step 2)  +  a few seconds of NCCL broadcast (step 3)</text>
+  </svg>

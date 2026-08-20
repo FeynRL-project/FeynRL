@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-16 -16 972 432" role="img" aria-label="Timeline showing rollout and training GPU activity across one round, with overlap in the middle and idle bubbles during the drain and the weight sync.">
+  <style>
+    .t  { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13.5px; fill: #E8EAED; }
+    .ts { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 11.5px; fill: #9AA4B0; }
+    .tb { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13.5px; font-weight: 600; fill: #E8EAED; }
+    .tw { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13px; font-weight: 600; fill: #FFFFFF; }
+    .tmono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; fill: #9AA4B0; }
+  </style>
+
+  <rect x="-16" y="-16" width="972" height="432" rx="10" fill="#1C2127" stroke="#333A43"/>
+    <defs>
+      <pattern id="hatch" width="8" height="8" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+        <rect width="8" height="8" fill="#232830"/>
+        <line x1="0" y1="0" x2="0" y2="8" stroke="#6E7885" stroke-width="1.6"/>
+      </pattern>
+    </defs>
+
+    <!-- time axis -->
+    <line x1="120" y1="330" x2="900" y2="330" stroke="#333A43" stroke-width="1.4"/>
+    <text x="510" y="356" text-anchor="middle" class="ts">time →  (one round)</text>
+
+    <!-- Lane labels -->
+    <text x="108" y="122" text-anchor="end" class="tb" fill="#43BFA9">Rollout</text>
+    <text x="108" y="140" text-anchor="end" class="ts">GPUs</text>
+    <text x="108" y="222" text-anchor="end" class="tb" fill="#929BF0">Training</text>
+    <text x="108" y="240" text-anchor="end" class="ts">GPUs</text>
+
+    <!-- Rollout lane -->
+    <!-- generating -->
+    <rect x="120" y="100" width="520" height="52" rx="6" fill="#43BFA9" opacity="0.9"/>
+    <text x="380" y="131" text-anchor="middle" class="tw">generating next round’s rollouts</text>
+    <!-- draining -->
+    <rect x="644" y="100" width="118" height="52" rx="6" fill="#43BFA9" opacity="0.45"/>
+    <text x="703" y="124" text-anchor="middle" class="ts" fill="#E8EAED">finishing</text>
+    <text x="703" y="140" text-anchor="middle" class="ts" fill="#E8EAED">in-flight requests</text>
+    <!-- idle for sync -->
+    <rect x="766" y="100" width="88" height="52" rx="6" fill="url(#hatch)" stroke="#333A43"/>
+    <text x="810" y="131" text-anchor="middle" class="ts">idle</text>
+    <!-- resume -->
+    <rect x="858" y="100" width="42" height="52" rx="6" fill="#43BFA9" opacity="0.9"/>
+
+    <!-- Training lane -->
+    <!-- short wait -->
+    <rect x="120" y="200" width="56" height="52" rx="6" fill="url(#hatch)" stroke="#333A43"/>
+    <!-- training -->
+    <rect x="180" y="200" width="460" height="52" rx="6" fill="#929BF0" opacity="0.92"/>
+    <text x="410" y="231" text-anchor="middle" class="tw">training: optimizer passes over this round’s data</text>
+    <!-- waiting for drain -->
+    <rect x="644" y="200" width="118" height="52" rx="6" fill="url(#hatch)" stroke="#333A43"/>
+    <text x="703" y="226" text-anchor="middle" class="ts">waiting for</text>
+    <text x="703" y="242" text-anchor="middle" class="ts">rollout drain</text>
+    <!-- sync -->
+    <rect x="766" y="200" width="88" height="52" rx="6" fill="#E0A94A" opacity="0.9"/>
+    <text x="810" y="231" text-anchor="middle" class="tw">sync</text>
+    <!-- next round -->
+    <rect x="858" y="200" width="42" height="52" rx="6" fill="#929BF0" opacity="0.35"/>
+
+    <!-- Overlap bracket -->
+    <path d="M 180 84 L 180 72 L 640 72 L 640 84" stroke="#9AA4B0" stroke-width="1.3" fill="none"/>
+    <text x="410" y="60" text-anchor="middle" class="t" fill="#43BFA9">the overlap: both pools busy at once — this is the win</text>
+
+    <!-- Bubble annotations -->
+    <line x1="148" y1="258" x2="148" y2="288" stroke="#9AA4B0" stroke-width="1.2"/>
+    <text x="148" y="304" text-anchor="middle" class="ts">bubble A</text>
+    <text x="148" y="318" text-anchor="middle" class="ts">short wait for data</text>
+
+    <line x1="703" y1="258" x2="703" y2="288" stroke="#9AA4B0" stroke-width="1.2"/>
+    <text x="703" y="304" text-anchor="middle" class="ts">bubble B — the drain:</text>
+    <text x="703" y="318" text-anchor="middle" class="ts">training idle while in-flight generation finishes</text>
+
+    <line x1="810" y1="152" x2="810" y2="188" stroke="#9AA4B0" stroke-width="1.2" stroke-dasharray="2 3"/>
+    <text x="940" y="376" text-anchor="end" class="ts">bubble C — all GPUs pause for the weight broadcast (seconds)</text>
+    <line x1="836" y1="362" x2="812" y2="336" stroke="#9AA4B0" stroke-width="1.2"/>
+  </svg>

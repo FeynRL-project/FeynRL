@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-16 -16 972 502" role="img" aria-label="Architecture diagram: a prompt producer feeds a prompt queue, rollout GPUs generate and score completions, results flow through a results queue into a version-tagged replay buffer, training GPUs run gradient updates on batches from the buffer, and updated policy weights are broadcast back to the rollout engines once per round.">
+  <style>
+    .t  { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13.5px; fill: #E8EAED; }
+    .ts { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 11.5px; fill: #9AA4B0; }
+    .tb { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13.5px; font-weight: 600; fill: #E8EAED; }
+    .tw { font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif; font-size: 13px; font-weight: 600; fill: #FFFFFF; }
+    .tmono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; fill: #9AA4B0; }
+  </style>
+
+  <rect x="-16" y="-16" width="972" height="502" rx="10" fill="#1C2127" stroke="#333A43"/>
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#9AA4B0"/>
+      </marker>
+      <marker id="arrSync" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#E0A94A"/>
+      </marker>
+    </defs>
+
+    <!-- Prompt producer -->
+    <rect x="20" y="120" width="150" height="86" rx="9" fill="#1C2127" stroke="#9AA4B0" stroke-width="1.4"/>
+    <text x="95" y="152" text-anchor="middle" class="tb">Prompt producer</text>
+    <text x="95" y="172" text-anchor="middle" class="ts">streams prompts from</text>
+    <text x="95" y="188" text-anchor="middle" class="ts">the dataloader</text>
+
+    <!-- arrow to prompt queue -->
+    <line x1="170" y1="163" x2="212" y2="163" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- Prompt queue -->
+    <g>
+      <rect x="218" y="138" width="128" height="50" rx="7" fill="#232830" stroke="#333A43"/>
+      <rect x="226" y="146" width="24" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <rect x="256" y="146" width="24" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <rect x="286" y="146" width="24" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <rect x="316" y="146" width="22" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <text x="282" y="212" text-anchor="middle" class="ts">prompt queue (bounded)</text>
+    </g>
+
+    <line x1="346" y1="163" x2="390" y2="163" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- Rollout GPUs -->
+    <g>
+      <rect x="396" y="52" width="176" height="60" rx="9" fill="#12312C" stroke="#43BFA9" stroke-width="1.6"/>
+      <rect x="396" y="132" width="176" height="60" rx="9" fill="#12312C" stroke="#43BFA9" stroke-width="1.6"/>
+      <rect x="396" y="212" width="176" height="60" rx="9" fill="#12312C" stroke="#43BFA9" stroke-width="1.6"/>
+      <text x="484" y="78" text-anchor="middle" class="tb">Rollout GPU (vLLM)</text>
+      <text x="484" y="96" text-anchor="middle" class="ts">generates + scores completions</text>
+      <text x="484" y="158" text-anchor="middle" class="tb">Rollout GPU (vLLM)</text>
+      <text x="484" y="176" text-anchor="middle" class="ts">generates + scores completions</text>
+      <text x="484" y="238" text-anchor="middle" class="tb">Rollout GPU (vLLM)</text>
+      <text x="484" y="256" text-anchor="middle" class="ts">generates + scores completions</text>
+      <text x="484" y="296" text-anchor="middle" class="ts">every sample is tagged with the</text>
+      <text x="484" y="312" text-anchor="middle" class="ts">policy version that generated it</text>
+    </g>
+
+    <line x1="572" y1="163" x2="616" y2="163" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- Results queue -->
+    <g>
+      <rect x="622" y="138" width="128" height="50" rx="7" fill="#232830" stroke="#333A43"/>
+      <rect x="630" y="146" width="24" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <rect x="660" y="146" width="24" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <rect x="690" y="146" width="24" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <rect x="720" y="146" width="22" height="34" rx="4" fill="#1C2127" stroke="#333A43"/>
+      <text x="686" y="212" text-anchor="middle" class="ts">results queue (bounded)</text>
+    </g>
+
+    <line x1="750" y1="163" x2="794" y2="163" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- Replay buffer -->
+    <g>
+      <rect x="800" y="112" width="122" height="104" rx="9" fill="#1C2127" stroke="#9AA4B0" stroke-width="1.4"/>
+      <text x="861" y="138" text-anchor="middle" class="tb">Replay buffer</text>
+      <rect x="812" y="150" width="44" height="22" rx="4" fill="#232830" stroke="#333A43"/>
+      <text x="834" y="165" text-anchor="middle" class="tmono">v8</text>
+      <rect x="864" y="150" width="44" height="22" rx="4" fill="#12312C" stroke="#43BFA9"/>
+      <text x="886" y="165" text-anchor="middle" class="tmono">v9</text>
+      <text x="861" y="196" text-anchor="middle" class="ts">reward-labeled samples,</text>
+      <text x="861" y="210" text-anchor="middle" class="ts">tagged by policy version</text>
+    </g>
+
+    <!-- Buffer down to trainers -->
+    <path d="M 861 216 L 861 292" stroke="#9AA4B0" stroke-width="1.6" marker-end="url(#arr)" fill="none"/>
+    <text x="874" y="258" class="ts">mini-batches</text>
+
+    <!-- Training GPUs -->
+    <g>
+      <rect x="672" y="298" width="120" height="96" rx="9" fill="#23274A" stroke="#929BF0" stroke-width="1.6"/>
+      <rect x="802" y="298" width="120" height="96" rx="9" fill="#23274A" stroke="#929BF0" stroke-width="1.6"/>
+      <text x="732" y="340" text-anchor="middle" class="tb">Training GPU</text>
+      <text x="732" y="360" text-anchor="middle" class="ts">gradient updates</text>
+      <text x="862" y="340" text-anchor="middle" class="tb">Training GPU</text>
+      <text x="862" y="360" text-anchor="middle" class="ts">gradient updates</text>
+    </g>
+
+    <!-- Weight sync back to rollout engines -->
+    <path d="M 672 372 C 480 440, 300 430, 470 288" stroke="#E0A94A" stroke-width="2.2" stroke-dasharray="7 6" fill="none" marker-end="url(#arrSync)"/>
+    <rect x="336" y="404" width="292" height="28" rx="6" fill="#3A2F17" stroke="#E0A94A"/>
+    <text x="482" y="423" text-anchor="middle" class="t" fill="#E0A94A">weight sync (NCCL broadcast) — once per round</text>
+  </svg>

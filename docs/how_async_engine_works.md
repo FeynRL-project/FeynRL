@@ -1,6 +1,6 @@
 # How the FeynRL Async Engine Works
 
-This guide explains FeynRL's overlapped reinforcement-learning engine: where each component runs, how rollout data and policy weights move through the system, and where the runtime goes. It uses standard ML terminology and requires no code.
+This guide explains FeynRL's overlapped RL engine: where each component runs, how rollout data and policy weights move through the system, and where the runtime goes. It uses standard ML terminology and requires no code.
 
 ## 1. The big idea: overlap generation and training
 

@@ -127,3 +127,33 @@ def test_grpo_loss_kl_ref():
     assert np.isclose(metrics['kl_ref'], 0.3)
     assert np.isclose(loss.item(), 0.3)
     dummy_self.compute_kl_distance.assert_called_once()
+
+def test_grpo_loss_entropy_nan_at_masked_position_does_not_poison_loss():
+    '''
+        A NaN-sanitized position carries a NaN entropy as well, and NaN * 0 is NaN:
+        the entropy term must zero those positions through the mask (as the KL term
+        does) or a single bad token turns the whole loss NaN once ent_coeff > 0.
+    '''
+    grpo_logic = GRPO
+    dummy_self = SimpleNamespace(
+        clip_low=0.2,
+        clip_high=0.2,
+        ent_coeff=0.1,
+        kl_coeff=0.0,
+        use_decoupled_loss=False,
+        alg_name="Mock"
+    )
+
+    # second position was sanitized: sentinel logprob 1.0, mask 0, NaN entropy
+    logprobs     = torch.tensor([[-0.5, 1.0]])
+    old_logprobs = torch.tensor([[-0.5, -0.2]])
+    advantages   = torch.tensor([[0.0, 1.0]])
+    mask         = torch.tensor([[1.0, 0.0]])
+    entropies    = torch.tensor([[0.7, float("nan")]])
+
+    loss, denom, metrics = grpo_logic.compute_policy_loss(dummy_self, logprobs, old_logprobs, advantages, mask, entropies, None)
+
+    # Loss_pi = 0 (adv = 0 on the only live token), Loss_ent = 0.7 -> total = -0.1 * 0.7
+    assert torch.isfinite(loss)
+    assert np.isclose(loss.item(), -0.07)
+    assert np.isclose(metrics['loss_total'], -0.07)

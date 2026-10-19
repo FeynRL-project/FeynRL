@@ -88,7 +88,7 @@ def logprobs_with_nans(positions):
 
     return lp
 
-def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox_nan=False):
+def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox_nan=False, ent_coeff=0.0):
     '''
         Bare algorithm instance (no DeepSpeed init) running the real train_step, loss, sanitizer and
         denominator helpers. Only the forwards and the engines are stubbed, and each micro-batch's
@@ -101,7 +101,7 @@ def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox
     alg.update_only_after_full_replay = full_replay
     alg.clip_low = 0.2
     alg.clip_high = 0.2
-    alg.ent_coeff = 0.0
+    alg.ent_coeff = ent_coeff
     alg.kl_coeff = 0.1 if ref_nan else 0.0
     alg.use_decoupled_loss = prox_nan
     alg.behave_imp_weight_cap = None
@@ -123,7 +123,14 @@ def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox
             # the prox snapshot runs under no_grad, so a NaN injected only here is a proximal NaN
             nans += PROX_NANS.get(tag, [])
 
-        return logprobs_with_nans(nans), None, input_ids[:, 1:]
+        entropies = None
+        if ent_coeff > 0.0:
+            # a non-finite logits row gives a NaN entropy at the same position as its NaN logprob
+            entropies = torch.full((B, T - 1), 0.7)
+            for row, col in POLICY_NANS.get(tag, []):
+                entropies[row, col] = float("nan")
+
+        return logprobs_with_nans(nans), entropies, input_ids[:, 1:]
 
     alg.policy_forward = policy_forward
     alg.ref_forward = lambda input_ids, att_mask, pos_ids, mm_kwargs=None: \
@@ -261,6 +268,18 @@ def test_proximal_nan_counts_without_moving_the_denominator(alg_cls, full_replay
     '''
     alg, out = run_train_step(alg_cls, full_replay=full_replay, prox_nan=True)
     check_train_step(alg, out, normalize_loss=True, full_replay=full_replay, prox_nan=True)
+
+@modes
+@all_algs
+def test_nan_entropy_at_sanitized_positions_does_not_poison_the_loss(alg_cls, full_replay):
+    '''
+        A non-finite logits row gives a NaN entropy as well as a NaN logprob, and NaN * 0 is NaN. With
+        ent_coeff > 0 the entropy term must zero those positions through the mask (like the KL term), both at
+        a sanitized live position and at one that was never in the mask, or the micro-batch loss is NaN.
+    '''
+    alg, out = run_train_step(alg_cls, full_replay=full_replay, ent_coeff=0.1)
+    assert np.isfinite(alg.policy_engine.losses).all()
+    check_train_step(alg, out, normalize_loss=True, full_replay=full_replay)
 
 @pytest.fixture
 def second_rank(monkeypatch):

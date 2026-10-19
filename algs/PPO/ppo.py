@@ -301,7 +301,10 @@ class PPO(COMMON):
 
         # 4. compute entropy loss (raw sum)
         if entropies is not None and self.ent_coeff > 0.0:
-            ent_sum = (entropies * mask).sum()
+            # NaN-sanitized positions carry NaN entropies too so zero them through the mask first,
+            # exactly like the KL term below.
+            entropies = torch.where(mask_bool, entropies, torch.zeros_like(entropies))
+            ent_sum   = (entropies * mask).sum()
 
         if ref_logprobs is not None and self.kl_coeff > 0.0:
             kl_dist = self.compute_kl_distance(logprobs=logprobs, ref_logprobs=ref_logprobs)

@@ -29,7 +29,7 @@ Compared to the naive estimator $\log(\pi/\pi_{\mathrm{ref}})$, this form has th
 The estimator is computed in float32 for numerical stability under bf16/fp16, with the exponent clamped to $\pm 10$ to prevent overflow. All algorithms use the same estimator for both the KL-to-reference penalty and, where applicable, the KL-to-behavior trust region.
 
 ### Numerical safeguards
-- **`sanitize_logprobs`** replaces any NaN/Inf positions in the logprobs with a sentinel value (`1.0`, since real logprobs are always ≤ 0) and returns a `nan_mask` so the caller can zero those positions out of the loss via `mask = mask * (~nan_mask)`. This prevents a single bad token from turning the whole gradient into NaN.
+- **`sanitize_logprobs`** replaces any NaN/Inf positions in the logprobs with a sentinel value (`1.0`, since real logprobs are always ≤ 0) and returns a `nan_mask` so the caller can zero those positions out of the loss via `mask = mask * (~nan_mask)`. This keeps the loss value finite. It does not keep the gradient finite when a policy logits row contains NaN or `+inf` (see [Tokens dropped by NaN sanitization](#tokens-dropped-by-nan-sanitization)).
 - **`check_weights_health`** iterates the policy engine's parameters and raises if any contain NaN. Called before and after every `train_step` in every algorithm, so weight corruption carried over from a previous epoch or a failed weight sync is caught immediately.
 - **`check_all_masked`** counts consecutive all-masked micro-batches (where `local_denom == 0` after sanitization) and aborts after a threshold (default 20). A sustained all-masked regime produces zero gradients that can wedge ZeRO-3 NCCL collectives.
 - **`check_logit_health`** and **`check_weights_per_microbatch_update`** are additional diagnostics available on `COMMON` but not wired into the active training loop today; they are exercised by `unit_tests/unit/test_common_health_checks.py`.
@@ -59,7 +59,7 @@ These are the same across every RL algorithm because the training↔rollout cont
 
 In RL training, the replay buffer produces variable-length rollouts. After collation and sharding across GPUs, each micro-batch can have a different number of valid action tokens. The same "mean of means $\neq$ global mean" problem from SFT applies here, but with an additional source of variance: **rollout lengths change every epoch** because the policy generates different-length responses as it improves.
 
-For the full derivation of why naive per-micro-batch normalization is biased and how `dp_scale / ga_denom` corrects it, see [`algs/SFT/README.md`](../SFT/README.md). The formula and DeepSpeed interaction are identical.
+For the full derivation of why naive per-micro-batch normalization is biased and how `dp_scale / ga_denom` corrects it, see [`algs/SFT/README.md`](../SFT/README.md). For `normalize_loss=True` the formula and DeepSpeed interaction are identical. The `normalize_loss=False` fallbacks differ: SFT scales the raw sum by `dp_scale` (a global *sum*), while RL keeps its original per-micro-batch mean with gradient-accumulation rescaling (a mean of local means).
 
 ### Why it matters more in RL than SFT
 
@@ -82,6 +82,27 @@ This single `all_reduce` (one scalar, 8 bytes) runs once before the training loo
 $$\nabla_{\text{final}} = \frac{1}{N_{\text{global}}} \sum_{\text{all tokens}} m_t \cdot \nabla \ell_t$$
 
 Every action token contributes equally to the gradient, regardless of which micro-batch or rank it landed on. When `normalize_loss=False`, the original per-micro-batch normalization is used (backward compatible).
+
+### One denominator per optimizer step
+
+`ga_denom` is a single number shared by every contribution to one optimizer step: every micro-batch, on every rank. That is what makes the weighting uniform. Two micro-batches with 10 and 100 tokens both divide by the same global total, so a token in the short one carries exactly the same weight as a token in the long one.
+
+Which micro-batches are counted depends on where the optimizer step lands:
+
+- `update_only_after_full_replay=True` (config `train.update_after_full_replay: True`) gives one optimizer step per `train_step` call over the replay shard, so `compute_global_token_denom` counts every micro-batch on every rank. Gradient accumulation does not subdivide anything here, because the boundary is set only on the last micro-batch.
+- `update_only_after_full_replay=False` (also when `train.update_after_full_replay` is unset) gives one optimizer step per gradient-accumulation group, so `compute_per_group_token_denoms` gives each group its own total, counted over that group's micro-batches on every rank.
+
+### Tokens dropped by NaN sanitization
+
+`sanitize_logprobs` masks out any position whose log-probability came back NaN or Inf, so those tokens contribute nothing to `loss_sum`, with the exceptions given at the end of this section. They are still counted in `ga_denom`, which is fixed by an `all_reduce` before the training loop's first forward, so it cannot know which positions the policy or reference forward will return as bad. Proximal NaN positions, found by the no-grad snapshot that the decoupled loss takes (always in P4O), are already known at that point, but `ga_denom` still counts them like every other dropped token.
+
+Write `Z` for this shared denominator and `D` for the number of tokens dropped across the whole optimizer step, summed over every micro-batch on every rank. The accumulated gradient is then `(Z - D) / Z` times the per-token mean over the surviving tokens. Every surviving token keeps the same weight `1 / Z` as every other token in the step, so a micro-batch that loses tokens contributes proportionally less, and only the magnitude of the gradient moves, never its direction. In a healthy step nothing is dropped and the factor is exactly 1.
+
+Keeping one shared denominator is what preserves that property. A per-micro-batch adjustment would need `D` for the *whole* step, which is not knowable when the first micro-batch is scaled and backpropagated, long before the later ones have run their forwards. Exactness would need either a no-grad pre-pass that locates the policy and reference NaNs before the first backward (an extra forward per micro-batch), or a rescaling of the accumulated gradient by `Z / (Z - D)` after one more all-reduce right before the optimizer step, which means reaching into DeepSpeed's gradient buffers. Neither is done, since the cost buys back a one-step scalar of order `D / Z` on a fault path.
+
+`nan_tokens` reports, per micro-batch, the number of tokens that were in the loss mask before sanitization and left it (policy, reference, or proximal NaN). It is logged as `train/nan_tokens`, averaged over the micro-batches of one `train_step` call and then over ranks. A shrunken step is therefore visible in the metrics rather than silent.
+
+This accounting assumes that a dropped position carries no gradient. That holds for a NaN in the reference or proximal log-probabilities and for a `-inf` target logit in an otherwise finite row. A policy logits row that contains NaN or `+inf` (e.g., a bf16 overflow), or is entirely `-inf`, is different, whether or not its position is in the loss mask. Masking keeps the loss value finite, but the `log_softmax` backward of that row is still NaN, so the gradient becomes NaN instead of shrinking, and `nan_tokens` counts the position only if it was live. With `ent_coeff > 0` the entropy term also makes `loss_sum` NaN, because the entropy of that row is NaN and NaN times a zero mask is still NaN (`torch.compile` turns `torch.distributions` validation off for the whole process, so `Categorical` does not raise).
 
 ## References
 

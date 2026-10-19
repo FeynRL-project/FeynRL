@@ -353,6 +353,8 @@ class P4O(COMMON):
             # among that prompt’s samples.
             advs      = micro_batch['zscore'][:, :-1].to(device, non_blocking=True)
             mask      = micro_batch['mask'][:, :-1].to(device, non_blocking=True)
+            # valid-token count BEFORE sanitization. the denominator counted exactly these
+            pre_valid = (mask > 0.5).sum()
             old_logprobs = micro_batch['old_logprobs'][:, :-1].to(device, non_blocking=True)
 
             input_ids = micro_batch['input_ids'].to(device, non_blocking=True)
@@ -370,9 +372,6 @@ class P4O(COMMON):
                                                                         att_mask=att_mask,
                                                                         pos_ids=pos_ids,
                                                                         mm_kwargs=mm_kwargs)
-
-            # Snapshot pre-NaN valid token count for ga_denom correction.
-            pre_nan_valid = (mask > 0.5).sum().item() if self.normalize_loss else 0
 
             # Sanitize logprobs before loss computation to prevent NaN into loss
             pi_logprobs, pi_nan = self.sanitize_logprobs(logprobs=pi_logprobs, engine_id=engine_id, step=step, num_micro=num_micro)
@@ -419,21 +418,27 @@ class P4O(COMMON):
                                           "ess_mix": f"{pi_metrics['ess_mix']:.4f}",
                                           })
 
+            # Count how many tokens were dropped because their log-probability came back NaN or Inf.
+            pi_metrics['nan_tokens'] = float((pre_valid - (mask > 0.5).sum()).item())
+
             # Scale loss for backward pass.
             if self.normalize_loss:
                 if self.update_only_after_full_replay:
-                    # Single global denominator covering all micro-batches.
-                    # Adjust for tokens lost to nan sanitization in this micro-batch.
-                    nan_removed  = pre_nan_valid - local_denom.item()
-                    ga_denom_adj = max(ga_denom - nan_removed, 1.0) if nan_removed > 0 else ga_denom
+                    # Single global denominator covering all micro-batches. Every contribution divides by the
+                    # SAME all-reduced count, so each token weighs 1/Z. This micro-batch's NaN-sanitized tokens
+                    # are NOT subtracted: that count is private to this rank and this micro-batch, and taking it off
+                    # a global denominator would make the survivors of a NaN-hit micro-batch weigh more than everyone
+                    # else's tokens. Sanitized positions are already masked out of the numerator, so the term
+                    # just shrinks by the fraction lost.
+                    ga_denom_adj = ga_denom
                     pi_loss      = loss_total_sum * (dp_scale / ga_denom_adj)
 
                 else:
                     # Per-ga-group denominator so each optimizer step is normalized
                     # only by its own group's tokens (not the entire replay buffer).
+                    # Unadjusted for the same reason as the branch above.
                     group_idx    = step // ga_pi
-                    nan_removed  = pre_nan_valid - local_denom.item()
-                    ga_denom_adj = max(ga_denoms[group_idx] - nan_removed, 1.0) if nan_removed > 0 else ga_denoms[group_idx]
+                    ga_denom_adj = ga_denoms[group_idx]
                     pi_loss      = loss_total_sum * (dp_scale / ga_denom_adj)
 
             else:

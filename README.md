@@ -111,7 +111,7 @@ If you use FeynRL in your work, please cite the following:
 }
 
 @misc{fakoor2026trustbatchonoffpolicy,
-  title         = {Trust the Batch, On- or Off-Policy: Adaptive Policy Optimization for RL Post-Training},
+  title         = {Let the Batch Decide, On- or Off-Policy: Effective Sample Size for RL Post-Training},
   author        = {Rasool Fakoor and Murdock Aubry and Nicholas Stranges and Alexander J. Smola},
   year          = {2026},
   eprint        = {2605.12380},

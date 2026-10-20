@@ -176,6 +176,31 @@ def save_checkpoint(epoch,
     if rank == 0:
         os.makedirs(model_path, exist_ok=True)
 
+        # Tags are deterministic (iterNNNNNN_vNNNNNN), so a re-run with the same experiment_id writes into a
+        # directory a previous run may have completed. Shards are overwritten in place, so the OLD completeness
+        # marker has to go FIRST, or a crash mid-save would leave a mix of old and new files behind a marker that
+        # still says complete. The old training_state.json goes with it, since it describes the previous run.
+        for stale in ("CHECKPOINT_COMPLETE", "training_state.json"):
+            try:
+                os.remove(os.path.join(model_path, stale))
+
+            except FileNotFoundError:
+                pass
+
+        # make the unlinks durable before any shard bytes are written. Some mounts reject
+        # fsync on a directory fd; the unlinks above have already happened, so warn and
+        # continue rather than fail the checkpoint.
+        try:
+            dir_fd = os.open(model_path, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+
+            finally:
+                os.close(dir_fd)
+
+        except OSError as e:
+            logger.warning(f"[Epoch {epoch+1}] Could not fsync checkpoint dir {model_path}: {e}")
+
     # 1. save HF-compatible weights and this must run on ALL ranks for zero-3 correctness.
     save_futures = []
     for engine in training_engines:

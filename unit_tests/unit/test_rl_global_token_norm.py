@@ -112,7 +112,7 @@ def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox
     alg.ref_model_engine = object() if ref_nan else None
 
     alg.order = []
-    def policy_forward(input_ids, att_mask, pos_ids, mm_kwargs=None):
+    def policy_forward(input_ids, att_mask, pos_ids, mm_kwargs=None, need_entropy=True):
         tag  = int(input_ids[0, 0])
         nans = list(POLICY_NANS.get(tag, []))
         if torch.is_grad_enabled():
@@ -124,8 +124,8 @@ def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox
             nans += PROX_NANS.get(tag, [])
 
         entropies = None
-        if ent_coeff > 0.0:
-            # a non-finite logits row gives a NaN entropy at the same position as its NaN logprob
+        if need_entropy and ent_coeff > 0.0:
+            # as if a non-finite logits row reached Categorical: NaN entropy where its logprob is NaN
             entropies = torch.full((B, T - 1), 0.7)
             for row, col in POLICY_NANS.get(tag, []):
                 entropies[row, col] = float("nan")
@@ -144,6 +144,14 @@ def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox
         return loss_total_sum, denom, metrics
 
     alg.compute_policy_loss = compute_policy_loss
+
+    # what each micro-batch hands to the all-masked watchdog; it must be the raw (unclamped) token count
+    alg.masked_counts = []
+    def check_all_masked(**kwargs):
+        alg.masked_counts.append(float(kwargs['masked_token_count']))
+        return alg_cls.check_all_masked(alg, **kwargs)
+
+    alg.check_all_masked = check_all_masked
 
     if alg_cls is PPO:
         alg.value_engine = RecordingEngine()
@@ -214,6 +222,7 @@ def check_train_step(alg, out, normalize_loss, full_replay, ref_nan=False, prox_
         survivors = valid(tag) - dropped(tag, ref_nan, prox_nan)
         assert metrics['nan_tokens'] == dropped(tag, ref_nan, prox_nan)
         assert local_denom == max(survivors, 1)
+        assert alg.masked_counts[step] == survivors
         assert (loss_sum == 0.0) == (survivors == 0)
         assert alg.policy_engine.losses[step] == pytest.approx(scaled(step, loss_sum, local_denom), rel=1e-6)
 
@@ -273,9 +282,10 @@ def test_proximal_nan_counts_without_moving_the_denominator(alg_cls, full_replay
 @all_algs
 def test_nan_entropy_at_sanitized_positions_does_not_poison_the_loss(alg_cls, full_replay):
     '''
-        A non-finite logits row gives a NaN entropy as well as a NaN logprob, and NaN * 0 is NaN. With
-        ent_coeff > 0 the entropy term must zero those positions through the mask (like the KL term), both at
-        a sanitized live position and at one that was never in the mask, or the micro-batch loss is NaN.
+        An entropy that is NaN at a masked position (a non-finite logits row that reached Categorical
+        without being neutralized) must not poison the loss, since NaN * 0 is NaN. With ent_coeff > 0 the
+        entropy term zeroes those positions through the mask (like the KL term), both at a sanitized live
+        position and at one that was never in the mask.
     '''
     alg, out = run_train_step(alg_cls, full_replay=full_replay, ent_coeff=0.1)
     assert np.isfinite(alg.policy_engine.losses).all()

@@ -8,6 +8,9 @@ from algs.RL.common import COMMON
 def make_dummy_common(alg_name="MockAlg"):
     '''Create a minimal COMMON-like object for testing.'''
     obj = SimpleNamespace(alg_name=alg_name)
+    # real method, needed by every weight scan; a plain param has numel > 0
+    # so the ZeRO-3 shard fallback stays inert in these tests
+    obj.local_param_shard = COMMON.local_param_shard.__get__(obj)
     return obj
 
 
@@ -183,6 +186,35 @@ def test_check_weights_health_skips_empty():
     COMMON.check_weights_health(obj, engine_id=0, location="TEST")
 
 
+def test_weight_scan_checks_zero3_shard():
+    '''A ZeRO-3-style param (numel 0 outside gather, NaN in its own slice) must
+       be caught; before the shard lookup these scans were vacuous.'''
+    obj = make_dummy_common()
+    p = torch.nn.Parameter(torch.empty(0))
+    p.ds_tensor = torch.tensor([float("nan"), 1.0])
+    p.ds_numel = 2                       # both slots are real data
+    module = SimpleNamespace(named_parameters=lambda: [("w", p)])
+    obj.policy_engine = SimpleNamespace(module=module)
+    with pytest.raises(RuntimeError):
+        COMMON.check_weights_health(obj, engine_id=0, location="test")
+
+
+def test_weight_scan_ignores_zero3_alignment_padding():
+    '''DeepSpeed allocates each slice with torch.empty and pads the parameter to
+       a multiple of the partition count, so the tail of the last rank's slice is
+       never written. Scanning it would abort a healthy run.'''
+    obj = make_dummy_common()
+    p = torch.nn.Parameter(torch.empty(0))
+    # slice of 4, but only 3 elements are real; the 4th is uninitialised padding
+    p.ds_tensor = torch.tensor([1.0, 2.0, 3.0, float("nan")])
+    p.ds_numel = 3
+    module = SimpleNamespace(named_parameters=lambda: [("w", p)])
+    obj.policy_engine = SimpleNamespace(module=module)
+    COMMON.check_weights_health(obj, engine_id=0, location="test")   # must NOT raise
+
+    assert COMMON.local_param_shard(obj, p).numel() == 3
+
+
 # ─── check_all_masked ───
 
 def test_check_all_masked_valid_tokens():
@@ -190,7 +222,7 @@ def test_check_all_masked_valid_tokens():
     obj = make_dummy_common()
     denom = torch.tensor(100.0)
     result = COMMON.check_all_masked(
-        obj, engine_id=0, step=0, num_micro=10, local_denom=denom,
+        obj, engine_id=0, step=0, num_micro=10, masked_token_count=denom,
         consecutive_nan_steps=5)
     assert result == 0
 
@@ -200,7 +232,7 @@ def test_check_all_masked_increments():
     obj = make_dummy_common()
     denom = torch.tensor(0.0)
     result = COMMON.check_all_masked(
-        obj, engine_id=1, step=0, num_micro=10, local_denom=denom,
+        obj, engine_id=1, step=0, num_micro=10, masked_token_count=denom,
         consecutive_nan_steps=3)
     assert result == 4
 
@@ -211,7 +243,7 @@ def test_check_all_masked_aborts_at_threshold():
     denom = torch.tensor(0.0)
     with pytest.raises(RuntimeError, match="model has collapsed"):
         COMMON.check_all_masked(
-            obj, engine_id=0, step=0, num_micro=10, local_denom=denom,
+            obj, engine_id=0, step=0, num_micro=10, masked_token_count=denom,
             consecutive_nan_steps=19, nan_abort_threshold=20)
 
 
@@ -220,9 +252,23 @@ def test_check_all_masked_below_threshold():
     obj = make_dummy_common()
     denom = torch.tensor(0.0)
     result = COMMON.check_all_masked(
-        obj, engine_id=1, step=0, num_micro=10, local_denom=denom,
+        obj, engine_id=1, step=0, num_micro=10, masked_token_count=denom,
         consecutive_nan_steps=18, nan_abort_threshold=20)
     assert result == 19
+
+
+def test_check_all_masked_takes_raw_count_not_clamped_denom():
+    '''The denom compute_policy_loss returns is clamped to min 1.0; passing it
+       here would make the guard dead code. The guard fires on the raw count.'''
+    obj = make_dummy_common()
+    clamped = torch.tensor(0.0).clamp(min=1.0)  # what the old code passed
+    raw = torch.tensor(0.0)                     # what the callers pass now
+    assert COMMON.check_all_masked(obj, engine_id=0, step=0, num_micro=1,
+                                   masked_token_count=clamped,
+                                   consecutive_nan_steps=0) == 0
+    assert COMMON.check_all_masked(obj, engine_id=0, step=0, num_micro=1,
+                                   masked_token_count=raw,
+                                   consecutive_nan_steps=0) == 1
 
 
 # ─── sanitize_logprobs ───
@@ -288,7 +334,7 @@ def test_check_logit_health_nan_with_corrupted_weights():
 
 
 def test_check_logit_health_inf_with_clean_weights():
-    '''Inf in logits + clean weights → warning only (bf16 overflow), no exception.'''
+    '''Inf in logits + clean weights → not fatal (bf16 overflow), no exception.'''
     obj = make_dummy_common()
     module = MagicMock()
     p1 = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -298,12 +344,12 @@ def test_check_logit_health_inf_with_clean_weights():
     logits = torch.randn(2, 10, 100)
     logits[1, 3, 0] = float('inf')
 
-    # Should NOT raise — just prints a warning
+    # Should NOT raise — weights are clean, so this is a plain bf16 overflow (reported downstream)
     COMMON.check_logit_health(obj, logits)
 
 
 def test_check_logit_health_nan_with_clean_weights():
-    '''NaN in logits + clean weights → warning only (not fatal).'''
+    '''NaN in logits + clean weights → not fatal.'''
     obj = make_dummy_common()
     module = MagicMock()
     p1 = torch.tensor([1.0], requires_grad=True)
@@ -343,3 +389,161 @@ def test_deepspeed_config_override():
 
     assert dumped['data_types'] == {"grad_accum_dtype": "bf16"}
     assert dumped['prescale_gradients'] == True
+
+
+# ─── policy_forward need_entropy ───
+
+def test_policy_forward_need_entropy_false_skips_entropy():
+    '''need_entropy=False returns no entropies even when ent_coeff > 0.'''
+    obj = make_dummy_common()
+    obj.ent_coeff = 0.1
+    logits = torch.randn(1, 4, 5)
+    obj.policy_engine = lambda input_ids, attention_mask, position_ids=None, use_cache=False, **kw: SimpleNamespace(logits=logits)
+    input_ids = torch.zeros(1, 4, dtype=torch.long)
+    att_mask  = torch.ones(1, 4, dtype=torch.long)
+
+    assert COMMON.policy_forward(obj, input_ids, att_mask, None)[1] is not None
+    assert COMMON.policy_forward(obj, input_ids, att_mask, None, need_entropy=False)[1] is None
+
+
+def test_prox_snapshot_does_not_request_entropy():
+    '''The no-grad proximal snapshot never uses entropies, so it asks policy_forward to skip them.'''
+    obj = make_dummy_common()
+    requested = []
+    def policy_forward(input_ids, att_mask, pos_ids, mm_kwargs=None, need_entropy=True):
+        requested.append(need_entropy)
+        return torch.zeros(input_ids.shape[0], input_ids.shape[1] - 1), None, input_ids[:, 1:]
+
+    obj.policy_forward = policy_forward
+    obj.extract_mm_kwargs = lambda micro_batch, device: {}
+    obj.sanitize_logprobs = COMMON.sanitize_logprobs.__get__(obj)
+    mb = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "attn_mask": torch.ones(2, 4, dtype=torch.long)}
+    COMMON.snapshot_prox_logprobs(obj, micro_batches=[mb, mb], engine_id=0, device=torch.device("cpu"))
+
+    assert requested == [False, False]
+
+
+# ─── policy_forward neutralizes non-finite logit rows ───
+
+class _LogitsEngine:
+    '''Stand-in policy engine: returns fixed logits, exposes clean params for check_logit_health.'''
+    def __init__(self, logits):
+        self._logits = logits
+        self.module = SimpleNamespace(named_parameters=lambda: [("w", torch.nn.Parameter(torch.ones(2)))])
+
+    def __call__(self, input_ids, attention_mask, position_ids=None, use_cache=False, **kwargs):
+        return SimpleNamespace(logits=self._logits)
+
+
+def _policy_forward_on(logits, ent_coeff=0.0):
+    obj = make_dummy_common()
+    obj.ent_coeff = ent_coeff
+    obj.policy_engine = _LogitsEngine(logits)
+    obj.check_logit_health = COMMON.check_logit_health.__get__(obj)
+    B, T, _ = logits.shape
+    input_ids = torch.zeros(B, T, dtype=torch.long)          # targets are all token 0
+    att_mask  = torch.ones(B, T, dtype=torch.long)
+    return COMMON.policy_forward(obj, input_ids, att_mask, None)
+
+
+def test_policy_forward_clean_logits_unchanged():
+    '''No bad row: logprobs are the plain log_softmax + gather, nothing else happens.'''
+    logits = torch.randn(2, 5, 7)
+    logprobs, entropies, target_ids = _policy_forward_on(logits)
+    ref = torch.log_softmax(logits[:, :-1, :].float(), dim=-1)[..., 0]     # target token 0
+    assert torch.allclose(logprobs, ref, atol=1e-6)
+    assert entropies is None and target_ids.shape == (2, 4)
+
+
+def test_policy_forward_neutralizes_non_finite_logit_rows():
+    '''A +inf (bf16 overflow) or NaN logit gives a finite masked loss but a NaN gradient
+       through the log_softmax backward, and a NaN Categorical entropy (torch.compile turns
+       distribution validation off). policy_forward must zero those rows first and hand them
+       to sanitize_logprobs as NaN logprobs.'''
+    base   = torch.randn(1, 4, 6, requires_grad=True)
+    inject = torch.zeros(1, 4, 6)
+    inject[0, 1, 2] = float("inf")            # row 1 (after the [:, :-1] slice): overflow
+    inject[0, 2, 0] = float("nan")            # row 2: NaN
+    logprobs, entropies, _ = _policy_forward_on(base + inject, ent_coeff=0.1)
+
+    # bad rows come back as NaN (the channel sanitize_logprobs reads); the clean row is finite
+    assert torch.isfinite(logprobs[0, 0])
+    assert torch.isnan(logprobs[0, 1]) and torch.isnan(logprobs[0, 2])
+    # entropy was computed (ent_coeff > 0) from the neutralized rows, and is finite
+    assert entropies is not None and torch.isfinite(entropies).all()
+
+    # the masked loss, built the way the algorithms build it, has a FINITE gradient
+    nan_mask = ~torch.isfinite(logprobs)
+    mask     = (~nan_mask).float()
+    loss = -(logprobs.masked_fill(nan_mask, 1.0) * mask).sum() - 0.1 * (entropies * mask).sum()
+    loss.backward()
+    assert torch.isfinite(base.grad).all()
+    assert torch.count_nonzero(base.grad[0, 1]) == 0 and torch.count_nonzero(base.grad[0, 2]) == 0
+
+
+def test_policy_forward_neutralizes_all_neg_inf_row_only():
+    '''A row that is entirely -inf has a -inf max and NaN log_softmax, so it is neutralized like
+       the others. A row with some -inf entries keeps a finite max and is left alone.'''
+    base   = torch.randn(1, 4, 6, requires_grad=True)
+    inject = torch.zeros(1, 4, 6)
+    inject[0, 1, :] = float("-inf")           # row 1: entirely -inf
+    inject[0, 2, 3] = float("-inf")           # row 2: one -inf entry, target token 0 is finite
+    logprobs, entropies, _ = _policy_forward_on(base + inject, ent_coeff=0.1)
+
+    assert torch.isnan(logprobs[0, 1])
+    assert torch.isfinite(logprobs[0, [0, 2]]).all()
+    assert torch.isfinite(entropies).all()
+
+    nan_mask = ~torch.isfinite(logprobs)
+    mask     = (~nan_mask).float()
+    loss = -(logprobs.masked_fill(nan_mask, 1.0) * mask).sum() - 0.1 * (entropies * mask).sum()
+    loss.backward()
+    assert torch.isfinite(base.grad).all()
+    assert torch.count_nonzero(base.grad[0, 1]) == 0
+
+
+def test_policy_forward_bad_row_with_nan_weights_is_fatal():
+    '''check_logit_health is wired in: a bad row while the weights are NaN must abort.'''
+    logits = torch.randn(1, 3, 5)
+    logits[0, 0, 1] = float("inf")
+    obj = make_dummy_common()
+    obj.ent_coeff = 0.0
+    obj.policy_engine = _LogitsEngine(logits)
+    obj.policy_engine.module = SimpleNamespace(
+        named_parameters=lambda: [("w", torch.nn.Parameter(torch.tensor([float("nan"), 1.0])))])
+    obj.check_logit_health = COMMON.check_logit_health.__get__(obj)
+    with pytest.raises(RuntimeError):
+        COMMON.policy_forward(obj, torch.zeros(1, 3, dtype=torch.long), torch.ones(1, 3, dtype=torch.long), None)
+
+
+def test_policy_forward_neutralizes_rows_in_a_batch_copy():
+    '''B > 1 makes the [:, :-1] slice non-contiguous, so logits is a fresh copy and the
+       in-place fill lands on it; the clean sample in the same batch must be untouched.'''
+    base   = torch.randn(2, 4, 6, requires_grad=True)
+    inject = torch.zeros(2, 4, 6)
+    inject[0, 1, 2] = float("inf")            # sample 0, row 1: overflow
+    logprobs, _, _ = _policy_forward_on(base + inject)
+
+    assert torch.isnan(logprobs[0, 1])
+    assert torch.isfinite(logprobs[0, [0, 2]]).all() and torch.isfinite(logprobs[1]).all()
+    # sample 1 is exactly what a plain forward on its own logits gives
+    ref = torch.log_softmax(base[1:, :-1, :].detach().float(), dim=-1)[..., 0]
+    assert torch.allclose(logprobs[1], ref, atol=1e-6)
+
+    nan_mask = ~torch.isfinite(logprobs)
+    loss = -(logprobs.masked_fill(nan_mask, 1.0) * (~nan_mask).float()).sum()
+    loss.backward()
+    assert torch.isfinite(base.grad).all()
+    assert torch.count_nonzero(base.grad[0, 1]) == 0
+
+
+def test_check_logit_health_returns_bad_row_count():
+    '''The guard is silent on clean weights and hands the count back to the caller.'''
+    obj = make_dummy_common()
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(
+        named_parameters=lambda: [("w", torch.nn.Parameter(torch.ones(2)))]))
+    logits = torch.randn(2, 5, 4)
+    assert COMMON.check_logit_health(obj, logits) == 0
+    logits[0, 1, 0] = float("inf")
+    logits[1, 3, 2] = float("nan")
+    assert COMMON.check_logit_health(obj, logits) == 2

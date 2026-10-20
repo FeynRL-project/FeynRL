@@ -209,8 +209,8 @@ class P3O(COMMON):
 
         # 4. compute entropy loss (raw sum)
         if entropies is not None and self.ent_coeff > 0.0:
-            # NaN-sanitized positions carry NaN entropies too so zero them through the mask first,
-            # exactly like the KL term below.
+            # policy_forward already neutralizes non-finite logits rows, so these entropies are finite.
+            # Still zero the masked positions before the sum (NaN * 0 is NaN), exactly like the KL term below.
             entropies = torch.where(mask_bool, entropies, torch.zeros_like(entropies))
             ent_sum   = (entropies * mask).sum()
 
@@ -337,7 +337,7 @@ class P3O(COMMON):
             # among that prompt’s samples.
             advs      = micro_batch['zscore'][:, :-1].to(device, non_blocking=True)
             mask      = micro_batch['mask'][:, :-1].to(device, non_blocking=True)
-            # valid-token count BEFORE sanitization. the denominator counted exactly these
+            # valid-token count BEFORE sanitization. The shared denominator (normalize_loss=True) counted exactly these.
             pre_valid = (mask > 0.5).sum()
             old_logprobs = micro_batch['old_logprobs'][:, :-1].to(device, non_blocking=True)
 

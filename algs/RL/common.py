@@ -35,14 +35,14 @@ class COMMON:
         This class provides common functions for policy gradient algorithms.
         Only contains methods that are 100% identical across all PG algorithms.
     '''
-    def policy_forward(self, input_ids, att_mask, pos_ids, mm_kwargs=None):
+    def policy_forward(self, input_ids, att_mask, pos_ids, mm_kwargs=None, need_entropy=True):
         '''
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
             mm_kwargs: multimodal vision tensors (e.g. pixel_values, image_grid_thw). Empty {} for llm.
             Returns:
-                logits is [B, T-1, vocab_size]
-                entropies is [B, T-1]
+                logprobs is [B, T-1]; a row whose logits are non-finite (NaN, +inf or all -inf, e.g. a bf16 overflow)
+                comes back as NaN so that sanitize_logprobs masks it entropies is [B, T-1]
         '''
         # if pos_ids is not provided, HF will add that automatically.
         if pos_ids is not None:
@@ -59,6 +59,24 @@ class COMMON:
         # [B, T, V] -> [B, T-1, V]
         logits = output.logits[:, :-1, :].contiguous()
         B, T_minus_1, vocab_size = logits.shape
+
+        # Instead of allocating a full logits [B, T-1, V] boolean tensor over the vocabulary,
+        # we reduce along dim=-1 using max() down to [B, T-1] where NaN propagates through max,
+        # making the row max NaN, and +inf makes the row max +inf.
+        # ~torch.isfinite(...) detects any row with NaN or +inf, and also an all -inf row (max -inf).
+        # Rows whose only non-finite entries are -inf keep a finite max and are harmless under
+        # softmax (exp(-inf) = 0), so they are kept.
+        with torch.no_grad():
+            # [B, T-1, V] -> [B, T-1]
+            bad_row = ~torch.isfinite(logits.max(dim=-1).values)
+            has_bad = bool(bad_row.any())
+
+        if has_bad:
+            # fatal if the weights themselves are NaN; otherwise silent, sanitize_logprobs
+            # reports the masked tokens once per micro-batch
+            self.check_logit_health(logits)
+            # in place, so the fault path allocates no second [B, T-1, V] buffer
+            logits.masked_fill_(bad_row[..., None], 0.0)
 
         # [B, T] -> [B, T-1]
         target_ids = input_ids[:, 1:].contiguous()
@@ -77,8 +95,14 @@ class COMMON:
         logprobs = compiled_log_softmax_and_gather(logits.to(torch.float32).view(-1, vocab_size),
                                                    target_ids.view(-1)).view(B, T_minus_1)
 
+        if has_bad:
+            # neutralized rows must still leave the loss: hand them to sanitize_logprobs
+            # through the channel it already reads (masked_fill's backward is zero there)
+            logprobs = logprobs.masked_fill(bad_row, float("nan"))
+
+        # To avoid the cost of entropy computation on forwards that never use it (the no-grad proximal snapshot).
         entropies = None
-        if self.ent_coeff > 0.0:
+        if need_entropy and self.ent_coeff > 0.0:
             entropies = torch.distributions.Categorical(logits=logits.to(torch.float32)).entropy()
 
         return logprobs, entropies, target_ids
@@ -300,10 +324,12 @@ class COMMON:
             mm_kwargs = self.extract_mm_kwargs(micro_batch, device)
             with torch.no_grad():
                 # curr_logprobs is [B, T-1], shift happoens inside policy_forward
+                # we do not need entropy on this forward pass, so we set need_entropy=False
                 curr_logprobs, _, _ = self.policy_forward(input_ids=input_ids,
                                                           att_mask=att_mask,
                                                           pos_ids=pos_ids,
-                                                          mm_kwargs=mm_kwargs)
+                                                          mm_kwargs=mm_kwargs,
+                                                          need_entropy=False)
                 curr_logprobs, prox_nan_mask = self.sanitize_logprobs(logprobs=curr_logprobs, engine_id=engine_id, step=step, num_micro=len(micro_batches))
 
             nan_masks.append(prox_nan_mask)
@@ -362,8 +388,10 @@ class COMMON:
             logits: [B, T-1, V]
 
             NaN in logits with NaN in weights = weight corruption (fatal).
-            NaN/Inf in logits with clean weights = bf16 overflow on specific
-            sequences (non-fatal, masked out downstream by sanitize_logprobs).
+            NaN/Inf in logits with clean weights = bf16 overflow on specific sequences
+            (non-fatal, masked out downstream by sanitize_logprobs).
+            Returns the number of non-finite rows (0 when every row is finite) and raises when the
+            weights themselves hold NaN.
         '''
         # Reduce along vocab dim in native dtype -> [B, T-1], no extra [B,T,V] alloc.
         with torch.no_grad():
@@ -373,12 +401,12 @@ class COMMON:
         if not all_finite:
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             num_bad = (~torch.isfinite(row_max)).sum().item()
-            total = row_max.numel()
 
             # Check if weights themselves are corrupted
             bad_param = None
             for pname, p in self.policy_engine.module.named_parameters():
-                if p.numel() > 0 and torch.isnan(p).any():
+                t = self.local_param_shard(p)
+                if t.numel() > 0 and torch.isnan(t).any():
                     bad_param = pname
                     break
 
@@ -389,13 +417,12 @@ class COMMON:
                                    f"first NaN param='{bad_param}'. "
                                    f"Model weights are corrupted — check optimizer step or weight sync.")
 
-            # Weights are clean — bf16 overflow on specific tokens.
-            # Log warning but don't crash. The affected positions will produce
-            # NaN logprobs which sanitize_logprobs masks out of the loss.
-            print(f"[Rank {rank}] WARNING: {num_bad}/{total} non-finite logit rows "
-                  f"(bf16 overflow), logits shape={list(logits.shape)}. "
-                  f"Weights are clean — affected tokens will be masked from loss.",
-                  flush=True)
+            # Weights are clean: a bf16 overflow on specific tokens, non-fatal. Stay silent here;
+            # policy_forward neutralizes the rows and sanitize_logprobs reports the masked tokens
+            # once per micro-batch, so a second message for the same rows would only be noise.
+            return num_bad
+
+        return 0
 
     def check_weights_health(self, engine_id, location):
         '''
@@ -403,7 +430,8 @@ class COMMON:
             Catches corruption carried over from a previous epoch or weight sync.
         '''
         nan_params = [name for name, p in self.policy_engine.module.named_parameters()
-                      if p.requires_grad and p.numel() > 0 and torch.isnan(p).any()
+                      if p.requires_grad and (t := self.local_param_shard(p)).numel() > 0
+                      and torch.isnan(t).any()
                       ]
         if nan_params:
             raise RuntimeError(f"[Alg:{self.alg_name}][Engine {engine_id}] {len(nan_params)} params "
@@ -413,10 +441,12 @@ class COMMON:
     def check_weights_per_microbatch_update(self, engine_id, step, num_micro, pi_loss, loss_total_sum, local_denom, ga_denom):
         '''
             Post-optimizer-step guard: detect NaN introduced by DeepSpeed's step().
-            Lightweight — iterates params without cloning or accessing DS internals.
+            Lightweight — iterates each rank's local ZeRO-3 shard without cloning
+            or gathering, so partitioned params are actually inspected.
         '''
         bad = [name for name, p in self.policy_engine.module.named_parameters()
-               if p.requires_grad and p.numel() > 0 and torch.isnan(p).any()
+               if p.requires_grad and (t := self.local_param_shard(p)).numel() > 0
+               and torch.isnan(t).any()
                ]
         if bad:
             raise RuntimeError(f"[Alg:{self.alg_name}][Engine {engine_id}] NaN in weights "
@@ -427,14 +457,46 @@ class COMMON:
                                f"ga_denom={ga_denom}. "
                                f"Corrupted params ({len(bad)}): {bad[:10]}")
 
-    def check_all_masked(self, engine_id, step, num_micro, local_denom,
+    def local_param_shard(self, p):
+        '''
+            Under ZeRO-3 a partitioned parameter is EMPTY (numel 0) outside GatheredParameters, so
+            isnan(p) on the param itself checks nothing. Each rank inspects its own slice (p.ds_tensor) instead,
+            and across ranks every real element is covered exactly once. The slice must be TRIMMED first.
+            DeepSpeed allocates it with torch.empty and pads the parameter up to a multiple of the partition count,
+            so the tail of the last rank's slice is alignment padding that is never written and holds
+            whatever was on the heap. Scanning it reports NaN on a perfectly healthy model, which aborts
+            the run. When the ownership cannot be worked out, hand back the empty parameter: a scan that
+            checks nothing is a lesser evil than one that kills a good run.
+        '''
+        if p.numel() > 0 or getattr(p, "ds_tensor", None) is None:
+            return p
+
+        shard    = p.ds_tensor
+        ds_numel = getattr(p, "ds_numel", None)
+        if ds_numel is None:
+            return p
+
+        try:
+            rank = (torch.distributed.get_rank(group=getattr(p, "ds_process_group", None))
+                    if torch.distributed.is_initialized() else 0)
+
+        except Exception:
+            return p
+
+        # elements of this parameter that live on this rank, padding excluded
+        owned = min(max(ds_numel - shard.numel() * rank, 0), shard.numel())
+        return shard.narrow(0, 0, owned)
+
+    def check_all_masked(self, engine_id, step, num_micro, masked_token_count,
                          consecutive_nan_steps, nan_abort_threshold=20):
         '''
             Guard against sustained all-masked micro-batches which produce zero
             gradients and can cause ZeRO-3 NCCL hangs.
-            Returns updated consecutive_nan_steps count.
+            Returns updated consecutive_nan_steps count. masked_token_count must be the RAW mask sum. 
+            The denom that compute_policy_loss returns is clamped to min 1.0 and can never be
+            zero, which is exactly why this guard cannot take it.
         '''
-        if local_denom.item() == 0:
+        if float(masked_token_count) == 0:
             consecutive_nan_steps += 1
             if engine_id == 0:
                 print(f"[Alg:{self.alg_name}][Engine {engine_id}] WARNING: all tokens "
@@ -1131,12 +1193,14 @@ class COMMON:
 
         state_dict = self.gather_state_dict()
 
-        # Check live model params after ZeRO-3 gather.
-        # GatheredParameters temporarily all-gathers into p.data and reverts on exit.
-        # If the all-gather corrupts the buffer (e.g. CUDA stream race), the live
-        # model params now have NaN even though the CPU copies might be clean.
+        # Check live model params after ZeRO-3 gather. GatheredParameters
+        # all-gathers into p.data and reverts on exit, so at this point the
+        # params are partitioned again and each rank checks its own shard. If
+        # the all-gather corrupted the buffer (e.g. CUDA stream race), the
+        # corruption lives in the shards even though the CPU copies may be clean.
         nan_live = [name for name, p in self.policy_engine.module.named_parameters()
-                    if p.requires_grad and p.numel() > 0 and torch.isnan(p).any()]
+                    if p.requires_grad and (t := self.local_param_shard(p)).numel() > 0
+                    and torch.isnan(t).any()]
         if nan_live:
             raise RuntimeError(f"[Alg:{self.alg_name}][Rank {rank}] NaN in {len(nan_live)} live model "
                                f"params after ZeRO-3 gather: {nan_live[:10]}. "

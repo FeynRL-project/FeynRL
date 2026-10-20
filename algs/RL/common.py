@@ -40,9 +40,13 @@ class COMMON:
             input_ids and att_mask are [B, T]
             pos_ids is [B, T] or None
             mm_kwargs: multimodal vision tensors (e.g. pixel_values, image_grid_thw). Empty {} for llm.
+            need_entropy: compute entropies when ent_coeff > 0 (default). False skips them for forwards that
+                never use them, such as the no-grad proximal snapshot.
             Returns:
-                logprobs is [B, T-1]; a row whose logits are non-finite (NaN, +inf or all -inf, e.g. a bf16 overflow)
-                comes back as NaN so that sanitize_logprobs masks it entropies is [B, T-1]
+                logprobs is [B, T-1]; a row whose logits are non-finite (NaN, +inf or all -inf, e.g. an fp16 overflow)
+                comes back as NaN so that sanitize_logprobs masks it
+                entropies is [B, T-1], or None when ent_coeff == 0 or need_entropy=False
+                target_ids is [B, T-1]
         '''
         # if pos_ids is not provided, HF will add that automatically.
         if pos_ids is not None:
@@ -388,7 +392,7 @@ class COMMON:
             logits: [B, T-1, V]
 
             NaN in logits with NaN in weights = weight corruption (fatal).
-            NaN/Inf in logits with clean weights = bf16 overflow on specific sequences
+            NaN/Inf in logits with clean weights = an overflow (e.g. fp16) on specific sequences
             (non-fatal, masked out downstream by sanitize_logprobs).
             Returns the number of non-finite rows (0 when every row is finite) and raises when the
             weights themselves hold NaN.
@@ -417,7 +421,7 @@ class COMMON:
                                    f"first NaN param='{bad_param}'. "
                                    f"Model weights are corrupted — check optimizer step or weight sync.")
 
-            # Weights are clean: a bf16 overflow on specific tokens, non-fatal. Stay silent here;
+            # Weights are clean: an overflow (e.g. fp16) on specific tokens, non-fatal. Stay silent here;
             # policy_forward neutralizes the rows and sanitize_logprobs reports the masked tokens
             # once per micro-batch, so a second message for the same rows would only be noise.
             return num_bad
@@ -463,25 +467,41 @@ class COMMON:
             isnan(p) on the param itself checks nothing. Each rank inspects its own slice (p.ds_tensor) instead,
             and across ranks every real element is covered exactly once. The slice must be TRIMMED first.
             DeepSpeed allocates it with torch.empty and pads the parameter up to a multiple of the partition count,
-            so the tail of the last rank's slice is alignment padding that is never written and holds
-            whatever was on the heap. Scanning it reports NaN on a perfectly healthy model, which aborts
-            the run. When the ownership cannot be worked out, hand back the empty parameter: a scan that
-            checks nothing is a lesser evil than one that kills a good run.
+            so the tail of the trailing slice(s) is alignment padding that is never written and holds whatever was
+            on the heap (a parameter smaller than the partition count leaves whole slices of padding). Scanning it
+            reports NaN on a perfectly healthy model, which aborts the run. A parameter that is gathered and
+            available (e.g. a persistent one) is returned whole, so every rank checks all of it. When the ownership
+            cannot be worked out, or this rank's slice is not resident (NVMe offload), hand back nothing to scan:
+            a scan that checks nothing is a lesser evil than one that kills a good run.
         '''
-        if p.numel() > 0 or getattr(p, "ds_tensor", None) is None:
+        if getattr(p, "ds_tensor", None) is None:
             return p
 
+        # On DeepSpeed's sequential all-gather path (a fetch group holding a single param), param.data already
+        # points at the torch.empty gather buffer while the collective is still in flight (ds_status INFLIGHT),
+        # so p may hold memory that is not written yet. Scan this rank's slice instead, as for a released param.
+        inflight = getattr(getattr(p, "ds_status", None), "name", None) == "INFLIGHT"
+        if p.numel() > 0 and not inflight:
+            return p
+
+        # what to hand back when ownership cannot be worked out: nothing to scan
+        unknown  = p if p.numel() == 0 else p.new_empty(0)
         shard    = p.ds_tensor
         ds_numel = getattr(p, "ds_numel", None)
         if ds_numel is None:
-            return p
+            return unknown
+
+        # A partition that is not resident (offload_param=nvme between uses, where DeepSpeed swaps
+        # ds_tensor.data for a 0-dim placeholder) has no slice to scan.
+        if shard.dim() != 1 or shard.numel() != getattr(shard, "ds_numel", shard.numel()):
+            return unknown
 
         try:
             rank = (torch.distributed.get_rank(group=getattr(p, "ds_process_group", None))
                     if torch.distributed.is_initialized() else 0)
 
         except Exception:
-            return p
+            return unknown
 
         # elements of this parameter that live on this rank, padding excluded
         owned = min(max(ds_numel - shard.numel() * rank, 0), shard.numel())
@@ -490,27 +510,35 @@ class COMMON:
     def check_all_masked(self, engine_id, step, num_micro, masked_token_count,
                          consecutive_nan_steps, nan_abort_threshold=20):
         '''
-            Guard against sustained all-masked micro-batches which produce zero
-            gradients and can cause ZeRO-3 NCCL hangs.
+            Guard against sustained all-masked micro-batches: every token dropped by NaN/Inf sanitization
+            means the model has collapsed and every update is zero. The run length also carries across
+            train_step calls. Only the rank that reaches the threshold raises; the driver's early-failure
+            check then stops the other ranks.
             Returns updated consecutive_nan_steps count. masked_token_count must be the RAW mask sum. 
             The denom that compute_policy_loss returns is clamped to min 1.0 and can never be
             zero, which is exactly why this guard cannot take it.
         '''
         if float(masked_token_count) == 0:
             consecutive_nan_steps += 1
+            # The caller's count restarts at 0 on every train_step call, so a rank holding fewer than
+            # nan_abort_threshold micro-batches per call would never reach the threshold. Keep the run
+            # length across calls as well (a micro-batch with live tokens still resets it).
+            streak = max(getattr(self, "_all_masked_streak", 0) + 1, consecutive_nan_steps)
+            self._all_masked_streak = streak
             if engine_id == 0:
                 print(f"[Alg:{self.alg_name}][Engine {engine_id}] WARNING: all tokens "
                       f"masked at micro-batch {step}/{num_micro} "
-                      f"({consecutive_nan_steps}/{nan_abort_threshold} consecutive), "
+                      f"({streak}/{nan_abort_threshold} consecutive), "
                       f"loss is zero — model is not learning.",
                       flush=True)
-            if consecutive_nan_steps >= nan_abort_threshold:
+            if streak >= nan_abort_threshold:
                 raise RuntimeError(f"[Alg:{self.alg_name}][Engine {engine_id}] Aborting: "
                                    f"{nan_abort_threshold} consecutive micro-batches had all "
                                    f"tokens masked by NaN/Inf. The model has collapsed — "
                                    f"restart from a known-good checkpoint.")
         else:
             consecutive_nan_steps = 0
+            self._all_masked_streak = 0
         return consecutive_nan_steps
 
     def load_single_model(self, model_path: str, dtype: torch.dtype, model_name: str):

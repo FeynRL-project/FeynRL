@@ -130,9 +130,10 @@ def test_grpo_loss_kl_ref():
 
 def test_grpo_loss_entropy_nan_at_masked_position_does_not_poison_loss():
     '''
-        A NaN-sanitized position carries a NaN entropy as well, and NaN * 0 is NaN:
-        the entropy term must zero those positions through the mask (as the KL term
-        does) or a single bad token turns the whole loss NaN once ent_coeff > 0.
+        An entropy that is NaN at a masked position (a non-finite logits row that reached
+        Categorical without being neutralized by policy_forward) must not poison the loss,
+        since NaN * 0 is NaN: the entropy term zeroes those positions through the mask (as
+        the KL term does), or one bad token would turn the whole loss NaN once ent_coeff > 0.
     '''
     grpo_logic = GRPO
     dummy_self = SimpleNamespace(

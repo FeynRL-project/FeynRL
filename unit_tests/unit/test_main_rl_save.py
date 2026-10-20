@@ -1,4 +1,7 @@
 import os
+import errno
+import stat
+import pytest
 from unittest.mock import MagicMock, patch
 import misc.setup_rl as setup_rl
 
@@ -48,7 +51,8 @@ def test_save_checkpoint_waits_for_engine_saves_before_tokenizer_write(tmp_path)
     assert call_log == ["engine0", "engine1", "wait", "wait", "tokenizer"]
     assert model_path == os.path.join(str(tmp_path), "exp4", "iter000001_v000007")
     tokenizer.save_pretrained.assert_called_once_with(model_path)
-    logger.warning.assert_not_called()
+    # only the shared-filesystem warning is under test; a mount that rejects dir fsync may add its own
+    assert not any("shared filesystem" in c.args[0] for c in logger.warning.call_args_list)
 
 
 def test_save_checkpoint_warns_on_multi_gpu_node_cluster(tmp_path):
@@ -75,8 +79,7 @@ def test_save_checkpoint_warns_on_multi_gpu_node_cluster(tmp_path):
             save_timeout=30,
         )
 
-    logger.warning.assert_called_once()
-    assert "shared filesystem" in logger.warning.call_args[0][0]
+    assert sum("shared filesystem" in c.args[0] for c in logger.warning.call_args_list) == 1
 
 
 def test_save_checkpoint_removes_stale_marker_before_engines_write(tmp_path):
@@ -118,3 +121,74 @@ def test_save_checkpoint_removes_stale_marker_before_engines_write(tmp_path):
     assert os.path.exists(os.path.join(model_path, "CHECKPOINT_COMPLETE"))
     with open(os.path.join(model_path, "training_state.json")) as f:
         assert '"global_step": 42' in f.read()
+
+
+def _save_once(tmp_path, engine, logger):
+    with patch.object(setup_rl, "ray_get_with_timeout", return_value=[True]), \
+         patch.object(setup_rl.ray, "nodes", return_value=[{"Alive": True, "Resources": {"GPU": 1}}]):
+        return setup_rl.save_checkpoint(epoch=0, version=7, global_step=42, tokenizer=MagicMock(),
+                                        training_engines=[engine], checkpoint_dir=str(tmp_path),
+                                        experiment_id="exp4", rank=0, logger=logger, save_timeout=30)
+
+
+def test_save_checkpoint_fsyncs_the_dir_before_any_shard_is_written(tmp_path, monkeypatch):
+    '''The unlinks of the stale files are made durable with a directory fsync before the engines write.'''
+    model_path = os.path.join(str(tmp_path), "exp4", "iter000001_v000007")
+    os.makedirs(model_path)
+    open(os.path.join(model_path, "CHECKPOINT_COMPLETE"), "w").close()
+
+    events, real_fsync = [], os.fsync
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            events.append(("dir_fsync", sorted(os.listdir(model_path))))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(setup_rl.os, "fsync", fsync)
+    def remote(**kwargs):
+        events.append(("engine_save", None))
+        return "engine0_ref"
+
+    engine = SimpleNamespace(save_checkpoint=SimpleNamespace(remote=remote),
+                             save_engine_state=SimpleNamespace(remote=MagicMock(return_value="engine0_state_ref")))
+    _save_once(tmp_path, engine, MagicMock())
+    assert events[:2] == [("dir_fsync", []), ("engine_save", None)]
+
+
+def test_save_checkpoint_survives_a_mount_that_rejects_dir_fsync(tmp_path, monkeypatch):
+    '''Some mounts reject fsync on a directory fd. The unlinks already happened, so the checkpoint must
+       still complete, with a warning.'''
+    real_fsync = os.fsync
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "Invalid argument")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(setup_rl.os, "fsync", fsync)
+    logger = MagicMock()
+    engine = SimpleNamespace(save_checkpoint=SimpleNamespace(remote=MagicMock(return_value="engine0_ref")),
+                             save_engine_state=SimpleNamespace(remote=MagicMock(return_value="engine0_state_ref")))
+    model_path = _save_once(tmp_path, engine, logger)
+    assert os.path.exists(os.path.join(model_path, "CHECKPOINT_COMPLETE"))
+    logger.warning.assert_called_once()
+    assert "Could not fsync checkpoint dir" in logger.warning.call_args[0][0]
+
+
+def test_save_checkpoint_stops_before_any_shard_when_a_stale_file_cannot_be_removed(tmp_path, monkeypatch):
+    '''Only "file not found" is ignored when removing the stale files. Any other error (e.g. a permission
+       error) stops the save before an engine writes, so the old checkpoint is left as it was.'''
+    model_path = os.path.join(str(tmp_path), "exp4", "iter000001_v000007")
+    os.makedirs(model_path)
+    open(os.path.join(model_path, "CHECKPOINT_COMPLETE"), "w").close()
+
+    def remove(path):
+        raise PermissionError(errno.EACCES, "Permission denied", path)
+
+    monkeypatch.setattr(setup_rl.os, "remove", remove)
+    remote = MagicMock(return_value="engine0_ref")
+    engine = SimpleNamespace(save_checkpoint=SimpleNamespace(remote=remote),
+                             save_engine_state=SimpleNamespace(remote=MagicMock(return_value="engine0_state_ref")))
+    with pytest.raises(PermissionError):
+        _save_once(tmp_path, engine, MagicMock())
+
+    remote.assert_not_called()
+    assert os.path.exists(os.path.join(model_path, "CHECKPOINT_COMPLETE"))

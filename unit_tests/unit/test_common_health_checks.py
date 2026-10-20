@@ -195,7 +195,7 @@ def test_weight_scan_checks_zero3_shard():
     p.ds_numel = 2                       # both slots are real data
     module = SimpleNamespace(named_parameters=lambda: [("w", p)])
     obj.policy_engine = SimpleNamespace(module=module)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="contain NaN"):
         COMMON.check_weights_health(obj, engine_id=0, location="test")
 
 
@@ -213,6 +213,143 @@ def test_weight_scan_ignores_zero3_alignment_padding():
     COMMON.check_weights_health(obj, engine_id=0, location="test")   # must NOT raise
 
     assert COMMON.local_param_shard(obj, p).numel() == 3
+
+
+@pytest.mark.parametrize("ds_numel, slice_len, rank, owned", [
+    (7, 4, 0, 4),   # first rank: a full slice of real data
+    (7, 4, 1, 3),   # last rank: 3 real elements, then one slot of alignment padding
+    (3, 1, 2, 1),   # ds_numel < world size: rank 2 still owns its single element
+    (3, 1, 3, 0),   # a rank past the end owns nothing, its whole slice is padding
+], ids=["first", "last_padded", "small_param", "past_the_end"])
+def test_local_param_shard_trims_by_partition_rank(monkeypatch, ds_numel, slice_len, rank, owned):
+    '''Rank r of a ZeRO-3 partition holds elements [r*P, (r+1)*P) of the padded parameter: only the ones
+       below ds_numel are real. The rank is the one inside the parameter's own process group.'''
+    group, asked = object(), []
+    def get_rank(group=None):
+        asked.append(group)
+        return rank
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", get_rank)
+    obj = make_dummy_common()
+    p = torch.nn.Parameter(torch.empty(0))
+    p.ds_tensor = torch.full((slice_len,), float("nan"))     # padding slots hold heap garbage (NaN here)
+    p.ds_tensor[:owned] = 1.0
+    p.ds_numel = ds_numel
+    p.ds_process_group = group
+
+    assert torch.equal(COMMON.local_param_shard(obj, p), torch.ones(owned))
+    assert asked == [group]
+
+
+def test_local_param_shard_scans_nothing_when_ownership_is_unknown(monkeypatch):
+    '''Without a resolvable partition rank (or without ds_numel) the real/padding split is unknown, so the
+       scan must check nothing rather than the untrimmed slice and abort a healthy run.'''
+    def get_rank(group=None):
+        raise RuntimeError("process group is not initialized")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", get_rank)
+    obj = make_dummy_common()
+    p = torch.nn.Parameter(torch.empty(0))
+    p.ds_tensor = torch.tensor([1.0, float("nan")])          # second slot may be padding
+    p.ds_numel = 1
+    p.ds_process_group = object()
+    assert COMMON.local_param_shard(obj, p).numel() == 0
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(named_parameters=lambda: [("w", p)]))
+    COMMON.check_weights_health(obj, engine_id=0, location="test")   # must NOT raise
+
+    q = torch.nn.Parameter(torch.empty(0))
+    q.ds_tensor = torch.tensor([float("nan")])                 # no ds_numel: ownership unknown
+    assert COMMON.local_param_shard(obj, q).numel() == 0
+
+
+def _released_nvme_param(requires_grad=True):
+    '''ZeRO-3 + offload_param=nvme between uses: DeepSpeed 0.18.9 (remove_partition_and_release_buffers in
+       partitioned_param_swapper.py) points ds_tensor.data at a 0-dim fp16 placeholder.'''
+    p = torch.nn.Parameter(torch.empty(0), requires_grad=requires_grad)
+    p.ds_numel = 10
+    p.ds_tensor = torch.zeros(5)
+    p.ds_tensor.ds_numel = 5
+    p.ds_tensor.data = torch.tensor(1).half().data
+    return p
+
+
+def test_weight_scan_skips_a_partition_released_to_nvme():
+    '''A slice swapped out to NVMe has nothing resident to scan; the scan must skip it, not crash.'''
+    obj = make_dummy_common()
+    p = _released_nvme_param()
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(named_parameters=lambda: [("w", p)]))
+    COMMON.check_weights_health(obj, engine_id=0, location="test")      # must NOT raise
+    assert COMMON.local_param_shard(obj, p).numel() == 0
+
+
+def test_logit_check_skips_a_partition_released_to_nvme():
+    '''Same for the fault-path weight scan in check_logit_health, e.g. over a frozen LoRA base weight.'''
+    obj = make_dummy_common()
+    p = _released_nvme_param(requires_grad=False)
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(named_parameters=lambda: [("w", p)]))
+    assert COMMON.check_logit_health(obj, torch.tensor([[[1.0, float("inf")]]])) == 1
+
+
+def test_local_param_shard_scans_own_slice_of_an_inflight_param():
+    '''On DeepSpeed's sequential all-gather path, param.data already points at the gather buffer while the
+       collective is in flight, so the full-size tensor may hold unwritten memory. The scan must read this
+       rank's own slice instead: NaN only in the unwritten buffer must not raise, NaN in the slice must.'''
+    obj = make_dummy_common()
+    p = torch.nn.Parameter(torch.tensor([float("nan"), float("nan"), 3.0, 4.0]))   # gather buffer, not written yet
+    p.ds_status = SimpleNamespace(name="INFLIGHT")
+    p.ds_tensor = torch.tensor([1.0, 2.0])
+    p.ds_numel = 4
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(named_parameters=lambda: [("w", p)]))
+    assert torch.equal(COMMON.local_param_shard(obj, p), torch.tensor([1.0, 2.0]))
+    COMMON.check_weights_health(obj, engine_id=0, location="test")      # must NOT raise
+
+    p.ds_tensor[0] = float("nan")                                          # a real NaN in this rank's slice
+    with pytest.raises(RuntimeError, match="contain NaN"):
+        COMMON.check_weights_health(obj, engine_id=0, location="test")
+
+    p.ds_status = SimpleNamespace(name="AVAILABLE")                       # gathered and available: scanned whole
+    assert COMMON.local_param_shard(obj, p) is p
+
+
+def _zero3_param_with_nan_in_its_slice():
+    p = torch.nn.Parameter(torch.empty(0))
+    p.ds_tensor = torch.tensor([float("nan"), 1.0])
+    p.ds_numel = 2
+    return p
+
+
+def test_check_logit_health_sees_nan_in_a_zero3_shard():
+    '''Every weight scan reads the ZeRO-3 slice, not only check_weights_health.'''
+    obj = make_dummy_common()
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(
+        named_parameters=lambda: [("w", _zero3_param_with_nan_in_its_slice())]))
+    logits = torch.randn(1, 3, 5)
+    logits[0, 1, 2] = float("nan")
+    with pytest.raises(RuntimeError, match="NaN in logits AND weights"):
+        COMMON.check_logit_health(obj, logits)
+
+
+def test_check_weights_per_microbatch_update_sees_nan_in_a_zero3_shard():
+    obj = make_dummy_common()
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(
+        named_parameters=lambda: [("w", _zero3_param_with_nan_in_its_slice())]))
+    with pytest.raises(RuntimeError, match="NaN in weights after optimizer step"):
+        COMMON.check_weights_per_microbatch_update(obj, engine_id=0, step=0, num_micro=1,
+                                                   pi_loss=torch.tensor(0.0), loss_total_sum=torch.tensor(0.0),
+                                                   local_denom=torch.tensor(1.0), ga_denom=1.0)
+
+
+def test_weight_sync_gather_sees_nan_in_a_zero3_shard(monkeypatch):
+    obj = make_dummy_common()
+    obj.policy_engine = SimpleNamespace(device=torch.device("cpu"), module=SimpleNamespace(
+        named_parameters=lambda: [("w", _zero3_param_with_nan_in_its_slice())]))
+    obj.gather_state_dict = lambda: {}
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    with pytest.raises(RuntimeError, match="live model params after ZeRO-3 gather"):
+        COMMON.gather_weights_for_nccl(obj)
 
 
 # ─── check_all_masked ───
@@ -269,6 +406,27 @@ def test_check_all_masked_takes_raw_count_not_clamped_denom():
     assert COMMON.check_all_masked(obj, engine_id=0, step=0, num_micro=1,
                                    masked_token_count=raw,
                                    consecutive_nan_steps=0) == 1
+
+
+def test_check_all_masked_counts_across_train_step_calls():
+    '''Each train_step restarts the caller's count at 0. A sustained all-masked regime spread over calls of
+       fewer than nan_abort_threshold micro-batches (8 here) must still abort; a live micro-batch resets it.'''
+    zero = torch.tensor(0)
+    obj = make_dummy_common()
+    with pytest.raises(RuntimeError, match="model has collapsed"):
+        for call in range(3):
+            n = 0
+            for step in range(8):
+                n = COMMON.check_all_masked(obj, engine_id=1, step=step, num_micro=8,
+                                            masked_token_count=zero, consecutive_nan_steps=n)
+
+    obj = make_dummy_common()
+    for call in range(5):
+        n = 0
+        for step in range(8):
+            count = torch.tensor(5) if step == 7 else zero
+            n = COMMON.check_all_masked(obj, engine_id=1, step=step, num_micro=8,
+                                        masked_token_count=count, consecutive_nan_steps=n)
 
 
 # ─── sanitize_logprobs ───
@@ -512,7 +670,7 @@ def test_policy_forward_bad_row_with_nan_weights_is_fatal():
     obj.policy_engine.module = SimpleNamespace(
         named_parameters=lambda: [("w", torch.nn.Parameter(torch.tensor([float("nan"), 1.0])))])
     obj.check_logit_health = COMMON.check_logit_health.__get__(obj)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="NaN in logits AND weights"):
         COMMON.policy_forward(obj, torch.zeros(1, 3, dtype=torch.long), torch.ones(1, 3, dtype=torch.long), None)
 
 
@@ -547,3 +705,42 @@ def test_check_logit_health_returns_bad_row_count():
     logits[0, 1, 0] = float("inf")
     logits[1, 3, 2] = float("nan")
     assert COMMON.check_logit_health(obj, logits) == 2
+
+
+def test_check_logit_health_is_silent_on_clean_weights(capsys):
+    '''sanitize_logprobs already reports the masked tokens once per micro-batch; the guard adds no second line.'''
+    obj = make_dummy_common()
+    obj.policy_engine = SimpleNamespace(module=SimpleNamespace(
+        named_parameters=lambda: [("w", torch.nn.Parameter(torch.ones(2)))]))
+    logits = torch.randn(1, 3, 4)
+    logits[0, 1, 0] = float("inf")
+    assert COMMON.check_logit_health(obj, logits) == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_policy_forward_keeps_clean_rows_of_a_sample_with_a_bad_row():
+    '''Neutralization is per row: the clean rows of the sample holding a bad row keep their exact
+       log-probabilities and their gradient; only the bad row is zeroed.'''
+    base   = torch.randn(1, 4, 6, requires_grad=True)
+    inject = torch.zeros(1, 4, 6)
+    inject[0, 1, 2] = float("inf")
+    logprobs, _, _ = _policy_forward_on(base + inject)
+
+    ref = torch.log_softmax(base[:, :-1, :].detach().float(), dim=-1)[..., 0]
+    assert torch.allclose(logprobs[0, [0, 2]], ref[0, [0, 2]], atol=1e-6)
+
+    nan_mask = ~torch.isfinite(logprobs)
+    loss = -(logprobs.masked_fill(nan_mask, 1.0) * (~nan_mask).float()).sum()
+    loss.backward()
+    assert torch.count_nonzero(base.grad[0, 0]) > 0 and torch.count_nonzero(base.grad[0, 2]) > 0
+    assert torch.count_nonzero(base.grad[0, 1]) == 0
+
+
+def test_policy_forward_skips_the_health_scan_on_clean_logits():
+    '''check_logit_health re-reads the whole [B, T-1, V] logits; the healthy path must not pay for it.'''
+    obj = make_dummy_common()
+    obj.ent_coeff = 0.0
+    obj.policy_engine = _LogitsEngine(torch.randn(2, 5, 7))
+    obj.check_logit_health = MagicMock()
+    COMMON.policy_forward(obj, torch.zeros(2, 5, dtype=torch.long), torch.ones(2, 5, dtype=torch.long), None)
+    obj.check_logit_health.assert_not_called()

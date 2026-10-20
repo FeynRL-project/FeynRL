@@ -29,6 +29,9 @@ POLICY_NANS = {1: [(r, c) for r in range(B) for c in range(1, LIVE_PER_ROW[1] + 
 REF_NANS    = {3: [(1, 1)]}
 PROX_NANS   = {5: [(0, 3)]}
 
+# entropy the stubbed forward returns at every finite position when ent_coeff > 0
+ENTROPY = 0.7
+
 # per-micro-batch token counts of an emulated second rank (no NaN there), in its own processing order
 OTHER_RANK_COUNTS = [7.0, 3.0, 11.0, 5.0, 9.0]
 
@@ -126,7 +129,7 @@ def make_alg(alg_cls, normalize_loss=True, full_replay=True, ref_nan=False, prox
         entropies = None
         if need_entropy and ent_coeff > 0.0:
             # as if a non-finite logits row reached Categorical: NaN entropy where its logprob is NaN
-            entropies = torch.full((B, T - 1), 0.7)
+            entropies = torch.full((B, T - 1), ENTROPY)
             for row, col in POLICY_NANS.get(tag, []):
                 entropies[row, col] = float("nan")
 
@@ -290,6 +293,23 @@ def test_nan_entropy_at_sanitized_positions_does_not_poison_the_loss(alg_cls, fu
     alg, out = run_train_step(alg_cls, full_replay=full_replay, ent_coeff=0.1)
     assert np.isfinite(alg.policy_engine.losses).all()
     check_train_step(alg, out, normalize_loss=True, full_replay=full_replay)
+
+@modes
+@all_algs
+def test_entropy_bonus_counts_only_the_surviving_live_tokens(alg_cls, full_replay):
+    '''
+        With ent_coeff > 0 each micro-batch's raw loss sum moves by exactly -ent_coeff * ENTROPY per live
+        token that survived sanitization. Finiteness alone cannot tell a correct entropy term from a dropped
+        or sign-flipped one, or from a training forward that stopped asking for entropies.
+    '''
+    ent_coeff = 0.1
+    plain, _ = run_train_step(alg_cls, full_replay=full_replay)
+    alg, _   = run_train_step(alg_cls, full_replay=full_replay, ent_coeff=ent_coeff)
+    assert alg.order == plain.order
+    for step, tag in enumerate(alg.order):
+        survivors = valid(tag) - dropped(tag)
+        expected  = plain.records[step][0] - ent_coeff * ENTROPY * survivors
+        assert alg.records[step][0] == pytest.approx(expected, rel=1e-5, abs=1e-6)
 
 @pytest.fixture
 def second_rank(monkeypatch):

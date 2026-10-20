@@ -112,7 +112,7 @@ Controls concurrent rollout generation and training. When `enabled: true`, rollo
 | `gradient_accumulation_steps` | Gradient accumulation steps | Integer ≥ 1 | `1`, `4` |
 | `val_batch_size_per_gpu` | Validation batch size per GPU | Integer ≥ 1 | `16` |
 | `dynamic_ratio_every_step` | Recalculate dataset mix ratios every step | Boolean | `False` |
-| `normalize_loss` | `True`: global per-token mean. `False`: global sum. See [SFT README — Loss Normalization](../algs/SFT/README.md#loss-normalization). | Boolean | `True` |
+| `normalize_loss` | `True`: global per-token mean. `False`: global sum for SFT, per-micro-batch mean for RL. See [SFT README — Loss Normalization](../algs/SFT/README.md#loss-normalization) and [RL README — Global Token Normalization](../algs/RL/README.md#global-token-normalization-for-rl). | Boolean | `True` |
 
 ### RL Policy Arguments
 

@@ -421,7 +421,7 @@ class DAPO(COMMON):
             consecutive_nan_steps = self.check_all_masked(engine_id=engine_id,
                                                           step=step,
                                                           num_micro=num_micro,
-                                                          local_denom=local_denom,
+                                                          masked_token_count=mask.sum(),
                                                           consecutive_nan_steps=consecutive_nan_steps)
 
             # backward pass
